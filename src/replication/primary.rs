@@ -5,6 +5,12 @@
 /// 2. Sends the current snapshot as RESP bulk arrays
 /// 3. Sends +STREAM\r\n
 /// 4. Streams new WAL entries as they arrive
+///
+/// Backpressure mechanism:
+/// - Tracks the replica's replication offset vs the WAL's oldest sequence
+/// - If the replica falls behind the WAL's oldest entry, a full resync is triggered
+/// - A max pending buffer size (64KB) per replica limits unacknowledged data
+/// - Warnings are logged when replicas fall behind
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,6 +19,11 @@ use tokio::net::TcpStream;
 use crate::replication::wal;
 use crate::store::engine::KvEngine;
 use crate::resp::parser::RespValue;
+
+/// Maximum pending buffer size per replica connection (64KB).
+/// If the accumulated size of pending WAL entries exceeds this, the primary
+/// pauses sending until the write buffer is flushed, providing backpressure.
+const MAX_PENDING_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Send a full resync to a replica connection.
 ///
@@ -96,26 +107,77 @@ pub async fn send_full_resync(
     let wal_notify = repl_state.wal().notify();
 
     loop {
+        // Check if the replica has fallen behind the WAL's oldest entry.
+        // If so, the needed WAL entries have been evicted and we must
+        // trigger a full resync.
+        if let Some(oldest_seq) = repl_state.wal().oldest_seq() {
+            if last_seq < oldest_seq {
+                tracing::warn!(
+                    "replica fell behind: replica offset {} is behind WAL oldest seq {}. Triggering full resync.",
+                    last_seq,
+                    oldest_seq
+                );
+                // Break out of the streaming loop; the caller should
+                // re-initiate a full resync if desired.
+                repl_state.dec_connected_replicas();
+                return Err(format!(
+                    "replica offset {} behind WAL oldest seq {}, full resync required",
+                    last_seq, oldest_seq
+                ));
+            }
+        }
+
         // Check for new WAL entries
         let entries = repl_state.wal().entries_from(last_seq + 1);
         if !entries.is_empty() {
+            let mut pending_size: usize = 0;
+
             for (seq, entry) in &entries {
                 let binary = wal::serialize_entry(entry, *seq);
-                // Send as RESP BulkString with a special prefix
-                // Format: $<len>\r\n<WAL-BINARY>\r\n
-                // We wrap the binary WAL entry in a BulkString
+                let entry_size = binary.len();
                 let msg = RespValue::BulkString(Some(binary));
                 let msg_bytes = crate::resp::parser::serialize(&msg);
+                pending_size += msg_bytes.len();
+
                 if let Err(e) = writer.write_all(&msg_bytes).await {
                     tracing::debug!("replica stream write error: {e}");
-                    break;
+                    repl_state.dec_connected_replicas();
+                    return Err(format!("replica stream write error: {e}"));
                 }
                 last_seq = *seq;
+
+                // Backpressure: if pending buffer exceeds the limit,
+                // flush and wait before sending more. This prevents
+                // unbounded memory growth when a replica is slow.
+                if pending_size >= MAX_PENDING_BUFFER_SIZE {
+                    if let Err(e) = writer.flush().await {
+                        tracing::debug!("replica stream flush error (backpressure): {e}");
+                        repl_state.dec_connected_replicas();
+                        return Err(format!("replica stream flush error: {e}"));
+                    }
+                    tracing::warn!(
+                        "replica backpressure: pending buffer reached {} bytes (limit {}), pausing send",
+                        pending_size,
+                        MAX_PENDING_BUFFER_SIZE
+                    );
+                    pending_size = 0;
+                }
             }
             repl_state.set_replication_offset(last_seq);
+
             if let Err(e) = writer.flush().await {
                 tracing::debug!("replica stream flush error: {e}");
-                break;
+                repl_state.dec_connected_replicas();
+                return Err(format!("replica stream flush error: {e}"));
+            }
+
+            // Log a warning if the replica is far behind (more than 1000 entries)
+            if entries.len() > 1000 {
+                tracing::warn!(
+                    "replica is falling behind: {} pending WAL entries sent, current seq {}",
+                    entries.len(),
+                    last_seq
+                );
             }
         }
 
