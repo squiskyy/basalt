@@ -26,6 +26,9 @@ pub struct ServerConfig {
     pub resp_port: u16,
     /// Number of shards in the KV engine.
     pub shard_count: usize,
+    /// Use io_uring for the RESP server (Linux only).
+    #[cfg(feature = "io-uring")]
+    pub io_uring: bool,
     /// Directory for persistence snapshots. None = no persistence.
     pub db_path: Option<String>,
     /// How often to auto-snapshot to disk (milliseconds). 0 = disabled.
@@ -48,6 +51,8 @@ impl Default for ServerConfig {
             resp_host: "127.0.0.1".into(),
             resp_port: 6380,
             shard_count: 64,
+            #[cfg(feature = "io-uring")]
+            io_uring: false,
             db_path: None,
             snapshot_interval_ms: 60_000,
         }
@@ -85,6 +90,9 @@ struct ServerFile {
     resp_port: Option<u16>,
     #[serde(default)]
     shard_count: Option<usize>,
+    #[cfg(feature = "io-uring")]
+    #[serde(default)]
+    io_uring: Option<bool>,
     #[serde(default)]
     db_path: Option<String>,
     #[serde(default)]
@@ -113,6 +121,8 @@ impl Config {
             resp_host: file.server.resp_host.unwrap_or(server_defaults.resp_host),
             resp_port: file.server.resp_port.unwrap_or(server_defaults.resp_port),
             shard_count: file.server.shard_count.unwrap_or(server_defaults.shard_count),
+            #[cfg(feature = "io-uring")]
+            io_uring: file.server.io_uring.unwrap_or(false),
             db_path: file.server.db_path,
             snapshot_interval_ms: file
                 .server
@@ -137,6 +147,7 @@ impl Config {
         resp_host: Option<String>,
         resp_port: Option<u16>,
         shard_count: Option<usize>,
+        #[cfg(feature = "io-uring")] io_uring: Option<bool>,
         db_path: Option<String>,
         snapshot_interval_ms: Option<u64>,
         auth_tokens: Vec<String>,
@@ -156,6 +167,10 @@ impl Config {
         }
         if let Some(v) = shard_count {
             self.server.shard_count = v;
+        }
+        #[cfg(feature = "io-uring")]
+        if let Some(v) = io_uring {
+            self.server.io_uring = v;
         }
         if let Some(v) = db_path {
             self.server.db_path = Some(v);

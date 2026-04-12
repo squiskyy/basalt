@@ -35,6 +35,11 @@ struct Args {
     #[arg(long)]
     shards: Option<usize>,
 
+    /// Use io_uring for RESP server (Linux only, requires --features io-uring)
+    #[cfg(feature = "io-uring")]
+    #[arg(long)]
+    io_uring: bool,
+
     /// Directory for persistence snapshots (overrides config file)
     #[arg(long, value_name = "DIR")]
     db_path: Option<String>,
@@ -89,6 +94,8 @@ async fn main() {
         args.resp_host,
         args.resp_port,
         args.shards,
+        #[cfg(feature = "io-uring")]
+        args.io_uring.then_some(true),
         args.db_path,
         args.snapshot_interval,
         args.auth,
@@ -132,6 +139,12 @@ async fn main() {
     }
     info!("HTTP:  {}:{}", cfg.server.http_host, cfg.server.http_port);
     info!("RESP:  {}:{}", cfg.server.resp_host, cfg.server.resp_port);
+    #[cfg(feature = "io-uring")]
+    if cfg.server.io_uring {
+        info!("RESP backend: io_uring (raw)");
+    } else {
+        info!("RESP backend: tokio");
+    }
 
     // Start auto-snapshot loop if configured
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -167,6 +180,34 @@ async fn main() {
     });
 
     let resp_server = tokio::spawn(async move {
+        #[cfg(feature = "io-uring")]
+        if resp_config.io_uring {
+            let host = resp_config.resp_host.clone();
+            let port = resp_config.resp_port;
+            let db_path = resp_config.db_path.clone();
+            // io_uring runs in its own thread (blocking), separate from tokio
+            std::thread::spawn(move || {
+                if let Err(e) = resp::uring_server::run(&host, port, resp_engine, resp_auth, db_path) {
+                    eprintln!("io_uring RESP server error: {e}");
+                }
+            });
+            // Keep the tokio task alive
+            std::future::pending::<()>().await;
+        } else {
+            if let Err(e) = resp::server::run(
+                &resp_config.resp_host,
+                resp_config.resp_port,
+                resp_engine,
+                resp_auth,
+                resp_config.db_path.clone(),
+            )
+            .await
+            {
+                eprintln!("RESP server error: {e}");
+            }
+        }
+
+        #[cfg(not(feature = "io-uring"))]
         if let Err(e) = resp::server::run(
             &resp_config.resp_host,
             resp_config.resp_port,

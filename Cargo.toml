@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = []
-io-uring = ["dep:io-uring"]
+io-uring = ["dep:io-uring", "dep:slab", "dep:libc"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -24,6 +24,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 memchr = "2"
 toml = "0.8"
 io-uring = { version = "0.7", optional = true }
+slab = { version = "0.4", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
