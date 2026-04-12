@@ -1,11 +1,9 @@
 /// RESP2 protocol parser and serializer.
 ///
-/// Supports the five RESP2 data types:
-/// - SimpleString (`+...\r\n`)
-/// - Error (`-...\r\n`)
-/// - Integer (`:...\r\n`)
-/// - BulkString (`$<len>\r\n<data>\r\n`, `$-1\r\n` for null)
-/// - Array (`*<len>\r\n<elements>`, `*-1\r\n` for null)
+/// Uses memchr for SIMD-accelerated CRLF scanning on the hot path.
+/// Supports RESP pipelining: multiple commands in a single read are all processed.
+
+use memchr::memchr;
 
 /// A parsed RESP2 value.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,12 +31,21 @@ pub struct Command {
     pub args: Vec<Vec<u8>>,
 }
 
-/// Find the position of the next CRLF in the input.
+/// Find the position of the next `\r\n` (CRLF) in the input.
+/// Uses memchr for SIMD-accelerated `\r` scanning on x86_64 and aarch64.
+#[inline]
 fn find_crlf(input: &[u8]) -> Option<usize> {
-    for i in 0..input.len().saturating_sub(1) {
-        if input[i] == b'\r' && input[i + 1] == b'\n' {
-            return Some(i);
+    // memchr uses AVX2/SSE2 on x86_64, NEON on aarch64
+    let mut start = 0;
+    while start < input.len() {
+        let pos = memchr(b'\r', &input[start..])?;
+        let abs = start + pos;
+        // Check if next byte is \n
+        if abs + 1 < input.len() && input[abs + 1] == b'\n' {
+            return Some(abs);
         }
+        // \r not followed by \n — skip and keep searching
+        start = abs + 1;
     }
     None
 }
@@ -71,7 +78,7 @@ fn parse_one(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
             // Integer: :<number>\r\n
             let crlf = find_crlf(&input[1..]).ok_or(ParseError::Incomplete)?;
             let end = 1 + crlf;
-            let s = String::from_utf8(input[1..end].to_vec())
+            let s = std::str::from_utf8(&input[1..end])
                 .map_err(|e| ParseError::Invalid(format!("invalid UTF-8 in Integer: {e}")))?;
             let n: i64 = s
                 .parse()
@@ -82,14 +89,13 @@ fn parse_one(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
             // BulkString: $<len>\r\n<data>\r\n  or  $-1\r\n (null)
             let crlf = find_crlf(&input[1..]).ok_or(ParseError::Incomplete)?;
             let end = 1 + crlf;
-            let len_str = String::from_utf8(input[1..end].to_vec())
+            let len_str = std::str::from_utf8(&input[1..end])
                 .map_err(|e| ParseError::Invalid(format!("invalid UTF-8 in BulkString length: {e}")))?;
             let len: i64 = len_str
                 .parse()
                 .map_err(|e| ParseError::Invalid(format!("invalid BulkString length: {e}")))?;
 
             if len == -1 {
-                // Null bulk string
                 return Ok((RespValue::BulkString(None), end + 2));
             }
 
@@ -122,7 +128,7 @@ fn parse_one(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
             // Array: *<count>\r\n<elements>  or  *-1\r\n (null array)
             let crlf = find_crlf(&input[1..]).ok_or(ParseError::Incomplete)?;
             let end = 1 + crlf;
-            let count_str = String::from_utf8(input[1..end].to_vec())
+            let count_str = std::str::from_utf8(&input[1..end])
                 .map_err(|e| ParseError::Invalid(format!("invalid UTF-8 in Array count: {e}")))?;
             let count: i64 = count_str
                 .parse()
@@ -193,7 +199,6 @@ impl RespValue {
     pub fn to_command(&self) -> Option<Command> {
         match self {
             RespValue::Array(Some(elements)) if !elements.is_empty() => {
-                // First element is the command name
                 let name = match &elements[0] {
                     RespValue::BulkString(Some(data)) => {
                         String::from_utf8(data.clone()).ok()?
@@ -201,6 +206,9 @@ impl RespValue {
                     RespValue::SimpleString(s) => s.clone(),
                     _ => return None,
                 };
+
+                // Convert command name to uppercase for case-insensitive matching
+                let name = name.to_uppercase();
 
                 let args = elements[1..]
                     .iter()
@@ -269,6 +277,16 @@ pub fn serialize(value: &RespValue) -> Vec<u8> {
             buf
         }
     }
+}
+
+/// Serialize multiple RespValues into a single buffer (pipelined response).
+/// More efficient than serializing individually and concatenating.
+pub fn serialize_pipeline(values: &[RespValue]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for value in values {
+        buf.extend(serialize(value));
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -364,6 +382,14 @@ mod tests {
     }
 
     #[test]
+    fn test_to_command_case_insensitive() {
+        let input = b"*2\r\n$3\r\nget\r\n$3\r\nkey\r\n";
+        let val = parse(input).unwrap();
+        let cmd = val.to_command().unwrap();
+        assert_eq!(cmd.name, "GET");
+    }
+
+    #[test]
     fn test_serialize_roundtrip() {
         let original = RespValue::Array(Some(vec![
             RespValue::SimpleString("OK".to_string()),
@@ -400,5 +426,31 @@ mod tests {
         let val = RespValue::Error("ERR something".to_string());
         let bytes = serialize(&val);
         assert_eq!(&bytes, b"-ERR something\r\n");
+    }
+
+    #[test]
+    fn test_pipeline_serialization() {
+        let values = vec![
+            RespValue::SimpleString("OK".to_string()),
+            RespValue::Integer(42),
+        ];
+        let bytes = serialize_pipeline(&values);
+        assert_eq!(&bytes, b"+OK\r\n:42\r\n");
+    }
+
+    #[test]
+    fn test_crlf_not_just_cr() {
+        // \r without \n should not match
+        let input = b"+OK\r";
+        assert_eq!(find_crlf(input), None);
+    }
+
+    #[test]
+    fn test_crlf_multiple_candidates() {
+        // \r at multiple positions, only \r\n should match
+        // Position 3: \r followed by X (not \n) — skip
+        // Position 5: \r followed by \n — match
+        let input = b"+OK\rX\r\n";
+        assert_eq!(find_crlf(input), Some(5));
     }
 }

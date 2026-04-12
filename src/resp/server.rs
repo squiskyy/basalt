@@ -1,19 +1,19 @@
-use std::error::Error;
 use std::sync::Arc;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::store::engine::KvEngine;
 
 use super::commands::CommandHandler;
-use super::parser::{parse_pipeline, serialize};
+use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
 /// Run the RESP2 TCP server.
 ///
 /// Binds to `host:port`, accepts connections, and spawns a task per connection.
 /// Supports RESP pipelining: multiple commands in a single read are all processed.
-pub async fn run(host: &str, port: u16, engine: Arc<KvEngine>) -> Result<(), Box<dyn Error>> {
+/// Uses buffer recycling and batched writes for maximum throughput.
+pub async fn run(host: &str, port: u16, engine: Arc<KvEngine>) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("RESP server listening on {host}:{port}");
 
@@ -31,59 +31,61 @@ pub async fn run(host: &str, port: u16, engine: Arc<KvEngine>) -> Result<(), Box
 }
 
 async fn handle_connection(
-    socket: TcpStream,
+    stream: TcpStream,
     handler: Arc<CommandHandler>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    use tokio::io::AsyncReadExt;
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut reader, mut writer) = stream.into_split();
 
-    let mut stream = socket;
-    let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 4096];
+    // Recyclable read buffer — grows to fit workload but doesn't shrink
+    let mut read_buf = Vec::with_capacity(8192);
+    // Reusable staging area for partial reads
+    let mut tmp = [0u8; 8192];
 
     loop {
-        let n = stream.read(&mut tmp).await?;
+        let n = reader.read(&mut tmp).await?;
         if n == 0 {
             // Connection closed by client
             return Ok(());
         }
-        buf.extend_from_slice(&tmp[..n]);
+        read_buf.extend_from_slice(&tmp[..n]);
 
-        // Process all complete RESP values in the buffer (pipelining support)
+        // Process all complete RESP values in the buffer (pipelining)
         loop {
-            let (values, consumed) = parse_pipeline(&buf);
+            let (values, consumed) = parse_pipeline(&read_buf);
             if values.is_empty() {
                 break;
             }
 
-            // Remove consumed bytes from the buffer
-            buf.drain(..consumed);
+            // Remove consumed bytes from the read buffer
+            read_buf.drain(..consumed);
 
             // Dispatch each command and collect responses
-            let mut responses = Vec::with_capacity(values.len());
+            let mut responses: Vec<RespValue> = Vec::with_capacity(values.len());
             for value in values {
                 match value.to_command() {
                     Some(cmd) => {
                         let resp = handler.handle(&cmd);
-                        responses.push(serialize(&resp));
+                        responses.push(resp);
                     }
                     None => {
-                        let err = serialize(&super::parser::RespValue::Error(
+                        responses.push(RespValue::Error(
                             "ERR invalid command format".to_string(),
                         ));
-                        responses.push(err);
                     }
                 }
             }
 
-            // Write all responses at once for efficiency
+            // Batch-serialize all responses into one write — reduces syscalls
             if !responses.is_empty() {
-                let mut out = Vec::new();
-                for r in responses {
-                    out.extend_from_slice(&r);
-                }
-                stream.write_all(&out).await?;
-                stream.flush().await?;
+                let out = serialize_pipeline(&responses);
+                writer.write_all(&out).await?;
+                writer.flush().await?;
             }
+        }
+
+        // Keep read_buf from growing unbounded — trim if it got large but is now empty
+        if read_buf.is_empty() && read_buf.capacity() > 65536 {
+            read_buf = Vec::with_capacity(8192);
         }
     }
 }

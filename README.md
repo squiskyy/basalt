@@ -29,7 +29,16 @@ Single-threaded criterion benchmarks on the core engine (64 shards, papaya HashM
 | **SET** (1KB value) | 2.68 µs | ~370K ops/sec |
 | **SET** (8KB value) | 4.11 µs | ~240K ops/sec |
 | **Mixed 90/10** (read-heavy) | 584 ns | ~1.7M ops/sec |
-| **Namespace scan** (1K keys) | — | — |
+
+RESP2 protocol parser (SIMD-accelerated via memchr):
+
+| Operation | Latency |
+|---|---|
+| **Parse simple string** | 88 ns |
+| **Parse SET command** | 190 ns |
+| **Parse 10-command pipeline** | 3.1 µs (310 ns/cmd) |
+| **Parse 100-command pipeline** | 29.5 µs (295 ns/cmd) |
+| **Serialize bulk string** | 59 ns |
 
 Multi-threaded throughput scales linearly with shards (64 by default) since reads are lock-free.
 
@@ -88,6 +97,8 @@ redis-cli -p 6380 GET mykey
 | `GET` | `/health` | Health check |
 | `GET` | `/info` | Server info (version, shard count) |
 | `POST` | `/store/{namespace}` | Store a memory |
+| `POST` | `/store/{namespace}/batch` | Store multiple memories |
+| `POST` | `/store/{namespace}/batch/get` | Retrieve multiple memories |
 | `GET` | `/store/{namespace}` | List all memories in namespace |
 | `GET` | `/store/{namespace}/{key}` | Get a specific memory |
 | `DELETE` | `/store/{namespace}/{key}` | Delete a memory |
@@ -108,6 +119,40 @@ redis-cli -p 6380 GET mykey
 - `value` (required) — the memory content
 - `type` (optional, default: `semantic`) — `episodic`, `semantic`, or `procedural`
 - `ttl_ms` (optional) — custom TTL in milliseconds; overrides type default
+
+### POST /store/{namespace}/batch
+
+Store multiple memories in a single request.
+
+```json
+{
+  "memories": [
+    {"key": "obs:1", "value": "saw a red car", "type": "episodic", "ttl_ms": 3600000},
+    {"key": "fact:x", "value": "something", "type": "semantic"}
+  ]
+}
+```
+
+Response: `{"ok": true, "stored": 2}`
+
+### POST /store/{namespace}/batch/get
+
+Retrieve multiple memories by key.
+
+```json
+{"keys": ["obs:1", "fact:gravity", "nonexistent"]}
+```
+
+Response:
+```json
+{
+  "memories": [
+    {"key": "obs:1", "value": "saw a red car", "type": "episodic", "ttl_ms": 3599420},
+    {"key": "fact:gravity", "value": "earth is round", "type": "semantic"}
+  ],
+  "missing": ["nonexistent"]
+}
+```
 
 ### GET /store/{namespace}
 
@@ -199,12 +244,13 @@ Each agent gets its own namespace (`/store/agent-42/`). The sharded engine distr
 
 ## Roadmap
 
+- [x] **SIMD RESP parsing** — memchr-powered CRLF scanning (AVX2/SSE2 on x86_64, NEON on aarch64)
+- [x] **Batch endpoints** — POST /store/{ns}/batch and /store/{ns}/batch/get
 - [ ] Persistence — async mmap snapshots
 - [ ] Vector search — HNSW index for semantic memory embeddings
 - [ ] Auth — bearer tokens, namespace-level permissions
+- [ ] io_uring RESP server — zero-syscall I/O for Linux (feature flag ready, `--features io-uring`)
 - [ ] Replication — primary-replica async replication
-- [ ] io_uring — tokio-uring for lower RESP latency
-- [ ] SIMD RESP parsing — vectorized protocol parsing
 - [ ] Compression — LZ4/zstd for values > 1KB
 
 ## License

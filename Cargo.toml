@@ -5,6 +5,10 @@ edition = "2024"
 description = "Ultra-high performance KV store for AI memory"
 license = "MIT"
 
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
@@ -17,6 +21,8 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+memchr = "2"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -25,4 +31,8 @@ rand = "0.9"
 
 [[bench]]
 name = "basalt_bench"
+harness = false
+
+[[bench]]
+name = "resp_bench"
 harness = false
