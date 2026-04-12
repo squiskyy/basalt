@@ -377,6 +377,8 @@ http_port = 9999
             None,
             None,
             Some(32),
+            #[cfg(feature = "io-uring")]
+            None, // io_uring
             Some("/data/basalt".to_string()),
             Some(10_000u64),
             vec!["bsk-test:*".to_string()],

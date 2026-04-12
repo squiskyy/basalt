@@ -382,7 +382,7 @@ Returns `412` (HTTP) or `-ERR no db_path configured` (RESP) if persistence is di
 - [x] **Auth** — bearer tokens with namespace scoping (HTTP + RESP AUTH command)
 - [x] **Persistence** — binary snapshots with auto-interval, manual trigger, startup restore
 - [ ] Vector search — HNSW index for semantic memory embeddings
-- [ ] io_uring RESP server — zero-syscall I/O for Linux (feature flag ready, `--features io-uring`)
+- [x] io_uring RESP server — zero-syscall I/O for Linux (feature flag: `--features io-uring`)
 - [ ] Replication — primary-replica async replication
 - [ ] Compression — LZ4/zstd for values > 1KB
 
