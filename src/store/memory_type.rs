@@ -27,12 +27,12 @@ impl fmt::Display for MemoryType {
 impl MemoryType {
     /// Returns the default TTL in milliseconds for this memory type.
     ///
-    /// - Episodic: 60_000 ms (1 minute) — short-lived event memory
+    /// - Episodic: 3_600_000 ms (1 hour) — short-lived event memory
     /// - Semantic: no expiry (None) — persistent factual knowledge
     /// - Procedural: no expiry (None) — persistent skill data
     pub fn default_ttl_ms(&self) -> Option<u64> {
         match self {
-            MemoryType::Episodic => Some(60_000),
+            MemoryType::Episodic => Some(3_600_000),
             MemoryType::Semantic => None,
             MemoryType::Procedural => None,
         }
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn test_default_ttl() {
-        assert_eq!(MemoryType::Episodic.default_ttl_ms(), Some(60_000));
+        assert_eq!(MemoryType::Episodic.default_ttl_ms(), Some(3_600_000));
         assert_eq!(MemoryType::Semantic.default_ttl_ms(), None);
         assert_eq!(MemoryType::Procedural.default_ttl_ms(), None);
     }

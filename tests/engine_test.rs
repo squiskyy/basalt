@@ -128,7 +128,7 @@ fn test_episodic_has_ttl() {
     // Episodic memory type should have a default TTL
     let ttl = MemoryType::Episodic.default_ttl_ms();
     assert!(ttl.is_some(), "Episodic should have a default TTL");
-    assert_eq!(ttl.unwrap(), 60_000, "Default episodic TTL should be 60_000 ms");
+    assert_eq!(ttl.unwrap(), 3_600_000, "Default episodic TTL should be 3_600_000 ms (1 hour)");
 
     // Semantic and Procedural should not have a default TTL
     assert!(MemoryType::Semantic.default_ttl_ms().is_none());
