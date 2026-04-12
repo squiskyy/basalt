@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::replication::ReplicationState;
 
 use super::parser::{Command, RespValue};
 
@@ -9,11 +10,16 @@ use super::parser::{Command, RespValue};
 pub struct CommandHandler {
     engine: Arc<KvEngine>,
     db_path: Option<String>,
+    repl_state: Option<Arc<ReplicationState>>,
 }
 
 impl CommandHandler {
     pub fn new(engine: Arc<KvEngine>, db_path: Option<String>) -> Self {
-        CommandHandler { engine, db_path }
+        CommandHandler { engine, db_path, repl_state: None }
+    }
+
+    pub fn with_replication(engine: Arc<KvEngine>, db_path: Option<String>, repl_state: Arc<ReplicationState>) -> Self {
+        CommandHandler { engine, db_path, repl_state: Some(repl_state) }
     }
 
     /// Dispatch a command and return a RESP value response.
@@ -35,10 +41,35 @@ impl CommandHandler {
             "MTYPE" => self.handle_mtype(cmd),
             "SNAP" => self.handle_snap(cmd),
             "VSEARCH" => self.handle_vsearch(cmd),
+            "REPLICAOF" => RespValue::Error("ERR REPLICAOF must be handled at connection level".to_string()),
             // AUTH is handled separately in the connection handler
             "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
         }
+    }
+
+    /// Handle REPLICAOF command — returns a special result that the connection handler
+    /// uses to initiate replication. This is not a normal RESP response.
+    pub fn handle_replicaof(&self, cmd: &Command) -> ReplicaofResult {
+        if cmd.args.is_empty() {
+            return ReplicaofResult::Error("ERR wrong number of arguments for 'REPLICAOF'".to_string());
+        }
+        let first = String::from_utf8_lossy(&cmd.args[0]).to_uppercase();
+        if first == "NO" && cmd.args.len() == 2 {
+            let second = String::from_utf8_lossy(&cmd.args[1]).to_uppercase();
+            if second == "ONE" {
+                return ReplicaofResult::NoOne;
+            }
+        }
+        if cmd.args.len() == 2 {
+            let host = String::from_utf8_lossy(&cmd.args[0]).to_string();
+            let port_str = String::from_utf8_lossy(&cmd.args[1]);
+            match port_str.parse::<u16>() {
+                Ok(port) => return ReplicaofResult::Replicate { host, port },
+                Err(_) => return ReplicaofResult::Error("ERR invalid port for REPLICAOF".to_string()),
+            }
+        }
+        ReplicaofResult::Error("ERR syntax error for REPLICAOF. Use: REPLICAOF host port | REPLICAOF NO ONE".to_string())
     }
 
     fn handle_ping(&self, cmd: &Command) -> RespValue {
@@ -105,9 +136,16 @@ impl CommandHandler {
             }
         }
 
-        self.engine.set(&key, value, ttl_ms, MemoryType::Semantic)
-            .map(|_| RespValue::SimpleString("OK".to_string()))
-            .unwrap_or_else(|_| RespValue::Error("ERR max entries exceeded".to_string()))
+        let mem_type = MemoryType::Semantic;
+        match self.engine.set(&key, value.clone(), ttl_ms, mem_type) {
+            Ok(()) => {
+                if let Some(ref repl) = self.repl_state {
+                    repl.record_set(key.as_bytes(), &value, mem_type, ttl_ms);
+                }
+                RespValue::SimpleString("OK".to_string())
+            }
+            Err(_) => RespValue::Error("ERR max entries exceeded".to_string()),
+        }
     }
 
     fn handle_get(&self, cmd: &Command) -> RespValue {
@@ -129,6 +167,9 @@ impl CommandHandler {
         for arg in &cmd.args {
             let key = String::from_utf8_lossy(arg).to_string();
             if self.engine.delete(&key) {
+                if let Some(ref repl) = self.repl_state {
+                    repl.record_delete(key.as_bytes());
+                }
                 deleted += 1;
             }
         }
@@ -161,8 +202,12 @@ impl CommandHandler {
         while i < cmd.args.len() {
             let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
             let value = cmd.args[i + 1].clone();
-            match self.engine.set(&key, value, None, MemoryType::Semantic) {
-                Ok(()) => {}
+            match self.engine.set(&key, value.clone(), None, MemoryType::Semantic) {
+                Ok(()) => {
+                    if let Some(ref repl) = self.repl_state {
+                        repl.record_set(key.as_bytes(), &value, MemoryType::Semantic, None);
+                    }
+                }
                 Err(_) => {
                     return RespValue::Error("ERR max entries exceeded".to_string());
                 }
@@ -193,8 +238,23 @@ impl CommandHandler {
     }
 
     fn handle_info(&self, cmd: &Command) -> RespValue {
-        // INFO optionally takes a section name; we ignore it and return everything
-        let _ = cmd; // suppress unused warning
+        let section = if !cmd.args.is_empty() {
+            String::from_utf8_lossy(&cmd.args[0]).to_lowercase()
+        } else {
+            String::new()
+        };
+
+        if section == "replication" {
+            if let Some(ref repl) = self.repl_state {
+                return RespValue::BulkString(Some(repl.info_string().into_bytes()));
+            } else {
+                return RespValue::BulkString(Some(
+                    "# Replication\r\nrole:primary\r\nconnected_replicas:0\r\nreplication_offset:0\r\nwal_size:0\r\n".to_string().into_bytes(),
+                ));
+            }
+        }
+
+        // Default INFO response
         let info = format!(
             "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{}\r\ncompression_threshold:{}\r\n",
             self.engine.shard_count(),
@@ -253,9 +313,15 @@ impl CommandHandler {
             }
         }
 
-        self.engine.set(&key, value, ttl_ms, memory_type)
-            .map(|_| RespValue::SimpleString("OK".to_string()))
-            .unwrap_or_else(|_| RespValue::Error("ERR max entries exceeded".to_string()))
+        match self.engine.set(&key, value.clone(), ttl_ms, memory_type) {
+            Ok(()) => {
+                if let Some(ref repl) = self.repl_state {
+                    repl.record_set(key.as_bytes(), &value, memory_type, ttl_ms);
+                }
+                RespValue::SimpleString("OK".to_string())
+            }
+            Err(_) => RespValue::Error("ERR max entries exceeded".to_string()),
+        }
     }
 
     fn handle_mgett(&self, cmd: &Command) -> RespValue {
@@ -407,6 +473,16 @@ impl CommandHandler {
     }
 }
 
+/// Result of REPLICAOF command, used by the connection handler.
+pub enum ReplicaofResult {
+    /// REPLICAOF host port
+    Replicate { host: String, port: u16 },
+    /// REPLICAOF NO ONE
+    NoOne,
+    /// Error
+    Error(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +617,44 @@ mod tests {
             RespValue::Error(s) => assert!(s.contains("unknown command")),
             _ => panic!("expected error"),
         }
+    }
+
+    #[test]
+    fn test_replicaof_no_one() {
+        let handler = make_handler();
+        let cmd = Command {
+            name: "REPLICAOF".to_string(),
+            args: vec![b"NO".to_vec(), b"ONE".to_vec()],
+        };
+        let result = handler.handle_replicaof(&cmd);
+        assert!(matches!(result, ReplicaofResult::NoOne));
+    }
+
+    #[test]
+    fn test_replicaof_host_port() {
+        let handler = make_handler();
+        let cmd = Command {
+            name: "REPLICAOF".to_string(),
+            args: vec![b"127.0.0.1".to_vec(), b"6380".to_vec()],
+        };
+        let result = handler.handle_replicaof(&cmd);
+        match result {
+            ReplicaofResult::Replicate { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 6380);
+            }
+            _ => panic!("expected Replicate"),
+        }
+    }
+
+    #[test]
+    fn test_replicaof_invalid() {
+        let handler = make_handler();
+        let cmd = Command {
+            name: "REPLICAOF".to_string(),
+            args: vec![],
+        };
+        let result = handler.handle_replicaof(&cmd);
+        assert!(matches!(result, ReplicaofResult::Error(_)));
     }
 }

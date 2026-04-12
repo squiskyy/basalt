@@ -5,6 +5,7 @@ use tracing::info;
 
 pub mod config;
 pub mod http;
+pub mod replication;
 pub mod resp;
 pub mod store;
 
@@ -64,6 +65,10 @@ struct Args {
     #[arg(long, value_name = "BYTES")]
     compression_threshold: Option<usize>,
 
+    /// WAL size for replication (number of entries, overrides config file)
+    #[arg(long, value_name = "N")]
+    wal_size: Option<usize>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -120,6 +125,7 @@ async fn main() {
         args.max_entries,
         args.snapshot_compression_threshold,
         args.compression_threshold,
+        args.wal_size,
     );
 
     // Resolve auth tokens from file + CLI
@@ -227,6 +233,13 @@ async fn main() {
     let http_config = cfg.server.clone();
     let resp_config = cfg.server.clone();
 
+    // Create replication state
+    let repl_state = Arc::new(replication::ReplicationState::new_primary(
+        engine.clone(),
+        cfg.server.wal_size,
+    ));
+    info!("replication: primary mode, WAL size: {} entries", cfg.server.wal_size);
+
     let http_server = tokio::spawn(async move {
         let app = http::server::app(http_engine, http_auth, http_config.db_path.clone());
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
@@ -250,12 +263,13 @@ async fn main() {
             // Keep the tokio task alive
             std::future::pending::<()>().await;
         } else {
-            if let Err(e) = resp::server::run(
+            if let Err(e) = resp::server::run_with_replication(
                 &resp_config.resp_host,
                 resp_config.resp_port,
                 resp_engine,
                 resp_auth,
                 resp_config.db_path.clone(),
+                repl_state.clone(),
             )
             .await
             {
@@ -264,12 +278,13 @@ async fn main() {
         }
 
         #[cfg(not(feature = "io-uring"))]
-        if let Err(e) = resp::server::run(
+        if let Err(e) = resp::server::run_with_replication(
             &resp_config.resp_host,
             resp_config.resp_port,
             resp_engine,
             resp_auth,
             resp_config.db_path.clone(),
+            repl_state.clone(),
         )
         .await
         {

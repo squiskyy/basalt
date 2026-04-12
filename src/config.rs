@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub snapshot_compression_threshold: usize,
     /// Minimum value size (bytes) to LZ4-compress values in memory (runtime). 0 = disable.
     pub compression_threshold: usize,
+    /// WAL size for replication (number of entries to keep). Default 10000.
+    pub wal_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,7 @@ impl Default for ServerConfig {
             max_entries: 1_000_000,
             snapshot_compression_threshold: 1024,
             compression_threshold: 1024,
+            wal_size: 10_000,
         }
     }
 }
@@ -117,6 +120,8 @@ struct ServerFile {
     snapshot_compression_threshold: Option<usize>,
     #[serde(default)]
     compression_threshold: Option<usize>,
+    #[serde(default)]
+    wal_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -164,6 +169,7 @@ impl Config {
                 .server
                 .compression_threshold
                 .unwrap_or(server_defaults.compression_threshold),
+            wal_size: file.server.wal_size.unwrap_or(server_defaults.wal_size),
         };
 
         let auth = AuthConfig {
@@ -192,6 +198,7 @@ impl Config {
         max_entries: Option<usize>,
         snapshot_compression_threshold: Option<usize>,
         compression_threshold: Option<usize>,
+        wal_size: Option<usize>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -235,6 +242,9 @@ impl Config {
         }
         if let Some(v) = compression_threshold {
             self.server.compression_threshold = v;
+        }
+        if let Some(v) = wal_size {
+            self.server.wal_size = v;
         }
     }
 
@@ -441,6 +451,7 @@ http_port = 9999
             Some(500_000), // max_entries
             None,          // snapshot_compression_threshold
             None,          // compression_threshold
+            None,          // wal_size
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);
