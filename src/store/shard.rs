@@ -12,6 +12,8 @@ pub struct Entry {
     /// UNIX timestamp in milliseconds when this entry expires. `None` means no expiry.
     pub expires_at: Option<u64>,
     pub memory_type: MemoryType,
+    /// Optional embedding vector for semantic similarity search.
+    pub embedding: Option<Vec<f32>>,
 }
 
 impl Entry {
@@ -129,6 +131,7 @@ impl Shard {
                 compressed,
                 expires_at: entry.expires_at,
                 memory_type: entry.memory_type,
+                embedding: entry.embedding,
             }
         } else {
             entry
@@ -154,6 +157,7 @@ impl Shard {
                 compressed,
                 expires_at: entry.expires_at,
                 memory_type: entry.memory_type,
+                embedding: entry.embedding,
             }
         } else {
             entry
@@ -182,6 +186,7 @@ impl Shard {
             compressed: false,
             expires_at: entry.expires_at,
             memory_type: entry.memory_type,
+            embedding: entry.embedding,
         })
     }
 
@@ -231,6 +236,7 @@ impl Shard {
                         compressed: false,
                         expires_at: v.expires_at,
                         memory_type: v.memory_type,
+                        embedding: v.embedding.clone(),
                     },
                 ));
             }
@@ -300,6 +306,7 @@ mod tests {
             compressed: false,
             expires_at,
             memory_type,
+            embedding: None,
         }
     }
 

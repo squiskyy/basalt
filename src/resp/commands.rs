@@ -34,6 +34,7 @@ impl CommandHandler {
             "MSCAN" => self.handle_mscan(cmd),
             "MTYPE" => self.handle_mtype(cmd),
             "SNAP" => self.handle_snap(cmd),
+            "VSEARCH" => self.handle_vsearch(cmd),
             // AUTH is handled separately in the connection handler
             "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
@@ -336,6 +337,73 @@ impl CommandHandler {
             }
             None => RespValue::Error("ERR no db_path configured; persistence is disabled".to_string()),
         }
+    }
+
+    fn handle_vsearch(&self, cmd: &Command) -> RespValue {
+        // VSEARCH <namespace> <embedding_json> [COUNT <n>]
+        if cmd.args.len() < 2 {
+            return RespValue::Error(
+                "ERR wrong number of arguments for 'VSEARCH'".to_string(),
+            );
+        }
+
+        let namespace = String::from_utf8_lossy(&cmd.args[0]).to_string();
+
+        // Parse embedding JSON array
+        let embedding_json = String::from_utf8_lossy(&cmd.args[1]);
+        let embedding: Vec<f32> = match serde_json::from_str(&embedding_json) {
+            Ok(vec) => vec,
+            Err(e) => {
+                return RespValue::Error(format!(
+                    "ERR invalid embedding JSON: {e}"
+                ));
+            }
+        };
+
+        // Parse optional COUNT parameter
+        let mut top_k: usize = 10;
+        let mut i = 2;
+        while i < cmd.args.len() {
+            let flag = String::from_utf8_lossy(&cmd.args[i]).to_uppercase();
+            match flag.as_str() {
+                "COUNT" => {
+                    if i + 1 >= cmd.args.len() {
+                        return RespValue::Error(
+                            "ERR syntax error — COUNT requires a value".to_string(),
+                        );
+                    }
+                    match String::from_utf8_lossy(&cmd.args[i + 1]).parse::<usize>() {
+                        Ok(n) => top_k = n,
+                        Err(_) => {
+                            return RespValue::Error(
+                                "ERR COUNT value must be a positive integer".to_string(),
+                            );
+                        }
+                    }
+                    i += 2;
+                }
+                _ => {
+                    return RespValue::Error(format!("ERR syntax error — unknown flag '{flag}'"));
+                }
+            }
+        }
+
+        let results = self.engine.search_embedding(&namespace, &embedding, top_k);
+
+        // Return as flat array: [key1, distance1, value1, key2, distance2, value2, ...]
+        let items: Vec<RespValue> = results
+            .into_iter()
+            .flat_map(|r| {
+                let dist_str = format!("{:.6}", r.distance);
+                vec![
+                    RespValue::BulkString(Some(r.key.into_bytes())),
+                    RespValue::BulkString(Some(dist_str.into_bytes())),
+                    RespValue::BulkString(Some(r.value)),
+                ]
+            })
+            .collect();
+
+        RespValue::Array(Some(items))
     }
 }
 

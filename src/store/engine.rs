@@ -1,7 +1,10 @@
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, Shard, ShardFullError};
+use crate::store::vector::{HnswIndex, VectorSearchResult, current_version, increment_version};
 use fxhash::FxHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metadata returned alongside a value when using `get_with_meta`.
@@ -21,6 +24,9 @@ pub struct KvEngine {
     shard_mask: usize,
     max_entries: usize,
     compression_threshold: usize,
+    /// Per-namespace HNSW vector indices, protected by a Mutex.
+    /// Key: namespace (prefix before the first `:` in a key, or the full key).
+    vector_indexes: Mutex<HashMap<String, HnswIndex>>,
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -63,6 +69,7 @@ impl KvEngine {
             shard_mask: count - 1,
             max_entries,
             compression_threshold: 1024,
+            vector_indexes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +91,7 @@ impl KvEngine {
             shard_mask: count - 1,
             max_entries,
             compression_threshold,
+            vector_indexes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,9 +112,32 @@ impl KvEngine {
             compressed: false, // Shard::set will compress if needed
             expires_at,
             memory_type,
+            embedding: None,
         };
         let idx = self.shard_index(key);
-        self.shards[idx].set(key.to_string(), entry)
+        self.shards[idx].set(key.to_string(), entry)?;
+        // Increment version on any set (could affect vector index)
+        increment_version();
+        Ok(())
+    }
+
+    /// Set a key with explicit TTL, memory type, and an optional embedding vector.
+    /// Returns Err(ShardFullError) if the target shard is at capacity.
+    /// The vector index version is incremented to trigger a rebuild on next search.
+    pub fn set_with_embedding(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType, embedding: Option<Vec<f32>>) -> Result<(), ShardFullError> {
+        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let entry = Entry {
+            value,
+            compressed: false,
+            expires_at,
+            memory_type,
+            embedding,
+        };
+        let idx = self.shard_index(key);
+        self.shards[idx].set(key.to_string(), entry)?;
+        // Increment version (any set could affect vector index)
+        increment_version();
+        Ok(())
     }
 
     /// Force-set a key, ignoring shard capacity limits.
@@ -118,6 +149,7 @@ impl KvEngine {
             compressed: false, // Shard::set_force will compress if needed
             expires_at,
             memory_type,
+            embedding: None,
         };
         let idx = self.shard_index(key);
         self.shards[idx].set_force(key.to_string(), entry);
@@ -147,7 +179,11 @@ impl KvEngine {
     /// Delete a key. Returns true if the key existed.
     pub fn delete(&self, key: &str) -> bool {
         let idx = self.shard_index(key);
-        self.shards[idx].delete(key)
+        let deleted = self.shards[idx].delete(key);
+        if deleted {
+            increment_version();
+        }
+        deleted
     }
 
     /// Scan all entries whose keys start with `prefix` across all shards.
@@ -175,6 +211,9 @@ impl KvEngine {
         let mut total = 0;
         for shard in &self.shards {
             total += shard.delete_prefix(prefix);
+        }
+        if total > 0 {
+            increment_version();
         }
         total
     }
@@ -214,6 +253,85 @@ impl KvEngine {
     /// Return the compression threshold in bytes.
     pub fn compression_threshold(&self) -> usize {
         self.compression_threshold
+    }
+
+    /// Search for entries with embeddings similar to the query embedding within a namespace.
+    ///
+    /// The namespace is the prefix used in key storage (e.g., "myns" for keys "myns:key1").
+    /// If the HNSW index for this namespace is stale or missing, it will be rebuilt.
+    /// Returns up to `top_k` results sorted by cosine distance (lower = more similar).
+    pub fn search_embedding(
+        &self,
+        namespace: &str,
+        embedding: &[f32],
+        top_k: usize,
+    ) -> Vec<VectorSearchResult> {
+        let prefix = format!("{}:", namespace);
+        let version = current_version();
+
+        // Check if we need to rebuild the index
+        let needs_rebuild = {
+            let indexes = self.vector_indexes.lock().unwrap();
+            match indexes.get(namespace) {
+                Some(idx) => idx.is_stale(version),
+                None => true,
+            }
+        };
+
+        if needs_rebuild {
+            // Collect entries with embeddings for this namespace
+            let entries: Vec<(String, Vec<f32>, Vec<u8>)> = {
+                let all = self.scan_prefix(&prefix);
+                all.into_iter()
+                    .filter_map(|(key, value, _meta)| {
+                        // Get the full entry to access embedding
+                        let idx = self.shard_index(&key);
+                        let entry = self.shards[idx].get_entry(&key)?;
+                        let emb = entry.embedding?;
+                        let display_key = key.strip_prefix(&prefix)?.to_string();
+                        Some((display_key, emb, value))
+                    })
+                    .collect()
+            };
+
+            if entries.is_empty() {
+                // No embeddings in this namespace — clear the index
+                let mut indexes = self.vector_indexes.lock().unwrap();
+                indexes.remove(namespace);
+                return Vec::new();
+            }
+
+            // Build a values map for search results
+            let values: HashMap<String, Vec<u8>> = entries
+                .iter()
+                .map(|(k, _, v)| (k.clone(), v.clone()))
+                .collect();
+
+            // Rebuild the index
+            let mut indexes = self.vector_indexes.lock().unwrap();
+            let index = indexes.entry(namespace.to_string()).or_insert_with(HnswIndex::new);
+            index.rebuild(&entries, version);
+
+            // Search using the rebuilt index
+            return index.search(embedding, top_k, &values);
+        }
+
+        // Index is up-to-date, just search
+        let indexes = self.vector_indexes.lock().unwrap();
+        if let Some(index) = indexes.get(namespace) {
+            // Build values map from current data
+            let all = self.scan_prefix(&prefix);
+            let values: HashMap<String, Vec<u8>> = all
+                .into_iter()
+                .filter_map(|(key, value, _meta)| {
+                    let display_key = key.strip_prefix(&prefix)?.to_string();
+                    Some((display_key, value))
+                })
+                .collect();
+            index.search(embedding, top_k, &values)
+        } else {
+            Vec::new()
+        }
     }
 }
 

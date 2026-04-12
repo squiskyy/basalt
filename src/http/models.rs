@@ -10,6 +10,9 @@ pub struct StoreRequest {
     pub r#type: Option<MemoryType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    /// Optional embedding vector for semantic similarity search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Request body for batch storing multiple memories.
@@ -85,4 +88,33 @@ pub struct ListQuery {
     pub r#type: Option<MemoryType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+}
+
+/// Request body for vector similarity search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchRequest {
+    /// The query embedding vector.
+    pub embedding: Vec<f32>,
+    /// Number of top results to return. Defaults to 10.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+}
+
+fn default_top_k() -> usize {
+    10
+}
+
+/// A single result from a vector similarity search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub key: String,
+    /// Cosine distance (0 = identical, 2 = opposite). Lower is more similar.
+    pub distance: f32,
+    pub value: String,
+}
+
+/// Response body for vector similarity search.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchResult>,
 }
