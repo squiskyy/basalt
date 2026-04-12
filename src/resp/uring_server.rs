@@ -123,18 +123,34 @@ pub fn run(
                             .user_data(token_idx as u64);
                         unsafe {
                             if let Err(e) = sq.push(&ae) {
-                                tracing::warn!("io_uring SQ full on accept re-arm, queuing to backlog: {e:?}");
+                                tracing::warn!(
+                                    "io_uring SQ full on accept re-arm, queuing to backlog: {e:?}"
+                                );
                                 backlog.push_back(ae);
                             }
                         }
                     }
                     Some(Token::Read { fd, conn_id }) => {
                         tracing::debug!("read error fd={fd}: {err}");
-                        close_conn(fd, conn_id, token_idx, &mut connections, &mut tokens, &mut read_bufs);
+                        close_conn(
+                            fd,
+                            conn_id,
+                            token_idx,
+                            &mut connections,
+                            &mut tokens,
+                            &mut read_bufs,
+                        );
                     }
                     Some(Token::Write { fd, conn_id }) => {
                         tracing::debug!("write error fd={fd}: {err}");
-                        close_conn(fd, conn_id, token_idx, &mut connections, &mut tokens, &mut read_bufs);
+                        close_conn(
+                            fd,
+                            conn_id,
+                            token_idx,
+                            &mut connections,
+                            &mut tokens,
+                            &mut read_bufs,
+                        );
                     }
                     None => {}
                 }
@@ -166,7 +182,10 @@ pub fn run(
                         .user_data(read_token as u64);
 
                     unsafe {
-                        if sq.push(&recv_e).is_err() {
+                        if let Err(e) = sq.push(&recv_e) {
+                            tracing::warn!(
+                                "io_uring SQ full on new-conn recv, queuing to backlog: {e:?}"
+                            );
                             backlog.push_back(recv_e);
                         }
                     }
@@ -174,7 +193,14 @@ pub fn run(
 
                 Some(Token::Read { fd, conn_id }) => {
                     if result == 0 {
-                        close_conn(fd, conn_id, token_idx, &mut connections, &mut tokens, &mut read_bufs);
+                        close_conn(
+                            fd,
+                            conn_id,
+                            token_idx,
+                            &mut connections,
+                            &mut tokens,
+                            &mut read_bufs,
+                        );
                         continue;
                     }
 
@@ -211,7 +237,10 @@ pub fn run(
                                 .build()
                                 .user_data(token_idx as u64);
                             unsafe {
-                                if sq.push(&recv_e).is_err() {
+                                if let Err(e) = sq.push(&recv_e) {
+                                    tracing::warn!(
+                                        "io_uring SQ full on read-rearm (no cmd), queuing to backlog: {e:?}"
+                                    );
                                     backlog.push_back(recv_e);
                                 }
                             }
@@ -225,28 +254,35 @@ pub fn run(
                         if let Some(cmd) = value.to_command() {
                             if cmd.name == "AUTH" {
                                 let resp = handle_auth_resp(
-                                    &cmd, &auth, &mut conn.authenticated, &mut conn.auth_token,
+                                    &cmd,
+                                    &auth,
+                                    &mut conn.authenticated,
+                                    &mut conn.auth_token,
                                 );
                                 responses.push(resp);
                                 continue;
                             }
                         }
                         if auth_enabled && !conn.authenticated {
-                            responses.push(RespValue::Error("NOAUTH Authentication required".into()));
+                            responses
+                                .push(RespValue::Error("NOAUTH Authentication required".into()));
                             continue;
                         }
                         match value.to_command() {
                             Some(cmd) => {
                                 // Per-command namespace authorization check
                                 if let Some(ref token) = conn.auth_token {
-                                    if let Err(err_resp) = check_command_namespace(&cmd, &auth, token) {
+                                    if let Err(err_resp) =
+                                        check_command_namespace(&cmd, &auth, token)
+                                    {
                                         responses.push(err_resp);
                                         continue;
                                     }
                                 }
                                 responses.push(handler.handle(&cmd));
                             }
-                            None => responses.push(RespValue::Error("ERR invalid command format".into())),
+                            None => responses
+                                .push(RespValue::Error("ERR invalid command format".into())),
                         }
                     }
 
@@ -262,7 +298,10 @@ pub fn run(
                             .build()
                             .user_data(token_idx as u64);
                         unsafe {
-                            if sq.push(&write_e).is_err() {
+                            if let Err(e) = sq.push(&write_e) {
+                                tracing::warn!(
+                                    "io_uring SQ full on write submit, queuing to backlog: {e:?}"
+                                );
                                 backlog.push_back(write_e);
                             }
                         }
@@ -275,7 +314,10 @@ pub fn run(
                                 .build()
                                 .user_data(token_idx as u64);
                             unsafe {
-                                if sq.push(&recv_e).is_err() {
+                                if let Err(e) = sq.push(&recv_e) {
+                                    tracing::warn!(
+                                        "io_uring SQ full on read-after-write, queuing to backlog: {e:?}"
+                                    );
                                     backlog.push_back(recv_e);
                                 }
                             }
@@ -299,14 +341,21 @@ pub fn run(
                     if conn.write_progress < total {
                         // Partial write — send remaining bytes
                         let ptr = unsafe {
-                            conn.write_buf.as_ref().unwrap().as_ptr().add(conn.write_progress)
+                            conn.write_buf
+                                .as_ref()
+                                .unwrap()
+                                .as_ptr()
+                                .add(conn.write_progress)
                         };
                         let remaining = total - conn.write_progress;
                         let write_e = opcode::Send::new(types::Fd(fd), ptr, remaining as _)
                             .build()
                             .user_data(token_idx as u64);
                         unsafe {
-                            if sq.push(&write_e).is_err() {
+                            if let Err(e) = sq.push(&write_e) {
+                                tracing::warn!(
+                                    "io_uring SQ full on partial-write, queuing to backlog: {e:?}"
+                                );
                                 backlog.push_back(write_e);
                             }
                         }
@@ -321,7 +370,10 @@ pub fn run(
                                 .build()
                                 .user_data(token_idx as u64);
                             unsafe {
-                                if sq.push(&recv_e).is_err() {
+                                if let Err(e) = sq.push(&recv_e) {
+                                    tracing::warn!(
+                                        "io_uring SQ full on read-after-completion, queuing to backlog: {e:?}"
+                                    );
                                     backlog.push_back(recv_e);
                                 }
                             }
@@ -355,7 +407,15 @@ fn drain_backlog(
             sq.sync();
         }
         match backlog.pop_front() {
-            Some(sqe) => unsafe { let _ = sq.push(&sqe); },
+            Some(sqe) => unsafe {
+                if let Err(e) = sq.push(&sqe) {
+                    tracing::warn!(
+                        "io_uring SQ still full in drain_backlog, re-queuing SQE: {e:?}"
+                    );
+                    backlog.push_front(sqe);
+                    break;
+                }
+            },
             None => break,
         }
     }
@@ -377,7 +437,9 @@ fn close_conn(
         tokens.remove(token_idx);
     }
     read_bufs.remove(&conn_id);
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
 }
 
 fn set_nonblocking(fd: i32) {
