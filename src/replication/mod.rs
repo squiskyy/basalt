@@ -99,6 +99,11 @@ impl ReplicationState {
     /// Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
     /// When ttl_ms is None, we store 0 in the WalEntry.
     pub fn record_set(&self, key: &[u8], value: &[u8], mem_type: MemoryType, ttl_ms: Option<u64>) {
+        self.record_set_with_embedding(key, value, mem_type, ttl_ms, None);
+    }
+
+    /// Record a SET write with an optional embedding vector in the WAL.
+    pub fn record_set_with_embedding(&self, key: &[u8], value: &[u8], mem_type: MemoryType, ttl_ms: Option<u64>, embedding: Option<Vec<f32>>) {
         let entry = wal::WalEntry {
             op: wal::WalOp::Set,
             key: key.to_vec(),
@@ -106,7 +111,7 @@ impl ReplicationState {
             mem_type,
             ttl_ms: ttl_ms.unwrap_or(0),
             timestamp_ms: now_ms(),
-            embedding: None,
+            embedding,
         };
         let seq = self.wal.append(entry);
         self.replication_offset.store(seq, Ordering::Relaxed);

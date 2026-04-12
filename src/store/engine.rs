@@ -15,6 +15,16 @@ pub struct EntryMeta {
     pub ttl_remaining_ms: Option<u64>,
 }
 
+/// Metadata returned alongside a value when using `scan_prefix_with_embeddings`.
+#[derive(Debug, Clone)]
+pub struct EntryMetaWithEmbedding {
+    pub memory_type: MemoryType,
+    /// TTL remaining in milliseconds. `None` means the entry has no expiry.
+    pub ttl_remaining_ms: Option<u64>,
+    /// Optional embedding vector for semantic similarity search.
+    pub embedding: Option<Vec<f32>>,
+}
+
 /// The core sharded KV engine.
 ///
 /// Keys are hashed with ahash (randomized per instance) and routed to a shard
@@ -155,6 +165,22 @@ impl KvEngine {
         self.shards[idx].set_force(key.to_string(), entry);
     }
 
+    /// Force-set a key with embedding, ignoring shard capacity limits.
+    /// Used during snapshot restore to ensure data integrity, including
+    /// restoring embedding vectors for vector search.
+    pub fn set_force_with_embedding(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType, embedding: Option<Vec<f32>>) {
+        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let entry = Entry {
+            value,
+            compressed: false,
+            expires_at,
+            memory_type,
+            embedding,
+        };
+        let idx = self.shard_index(key);
+        self.shards[idx].set_force(key.to_string(), entry);
+    }
+
     /// Get the value for a key. Returns None if missing or expired.
     /// Values are transparently decompressed if they were compressed at rest.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
@@ -198,6 +224,27 @@ impl KvEngine {
                 let meta = EntryMeta {
                     memory_type: entry.memory_type,
                     ttl_remaining_ms,
+                };
+                results.push((key, entry.value, meta));
+            }
+        }
+        results
+    }
+
+    /// Scan all entries whose keys start with `prefix` across all shards,
+    /// including their embedding vectors.
+    /// Returns (key, value, EntryMetaWithEmbedding) tuples.
+    /// Values are transparently decompressed if they were compressed at rest.
+    pub fn scan_prefix_with_embeddings(&self, prefix: &str) -> Vec<(String, Vec<u8>, EntryMetaWithEmbedding)> {
+        let now = now_ms();
+        let mut results = Vec::new();
+        for shard in &self.shards {
+            for (key, entry) in shard.scan_prefix(prefix) {
+                let ttl_remaining_ms = entry.expires_at.map(|exp| exp.saturating_sub(now));
+                let meta = EntryMetaWithEmbedding {
+                    memory_type: entry.memory_type,
+                    ttl_remaining_ms,
+                    embedding: entry.embedding,
                 };
                 results.push((key, entry.value, meta));
             }

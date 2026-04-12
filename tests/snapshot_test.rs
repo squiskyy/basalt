@@ -402,7 +402,7 @@ fn test_snapshot_no_compression_small_values() {
     let snapshot_file = basalt::store::persistence::find_latest_snapshot(db_path).unwrap();
     let raw = std::fs::read(&snapshot_file).unwrap();
     // Header: 7 magic + 1 version + 8 count = 16 bytes
-    // Then per entry: 4 key_len + key + 1 flags + 4 val_len + val + 1 memory_type + 8 expires_at
+    // v3 per entry: 4 key_len + key + 1 flags + 4 val_len + val + 1 memory_type + 1 embedding_flag + 8 expires_at
     let header_size = 16;
     let mut offset = header_size;
     for _ in 0..2 {
@@ -415,7 +415,11 @@ fn test_snapshot_no_compression_small_values() {
         offset += 1;
         // val_len
         let val_len = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
-        offset += 4 + val_len + 1 + 8; // skip value + memory_type + expires_at
+        offset += 4 + val_len + 1; // skip value + memory_type
+        // embedding_flag (v3 format: 0 = no embedding)
+        let emb_flag = raw[offset];
+        assert_eq!(emb_flag, 0, "small value entry should have no embedding");
+        offset += 1 + 8; // skip embedding_flag + expires_at
     }
 }
 

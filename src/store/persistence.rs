@@ -1,20 +1,28 @@
 /// Persistence module for Basalt KV store.
 ///
-/// Binary snapshot format (version 2):
+/// Binary snapshot format (version 3):
 ///   - Magic bytes: b"BASALT\x00" (8 bytes)
-///   - Version: u8 (1 byte, currently 2)
+///   - Version: u8 (1 byte, currently 3)
 ///   - Entry count: u64 (8 bytes, little-endian)
-///   - For each entry (version 2):
+///   - For each entry (version 3):
 ///     - key_len: u32 (4 bytes, LE)
 ///     - key: [u8; key_len]
 ///     - flags: u8 (1 byte, bit 0 = LZ4 compressed, bits 1-7 reserved)
 ///     - val_len: u32 (4 bytes, LE, length of stored value bytes)
 ///     - value: [u8; val_len] (compressed if flag bit 0 set)
 ///     - memory_type: u8 (0=episodic, 1=semantic, 2=procedural)
+///     - embedding_flag: u8 (0 = no embedding, 1 = has embedding)
 ///     - expires_at: u64 (8 bytes, LE, 0 = no expiry)
+///     - If embedding_flag == 1:
+///       - dim: u32 (4 bytes, LE, number of f32 dimensions)
+///       - embedding: [u8; dim * 4] (each f32 as 4 LE bytes)
+///
+/// Version 2 format (backward compatible on read):
+///   Same as v3 but without the embedding_flag byte and embedding data.
+///   After memory_type, expires_at follows immediately.
 ///
 /// Version 1 format (backward compatible on read):
-///   Same as above but without the flags byte per entry.
+///   Same as v2 but without the flags byte per entry.
 ///   When reading version 1, entries are read without flags (no compression).
 ///
 /// Values larger than snapshot_compression_threshold are LZ4-compressed
@@ -35,7 +43,13 @@ use tracing::{debug, error, info, warn};
 const MAGIC: &[u8; 7] = b"BASALT\x00";
 
 /// Current snapshot format version.
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
+
+/// Version 3 (current: supports embedding vectors).
+const VERSION_3: u8 = 3;
+
+/// Version 2 (no embedding vectors, but has flags byte).
+const VERSION_2: u8 = 2;
 
 /// Version 1 (legacy, no compression/flags byte).
 const VERSION_1: u8 = 1;
@@ -59,6 +73,8 @@ pub struct SnapshotEntry {
     pub value: Vec<u8>,
     pub memory_type: MemoryType,
     pub expires_at: Option<u64>,
+    /// Optional embedding vector for semantic similarity search.
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Write a snapshot to disk atomically.
@@ -125,6 +141,12 @@ pub fn write_snapshot(
             .map_err(|e| format!("write value: {e}"))?;
         f.write_all(&[entry.memory_type.to_u8()])
             .map_err(|e| format!("write memory_type: {e}"))?;
+
+        // Embedding flag: 0 = no embedding, 1 = has embedding
+        let embedding_flag: u8 = if entry.embedding.is_some() { 1 } else { 0 };
+        f.write_all(&[embedding_flag])
+            .map_err(|e| format!("write embedding_flag: {e}"))?;
+
         f.write_all(
             &entry
                 .expires_at
@@ -132,6 +154,17 @@ pub fn write_snapshot(
                 .to_le_bytes(),
         )
         .map_err(|e| format!("write expires_at: {e}"))?;
+
+        // If embedding is present, write dim (u32 LE) then dim*f32 bytes
+        if let Some(ref emb) = entry.embedding {
+            let dim = emb.len() as u32;
+            f.write_all(&dim.to_le_bytes())
+                .map_err(|e| format!("write embedding dim: {e}"))?;
+            for &val in emb {
+                f.write_all(&val.to_le_bytes())
+                    .map_err(|e| format!("write embedding value: {e}"))?;
+            }
+        }
     }
 
     f.flush()
@@ -155,8 +188,8 @@ pub fn write_snapshot(
 
 /// Read a snapshot from disk.
 ///
-/// Supports both version 1 (no flags byte, no compression) and version 2
-/// (flags byte per entry, optional LZ4 decompression).
+/// Supports version 3 (embedding vectors), version 2 (flags byte, no embedding),
+/// and version 1 (no flags byte, no compression, no embedding).
 ///
 /// Returns the list of entries stored in the snapshot.
 pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
@@ -177,16 +210,20 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut version = [0u8; 1];
     f.read_exact(&mut version)
         .map_err(|e| format!("read version: {e}"))?;
-    if version[0] != VERSION && version[0] != VERSION_1 {
+    if version[0] != VERSION_3 && version[0] != VERSION_2 && version[0] != VERSION_1 {
         return Err(format!(
-            "unsupported snapshot version {} in {} (expected {} or {})",
+            "unsupported snapshot version {} in {} (expected {}, {}, or {})",
             version[0],
             path.display(),
             VERSION_1,
-            VERSION
+            VERSION_2,
+            VERSION_3
         ));
     }
-    let is_v1 = version[0] == VERSION_1;
+    let ver = version[0];
+    let is_v1 = ver == VERSION_1;
+    let is_v2 = ver == VERSION_2;
+    let is_v3 = ver == VERSION_3;
 
     let mut count_bytes = [0u8; 8];
     f.read_exact(&mut count_bytes)
@@ -248,23 +285,88 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             )
         })?;
 
-        // expires_at
-        let mut exp_bytes = [0u8; 8];
-        f.read_exact(&mut exp_bytes)
-            .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
-        let expires_at_raw = u64::from_le_bytes(exp_bytes);
-        let expires_at = if expires_at_raw == 0 {
-            None
-        } else {
-            Some(expires_at_raw)
-        };
+        // In v3, read embedding_flag before expires_at
+        // In v1/v2, no embedding data
+        let embedding = if is_v3 {
+            // embedding_flag: 0 = no embedding, 1 = has embedding
+            let mut emb_flag_byte = [0u8; 1];
+            f.read_exact(&mut emb_flag_byte)
+                .map_err(|e| format!("read embedding_flag at entry {i}: {e}"))?;
+            let emb_flag = emb_flag_byte[0];
 
-        entries.push(SnapshotEntry {
-            key,
-            value,
-            memory_type,
-            expires_at,
-        });
+            // expires_at
+            let mut exp_bytes = [0u8; 8];
+            f.read_exact(&mut exp_bytes)
+                .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
+            let expires_at_raw = u64::from_le_bytes(exp_bytes);
+            let expires_at = if expires_at_raw == 0 {
+                None
+            } else {
+                Some(expires_at_raw)
+            };
+
+            // Read embedding if flag is set
+            let emb = if emb_flag == 1 {
+                let mut dim_bytes = [0u8; 4];
+                f.read_exact(&mut dim_bytes)
+                    .map_err(|e| format!("read embedding dim at entry {i}: {e}"))?;
+                let dim = u32::from_le_bytes(dim_bytes) as usize;
+                let mut emb_data = vec![0u8; dim * 4];
+                f.read_exact(&mut emb_data)
+                    .map_err(|e| format!("read embedding data at entry {i}: {e}"))?;
+                let mut embedding = Vec::with_capacity(dim);
+                for j in 0..dim {
+                    let offset = j * 4;
+                    let val = f32::from_le_bytes([
+                        emb_data[offset],
+                        emb_data[offset + 1],
+                        emb_data[offset + 2],
+                        emb_data[offset + 3],
+                    ]);
+                    embedding.push(val);
+                }
+                Some(embedding)
+            } else if emb_flag == 0 {
+                None
+            } else {
+                return Err(format!(
+                    "invalid embedding flag {} at entry {i} in {}",
+                    emb_flag,
+                    path.display()
+                ));
+            };
+
+            // We need to return both expires_at and embedding, but we read
+            // expires_at here. Use a small struct-like approach via early push.
+            entries.push(SnapshotEntry {
+                key,
+                value,
+                memory_type,
+                expires_at,
+                embedding: emb,
+            });
+            continue;
+        } else {
+            // v1/v2: no embedding flag, read expires_at directly
+            let mut exp_bytes = [0u8; 8];
+            f.read_exact(&mut exp_bytes)
+                .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
+            let expires_at_raw = u64::from_le_bytes(exp_bytes);
+            let expires_at = if expires_at_raw == 0 {
+                None
+            } else {
+                Some(expires_at_raw)
+            };
+
+            entries.push(SnapshotEntry {
+                key,
+                value,
+                memory_type,
+                expires_at,
+                embedding: None,
+            });
+            continue;
+        };
     }
 
     Ok(entries)
@@ -365,9 +467,17 @@ pub fn load_latest_snapshot(
                 continue;
             }
             let ttl_ms = exp - now;
-            engine.set_force(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type);
+            if entry.embedding.is_some() {
+                engine.set_force_with_embedding(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type, entry.embedding.clone());
+            } else {
+                engine.set_force(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type);
+            }
         } else {
-            engine.set_force(&entry.key, entry.value.clone(), None, entry.memory_type);
+            if entry.embedding.is_some() {
+                engine.set_force_with_embedding(&entry.key, entry.value.clone(), None, entry.memory_type, entry.embedding.clone());
+            } else {
+                engine.set_force(&entry.key, entry.value.clone(), None, entry.memory_type);
+            }
         }
         loaded += 1;
     }
@@ -380,10 +490,11 @@ pub fn load_latest_snapshot(
     Ok(loaded)
 }
 
-/// Collect all live entries from the KV engine for a snapshot.
+/// Collect all live entries from the KV engine for a snapshot,
+/// including their embedding vectors.
 pub fn collect_entries(engine: &crate::store::engine::KvEngine) -> Vec<SnapshotEntry> {
-    // Scan all keys (empty prefix matches everything)
-    let results = engine.scan_prefix("");
+    // Scan all keys (empty prefix matches everything), including embeddings
+    let results = engine.scan_prefix_with_embeddings("");
     results
         .into_iter()
         .map(|(key, value, meta)| SnapshotEntry {
@@ -391,6 +502,7 @@ pub fn collect_entries(engine: &crate::store::engine::KvEngine) -> Vec<SnapshotE
             value,
             memory_type: meta.memory_type,
             expires_at: meta.ttl_remaining_ms.map(|ttl| now_ms() + ttl),
+            embedding: meta.embedding,
         })
         .collect()
 }
@@ -502,18 +614,21 @@ mod tests {
                 value: b"hello world".to_vec(),
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
+                embedding: None,
             },
             SnapshotEntry {
                 key: "ns:mem2".to_string(),
                 value: b"episodic memory".to_vec(),
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(9999999999999),
+                embedding: None,
             },
             SnapshotEntry {
                 key: "ns:mem3".to_string(),
                 value: vec![0, 1, 2, 3, 255],
                 memory_type: MemoryType::Procedural,
                 expires_at: Some(12345),
+                embedding: None,
             },
         ];
 
@@ -527,16 +642,19 @@ mod tests {
         assert_eq!(loaded[0].value, b"hello world");
         assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
         assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
 
         assert_eq!(loaded[1].key, "ns:mem2");
         assert_eq!(loaded[1].value, b"episodic memory");
         assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
         assert_eq!(loaded[1].expires_at, Some(9999999999999));
+        assert_eq!(loaded[1].embedding, None);
 
         assert_eq!(loaded[2].key, "ns:mem3");
         assert_eq!(loaded[2].value, vec![0, 1, 2, 3, 255]);
         assert_eq!(loaded[2].memory_type, MemoryType::Procedural);
         assert_eq!(loaded[2].expires_at, Some(12345));
+        assert_eq!(loaded[2].embedding, None);
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -648,6 +766,7 @@ mod tests {
                 value: large_value.clone(),
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
+                embedding: None,
             },
         ];
 
@@ -661,6 +780,7 @@ mod tests {
         assert_eq!(loaded[0].value, large_value);
         assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
         assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
 
         // Verify the snapshot file is smaller than the uncompressed data
         let file_size = fs::metadata(&path).unwrap().len() as usize;
@@ -693,6 +813,7 @@ mod tests {
                 value: small_value.clone(),
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
+                embedding: None,
             },
         ];
 
@@ -758,7 +879,7 @@ mod tests {
 
         fs::write(&path, &data).unwrap();
 
-        // Read back using version 2 reader — should handle v1 format
+        // Read back using current reader — should handle v1 format
         let loaded = read_snapshot(&path).unwrap();
         assert_eq!(loaded.len(), 2);
 
@@ -766,11 +887,184 @@ mod tests {
         assert_eq!(loaded[0].value, b"world".to_vec());
         assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
         assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
 
         assert_eq!(loaded[1].key, "test");
         assert_eq!(loaded[1].value, vec![0, 1, 2, 3]);
         assert_eq!(loaded[1].memory_type, MemoryType::Procedural);
         assert_eq!(loaded[1].expires_at, Some(99999));
+        assert_eq!(loaded[1].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_backward_compatibility_v2() {
+        let dir = std::env::temp_dir().join("basalt_test_v2_compat");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create a version 2 snapshot (flags byte, but no embedding_flag/embedding data)
+        // v2 format per entry: key_len(u32) key bytes flags(u8) val_len(u32) value bytes memory_type(u8) expires_at(u64)
+        let path = dir.join("snapshot-1000.bin");
+        let mut data = Vec::new();
+
+        // Magic
+        data.extend_from_slice(b"BASALT\x00");
+        // Version 2
+        data.push(2u8);
+        // Count: 2 entries
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        // Entry 1: key="v2key1", value="v2val1", flags=0, memory_type=Semantic, expires_at=0
+        let key1 = b"v2key1";
+        data.extend_from_slice(&(key1.len() as u32).to_le_bytes());
+        data.extend_from_slice(key1);
+        data.push(0u8); // flags: no compression
+        let val1 = b"v2val1";
+        data.extend_from_slice(&(val1.len() as u32).to_le_bytes());
+        data.extend_from_slice(val1);
+        data.push(1u8); // Semantic
+        data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+        // Entry 2: key="v2key2", value=[10,20,30], flags=0, memory_type=Episodic, expires_at=55555
+        let key2 = b"v2key2";
+        data.extend_from_slice(&(key2.len() as u32).to_le_bytes());
+        data.extend_from_slice(key2);
+        data.push(0u8); // flags: no compression
+        let val2: Vec<u8> = vec![10, 20, 30];
+        data.extend_from_slice(&(val2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&val2);
+        data.push(0u8); // Episodic
+        data.extend_from_slice(&55555u64.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        // Read back using current reader (v3) — should handle v2 format
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].key, "v2key1");
+        assert_eq!(loaded[0].value, b"v2val1".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+
+        assert_eq!(loaded[1].key, "v2key2");
+        assert_eq!(loaded[1].value, vec![10, 20, 30]);
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(55555));
+        assert_eq!(loaded[1].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_embedding_roundtrip() {
+        let dir = std::env::temp_dir().join("basalt_test_embedding");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let embedding1 = vec![0.1, 0.2, 0.3, 0.4, 0.5f32];
+        let embedding2 = vec![-1.0, 2.5, -0.001, 100.0f32];
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "emb:1".to_string(),
+                value: b"data1".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: Some(embedding1.clone()),
+            },
+            SnapshotEntry {
+                key: "emb:2".to_string(),
+                value: b"data2".to_vec(),
+                memory_type: MemoryType::Episodic,
+                expires_at: Some(88888),
+                embedding: Some(embedding2.clone()),
+            },
+            SnapshotEntry {
+                key: "noemb:3".to_string(),
+                value: b"data3".to_vec(),
+                memory_type: MemoryType::Procedural,
+                expires_at: Some(99999),
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        assert!(path.exists());
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+
+        // Entry with embedding, no expiry
+        assert_eq!(loaded[0].key, "emb:1");
+        assert_eq!(loaded[0].value, b"data1");
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert!(loaded[0].embedding.is_some());
+        let emb0 = loaded[0].embedding.as_ref().unwrap();
+        assert_eq!(emb0.len(), 5);
+        for (i, &v) in embedding1.iter().enumerate() {
+            assert!((emb0[i] - v).abs() < 1e-6, "embedding1[{}] = {} vs {}", i, emb0[i], v);
+        }
+
+        // Entry with embedding and expiry
+        assert_eq!(loaded[1].key, "emb:2");
+        assert_eq!(loaded[1].value, b"data2");
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(88888));
+        assert!(loaded[1].embedding.is_some());
+        let emb1 = loaded[1].embedding.as_ref().unwrap();
+        assert_eq!(emb1.len(), 4);
+        for (i, &v) in embedding2.iter().enumerate() {
+            assert!((emb1[i] - v).abs() < 1e-6, "embedding2[{}] = {} vs {}", i, emb1[i], v);
+        }
+
+        // Entry without embedding
+        assert_eq!(loaded[2].key, "noemb:3");
+        assert_eq!(loaded[2].value, b"data3");
+        assert_eq!(loaded[2].memory_type, MemoryType::Procedural);
+        assert_eq!(loaded[2].expires_at, Some(99999));
+        assert_eq!(loaded[2].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_embedding_with_compression() {
+        let dir = std::env::temp_dir().join("basalt_test_emb_compress");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Large value to trigger compression, with embedding
+        let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
+        let embedding = vec![1.0f32, -1.0, 0.5, 0.25, 0.125];
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "big:emb".to_string(),
+                value: large_value.clone(),
+                memory_type: MemoryType::Semantic,
+                expires_at: Some(12345678),
+                embedding: Some(embedding.clone()),
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "big:emb");
+        assert_eq!(loaded[0].value, large_value);
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, Some(12345678));
+        assert!(loaded[0].embedding.is_some());
+        let emb = loaded[0].embedding.as_ref().unwrap();
+        assert_eq!(emb.len(), 5);
+        for (i, &v) in embedding.iter().enumerate() {
+            assert!((emb[i] - v).abs() < 1e-6);
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -789,6 +1083,7 @@ mod tests {
                 value: large_value.clone(),
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
+                embedding: None,
             },
         ];
 

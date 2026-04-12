@@ -35,8 +35,9 @@ pub async fn send_full_resync(
     writer.flush().await.map_err(|e| format!("flush FULLRESYNC: {e}"))?;
 
     // 2. Send snapshot data as a series of RESP arrays
-    // Each entry: Array [BulkString("SET"), BulkString(key), BulkString(value), BulkString(mem_type), Integer(ttl_ms)]
-    let entries = engine.scan_prefix("");
+    // Each entry: Array [BulkString("SET"), BulkString(key), BulkString(value), BulkString(mem_type), Integer(ttl_ms), BulkString(embedding_json)]
+    // embedding_json is an empty string if no embedding, or a JSON array of f32 values
+    let entries = engine.scan_prefix_with_embeddings("");
     let entry_count = entries.len();
 
     // Send entry count as an integer
@@ -56,12 +57,19 @@ pub async fn send_full_resync(
         };
         let mt_str = meta.memory_type.to_string();
 
+        // Serialize embedding as JSON array if present
+        let emb_str = match &meta.embedding {
+            Some(emb) => serde_json::to_string(emb).unwrap_or_default(),
+            None => String::new(),
+        };
+
         let entry_msg = RespValue::Array(Some(vec![
             RespValue::BulkString(Some(b"SET".to_vec())),
             RespValue::BulkString(Some(key.as_bytes().to_vec())),
             RespValue::BulkString(Some(value.clone())),
             RespValue::BulkString(Some(mt_str.into_bytes())),
             RespValue::BulkString(Some(ttl_str.into_bytes())),
+            RespValue::BulkString(Some(emb_str.into_bytes())),
         ]));
         let entry_bytes = crate::resp::parser::serialize(&entry_msg);
         writer

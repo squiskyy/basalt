@@ -53,7 +53,7 @@ pub async fn replicate_from_primary(
         } else {
             Some(entry.ttl_ms)
         };
-        engine.set_force(&entry.key, entry.value, ttl, entry.mem_type);
+        engine.set_force_with_embedding(&entry.key, entry.value, ttl, entry.mem_type, entry.embedding);
         if (i + 1) % 1000 == 0 {
             tracing::debug!("restored {}/{} snapshot entries", i + 1, snapshot_count);
         }
@@ -175,6 +175,7 @@ struct SnapshotEntry {
     value: Vec<u8>,
     mem_type: MemoryType,
     ttl_ms: u64,
+    embedding: Option<Vec<f32>>,
 }
 
 /// Read a single snapshot entry (RESP Array).
@@ -212,8 +213,8 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
         _ => return Err("expected RESP Array for snapshot entry".to_string()),
     };
 
-    if arr.len() != 5 {
-        return Err(format!("expected 5 elements in snapshot entry, got {}", arr.len()));
+    if arr.len() < 5 || arr.len() > 6 {
+        return Err(format!("expected 5 or 6 elements in snapshot entry, got {}", arr.len()));
     }
 
     // Element 0: "SET"
@@ -242,11 +243,29 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
         .parse()
         .map_err(|e| format!("invalid ttl_ms: {e}"))?;
 
+    // Element 5: optional embedding (JSON array of f32)
+    let embedding = if arr.len() == 6 {
+        let emb_bytes = extract_bulk_string_or_err(&arr[5], "embedding")?;
+        let emb_str = String::from_utf8_lossy(&emb_bytes).to_string();
+        if emb_str.is_empty() || emb_str == "null" {
+            None
+        } else {
+            // Parse as JSON array of f32
+            match serde_json::from_str::<Vec<f32>>(&emb_str) {
+                Ok(v) => Some(v),
+                Err(_) => None,
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(SnapshotEntry {
         key,
         value,
         mem_type,
         ttl_ms,
+        embedding,
     })
 }
 
@@ -294,12 +313,14 @@ fn apply_wal_entry(engine: &Arc<KvEngine>, entry: &wal::WalEntry) {
     match entry.op {
         wal::WalOp::Set => {
             let ttl = if entry.ttl_ms == 0 { None } else { Some(entry.ttl_ms) };
-            // Use set_force to bypass capacity limits during replication
-            engine.set_force(
-                &String::from_utf8_lossy(&entry.key),
+            let key_str = String::from_utf8_lossy(&entry.key).to_string();
+            // Use set_force_with_embedding to preserve vectors for vector search
+            engine.set_force_with_embedding(
+                &key_str,
                 entry.value.clone(),
                 ttl,
                 entry.mem_type,
+                entry.embedding.clone(),
             );
         }
         wal::WalOp::Delete => {
