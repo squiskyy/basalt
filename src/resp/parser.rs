@@ -2,7 +2,6 @@
 ///
 /// Uses memchr for SIMD-accelerated CRLF scanning on the hot path.
 /// Supports RESP pipelining: multiple commands in a single read are all processed.
-
 use memchr::memchr;
 
 /// Maximum allowed size for a RESP BulkString value (512 MB).
@@ -92,8 +91,9 @@ fn parse_one(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
             // BulkString: $<len>\r\n<data>\r\n  or  $-1\r\n (null)
             let crlf = find_crlf(&input[1..]).ok_or(ParseError::Incomplete)?;
             let end = 1 + crlf;
-            let len_str = std::str::from_utf8(&input[1..end])
-                .map_err(|e| ParseError::Invalid(format!("invalid UTF-8 in BulkString length: {e}")))?;
+            let len_str = std::str::from_utf8(&input[1..end]).map_err(|e| {
+                ParseError::Invalid(format!("invalid UTF-8 in BulkString length: {e}"))
+            })?;
             let len: i64 = len_str
                 .parse()
                 .map_err(|e| ParseError::Invalid(format!("invalid BulkString length: {e}")))?;
@@ -209,9 +209,7 @@ impl RespValue {
         match self {
             RespValue::Array(Some(elements)) if !elements.is_empty() => {
                 let name = match &elements[0] {
-                    RespValue::BulkString(Some(data)) => {
-                        String::from_utf8(data.clone()).ok()?
-                    }
+                    RespValue::BulkString(Some(data)) => String::from_utf8(data.clone()).ok()?,
                     RespValue::SimpleString(s) => s.clone(),
                     _ => return None,
                 };

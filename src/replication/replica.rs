@@ -7,7 +7,6 @@
 /// 4. Receives snapshot data
 /// 5. Receives +STREAM\r\n
 /// 6. Applies WAL entries as they arrive
-
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -58,7 +57,13 @@ pub async fn replicate_from_primary(
         } else {
             Some(entry.ttl_ms)
         };
-        engine.set_force_with_embedding(&entry.key, entry.value, ttl, entry.mem_type, entry.embedding);
+        engine.set_force_with_embedding(
+            &entry.key,
+            entry.value,
+            ttl,
+            entry.mem_type,
+            entry.embedding,
+        );
         if (i + 1) % 1000 == 0 {
             tracing::debug!("restored {}/{} snapshot entries", i + 1, snapshot_count);
         }
@@ -165,7 +170,9 @@ async fn read_snapshot_count(reader: &mut (impl AsyncReadExt + Unpin)) -> Result
                             .parse::<usize>()
                             .map_err(|e| format!("invalid snapshot count: {e}"));
                     } else {
-                        return Err(format!("expected integer for snapshot count, got: {line_str}"));
+                        return Err(format!(
+                            "expected integer for snapshot count, got: {line_str}"
+                        ));
                     }
                 }
             }
@@ -184,7 +191,9 @@ struct SnapshotEntry {
 }
 
 /// Read a single snapshot entry (RESP Array).
-async fn read_snapshot_entry(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<SnapshotEntry, String> {
+async fn read_snapshot_entry(
+    reader: &mut (impl AsyncReadExt + Unpin),
+) -> Result<SnapshotEntry, String> {
     // We need to parse a RESP Array: [SET, key, value, mem_type, ttl_ms]
     // Read enough data to parse a full RESP value
     let mut buf = Vec::new();
@@ -219,7 +228,10 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
     };
 
     if arr.len() < 5 || arr.len() > 6 {
-        return Err(format!("expected 5 or 6 elements in snapshot entry, got {}", arr.len()));
+        return Err(format!(
+            "expected 5 or 6 elements in snapshot entry, got {}",
+            arr.len()
+        ));
     }
 
     // Element 0: "SET"
@@ -255,11 +267,7 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
         if emb_str.is_empty() || emb_str == "null" {
             None
         } else {
-            // Parse as JSON array of f32
-            match serde_json::from_str::<Vec<f32>>(&emb_str) {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            }
+            serde_json::from_str::<Vec<f32>>(&emb_str).ok()
         }
     } else {
         None
@@ -274,7 +282,10 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
     })
 }
 
-fn extract_bulk_string_or_err(val: &crate::resp::parser::RespValue, name: &str) -> Result<Vec<u8>, String> {
+fn extract_bulk_string_or_err(
+    val: &crate::resp::parser::RespValue,
+    name: &str,
+) -> Result<Vec<u8>, String> {
     match val {
         crate::resp::parser::RespValue::BulkString(Some(data)) => Ok(data.clone()),
         _ => Err(format!("expected BulkString for {name}")),
@@ -317,7 +328,11 @@ fn extract_bulk_string(val: &crate::resp::parser::RespValue) -> Option<Vec<u8>> 
 fn apply_wal_entry(engine: &Arc<KvEngine>, entry: &wal::WalEntry) {
     match entry.op {
         wal::WalOp::Set => {
-            let ttl = if entry.ttl_ms == 0 { None } else { Some(entry.ttl_ms) };
+            let ttl = if entry.ttl_ms == 0 {
+                None
+            } else {
+                Some(entry.ttl_ms)
+            };
             let key_str = String::from_utf8_lossy(&entry.key).to_string();
             // Use set_force_with_embedding to preserve vectors for vector search
             engine.set_force_with_embedding(

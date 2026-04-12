@@ -17,22 +17,21 @@
 /// pointers to in-flight write data.
 ///
 /// Gated behind `--features io-uring`. Requires Linux kernel 5.19+.
-
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{IoUring, opcode, squeue, types};
 
 use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
 
-use super::commands::{check_command_namespace, CommandHandler, ReplicaofResult};
+use super::commands::{CommandHandler, ReplicaofResult, check_command_namespace};
 use super::error::RespError;
-use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
+use super::parser::{RespValue, parse_pipeline, serialize_pipeline};
 
 const RING_SIZE: u32 = 1024;
 const READ_BUF_SIZE: usize = 8192;
@@ -410,13 +409,8 @@ pub fn run(
 
                     if progress < total {
                         // Partial write - send remaining bytes using stable write_buf pointer
-                        let ptr = unsafe {
-                            write_bufs
-                                .get(&conn_id)
-                                .unwrap()
-                                .as_ptr()
-                                .add(progress)
-                        };
+                        let ptr =
+                            unsafe { write_bufs.get(&conn_id).unwrap().as_ptr().add(progress) };
                         let remaining = total - progress;
                         let write_e = opcode::Send::new(types::Fd(fd), ptr, remaining as _)
                             .build()

@@ -11,14 +11,13 @@
 /// - If the replica falls behind the WAL's oldest entry, a full resync is triggered
 /// - A max pending buffer size (64KB) per replica limits unacknowledged data
 /// - Warnings are logged when replicas fall behind
-
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::replication::wal;
-use crate::store::engine::KvEngine;
 use crate::resp::parser::RespValue;
+use crate::store::engine::KvEngine;
 
 /// Maximum pending buffer size per replica connection (64KB).
 /// If the accumulated size of pending WAL entries exceeds this, the primary
@@ -43,7 +42,10 @@ pub async fn send_full_resync(
         .write_all(full_resync.as_bytes())
         .await
         .map_err(|e| format!("write FULLRESYNC: {e}"))?;
-    writer.flush().await.map_err(|e| format!("flush FULLRESYNC: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("flush FULLRESYNC: {e}"))?;
 
     // 2. Send snapshot data as a series of RESP arrays
     // Each entry: Array [BulkString("SET"), BulkString(key), BulkString(value), BulkString(mem_type), Integer(ttl_ms), BulkString(embedding_json)]
@@ -94,7 +96,10 @@ pub async fn send_full_resync(
         .write_all(b"+STREAM\r\n")
         .await
         .map_err(|e| format!("write STREAM: {e}"))?;
-    writer.flush().await.map_err(|e| format!("flush STREAM: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("flush STREAM: {e}"))?;
 
     // 4. Stream WAL entries
     repl_state.inc_connected_replicas();
@@ -110,21 +115,21 @@ pub async fn send_full_resync(
         // Check if the replica has fallen behind the WAL's oldest entry.
         // If so, the needed WAL entries have been evicted and we must
         // trigger a full resync.
-        if let Some(oldest_seq) = repl_state.wal().oldest_seq() {
-            if last_seq < oldest_seq {
-                tracing::warn!(
-                    "replica fell behind: replica offset {} is behind WAL oldest seq {}. Triggering full resync.",
-                    last_seq,
-                    oldest_seq
-                );
-                // Break out of the streaming loop; the caller should
-                // re-initiate a full resync if desired.
-                repl_state.dec_connected_replicas();
-                return Err(format!(
-                    "replica offset {} behind WAL oldest seq {}, full resync required",
-                    last_seq, oldest_seq
-                ));
-            }
+        if let Some(oldest_seq) = repl_state.wal().oldest_seq()
+            && last_seq < oldest_seq
+        {
+            tracing::warn!(
+                "replica fell behind: replica offset {} is behind WAL oldest seq {}. Triggering full resync.",
+                last_seq,
+                oldest_seq
+            );
+            // Break out of the streaming loop; the caller should
+            // re-initiate a full resync if desired.
+            repl_state.dec_connected_replicas();
+            return Err(format!(
+                "replica offset {} behind WAL oldest seq {}, full resync required",
+                last_seq, oldest_seq
+            ));
         }
 
         // Check for new WAL entries
@@ -134,7 +139,7 @@ pub async fn send_full_resync(
 
             for (seq, entry) in &entries {
                 let binary = wal::serialize_entry(entry, *seq);
-                let entry_size = binary.len();
+                let _entry_size = binary.len();
                 let msg = RespValue::BulkString(Some(binary));
                 let msg_bytes = crate::resp::parser::serialize(&msg);
                 pending_size += msg_bytes.len();

@@ -8,9 +8,9 @@ use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
 
-use super::commands::{check_command_namespace, CommandHandler, ReplicaofResult};
+use super::commands::{CommandHandler, ReplicaofResult, check_command_namespace};
 use super::error::RespError;
-use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
+use super::parser::{RespValue, parse_pipeline, serialize_pipeline};
 
 /// Run the RESP2 TCP server.
 ///
@@ -43,10 +43,16 @@ pub async fn run_with_replication(
     repl_state: Arc<ReplicationState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), RespError> {
-    let listener = TcpListener::bind((host, port)).await.map_err(RespError::Bind)?;
+    let listener = TcpListener::bind((host, port))
+        .await
+        .map_err(RespError::Bind)?;
     tracing::info!("RESP server listening on {host}:{port}");
 
-    let handler = Arc::new(CommandHandler::with_replication(engine.clone(), db_path, repl_state.clone()));
+    let handler = Arc::new(CommandHandler::with_replication(
+        engine.clone(),
+        db_path,
+        repl_state.clone(),
+    ));
     let auth_enabled = auth.is_enabled();
 
     loop {
@@ -55,7 +61,6 @@ pub async fn run_with_replication(
                 let (socket, addr) = result.map_err(RespError::Accept)?;
                 let handler = Arc::clone(&handler);
                 let auth = Arc::clone(&auth);
-                let auth_enabled = auth_enabled;
                 let repl_state = repl_state.clone();
                 let engine = engine.clone();
                 tokio::spawn(async move {
@@ -140,7 +145,9 @@ async fn handle_connection(
                                     primary_host: host,
                                     primary_port: port,
                                 });
-                                tracing::info!("REPLICAOF {repl_host}:{repl_port} — becoming replica");
+                                tracing::info!(
+                                    "REPLICAOF {repl_host}:{repl_port} — becoming replica"
+                                );
 
                                 // Send OK immediately, then start replication in background
                                 responses.push(RespValue::SimpleString("OK".to_string()));
@@ -167,12 +174,18 @@ async fn handle_connection(
                                         &repl_engine,
                                         &repl_repl_state,
                                         shutdown_rx,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         Ok(()) => {
-                                            tracing::info!("replication from {repl_host}:{repl_port} ended cleanly");
+                                            tracing::info!(
+                                                "replication from {repl_host}:{repl_port} ended cleanly"
+                                            );
                                         }
                                         Err(e) => {
-                                            tracing::error!("replication error from {repl_host}:{repl_port}: {e}");
+                                            tracing::error!(
+                                                "replication error from {repl_host}:{repl_port}: {e}"
+                                            );
                                         }
                                     }
                                 });
@@ -199,19 +212,17 @@ async fn handle_connection(
                 match value.to_command() {
                     Some(cmd) => {
                         // Per-command namespace authorization check
-                        if let Some(ref token) = auth_token {
-                            if let Err(err_resp) = check_command_namespace(&cmd, &auth, token) {
-                                responses.push(err_resp);
-                                continue;
-                            }
+                        if let Some(ref token) = auth_token
+                            && let Err(err_resp) = check_command_namespace(&cmd, &auth, token)
+                        {
+                            responses.push(err_resp);
+                            continue;
                         }
                         let resp = handler.handle(&cmd);
                         responses.push(resp);
                     }
                     None => {
-                        responses.push(RespValue::Error(
-                            "ERR invalid command format".to_string(),
-                        ));
+                        responses.push(RespValue::Error("ERR invalid command format".to_string()));
                     }
                 }
             }

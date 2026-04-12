@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::replication::ReplicationState;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
-use crate::replication::ReplicationState;
 
 use super::parser::{Command, RespValue};
 
@@ -24,10 +24,10 @@ fn first_key_arg_index(cmd_name: &str) -> Option<usize> {
     match cmd_name.to_uppercase().as_str() {
         "GET" | "DEL" | "MGETT" | "MTYPE" => Some(0),
         "SET" | "MSETT" => Some(0),
-        "MGET" => Some(0),  // multiple keys starting at arg 0
-        "MSET" => Some(0),  // key-value pairs starting at arg 0
-        "KEYS" | "MSCAN" => Some(0),  // prefix/pattern arg
-        "VSEARCH" => Some(0),  // namespace arg
+        "MGET" => Some(0),           // multiple keys starting at arg 0
+        "MSET" => Some(0),           // key-value pairs starting at arg 0
+        "KEYS" | "MSCAN" => Some(0), // prefix/pattern arg
+        "VSEARCH" => Some(0),        // namespace arg
         _ => None,
     }
 }
@@ -68,9 +68,10 @@ pub fn check_command_namespace(
             let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
             let ns = extract_namespace(&key);
             if !auth.is_authorized(token, ns) {
-                return Err(RespValue::Error(
-                    format!("NOAUTH Token not authorized for namespace '{}'", ns),
-                ));
+                return Err(RespValue::Error(format!(
+                    "NOAUTH Token not authorized for namespace '{}'",
+                    ns
+                )));
             }
             i += 2;
         }
@@ -83,9 +84,10 @@ pub fn check_command_namespace(
             let key = String::from_utf8_lossy(arg).to_string();
             let ns = extract_namespace(&key);
             if !auth.is_authorized(token, ns) {
-                return Err(RespValue::Error(
-                    format!("NOAUTH Token not authorized for namespace '{}'", ns),
-                ));
+                return Err(RespValue::Error(format!(
+                    "NOAUTH Token not authorized for namespace '{}'",
+                    ns
+                )));
             }
         }
         return Ok(());
@@ -96,9 +98,10 @@ pub fn check_command_namespace(
         let key = String::from_utf8_lossy(&cmd.args[key_index]).to_string();
         let ns = extract_namespace(&key);
         if !auth.is_authorized(token, ns) {
-            return Err(RespValue::Error(
-                format!("NOAUTH Token not authorized for namespace '{}'", ns),
-            ));
+            return Err(RespValue::Error(format!(
+                "NOAUTH Token not authorized for namespace '{}'",
+                ns
+            )));
         }
     }
 
@@ -114,11 +117,23 @@ pub struct CommandHandler {
 
 impl CommandHandler {
     pub fn new(engine: Arc<KvEngine>, db_path: Option<String>) -> Self {
-        CommandHandler { engine, db_path, repl_state: None }
+        CommandHandler {
+            engine,
+            db_path,
+            repl_state: None,
+        }
     }
 
-    pub fn with_replication(engine: Arc<KvEngine>, db_path: Option<String>, repl_state: Arc<ReplicationState>) -> Self {
-        CommandHandler { engine, db_path, repl_state: Some(repl_state) }
+    pub fn with_replication(
+        engine: Arc<KvEngine>,
+        db_path: Option<String>,
+        repl_state: Arc<ReplicationState>,
+    ) -> Self {
+        CommandHandler {
+            engine,
+            db_path,
+            repl_state: Some(repl_state),
+        }
     }
 
     /// Dispatch a command and return a RESP value response.
@@ -140,7 +155,9 @@ impl CommandHandler {
             "MTYPE" => self.handle_mtype(cmd),
             "SNAP" => self.handle_snap(cmd),
             "VSEARCH" => self.handle_vsearch(cmd),
-            "REPLICAOF" => RespValue::Error("ERR REPLICAOF must be handled at connection level".to_string()),
+            "REPLICAOF" => {
+                RespValue::Error("ERR REPLICAOF must be handled at connection level".to_string())
+            }
             // AUTH is handled separately in the connection handler
             "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
@@ -151,7 +168,9 @@ impl CommandHandler {
     /// uses to initiate replication. This is not a normal RESP response.
     pub fn handle_replicaof(&self, cmd: &Command) -> ReplicaofResult {
         if cmd.args.is_empty() {
-            return ReplicaofResult::Error("ERR wrong number of arguments for 'REPLICAOF'".to_string());
+            return ReplicaofResult::Error(
+                "ERR wrong number of arguments for 'REPLICAOF'".to_string(),
+            );
         }
         let first = String::from_utf8_lossy(&cmd.args[0]).to_uppercase();
         if first == "NO" && cmd.args.len() == 2 {
@@ -165,10 +184,15 @@ impl CommandHandler {
             let port_str = String::from_utf8_lossy(&cmd.args[1]);
             match port_str.parse::<u16>() {
                 Ok(port) => return ReplicaofResult::Replicate { host, port },
-                Err(_) => return ReplicaofResult::Error("ERR invalid port for REPLICAOF".to_string()),
+                Err(_) => {
+                    return ReplicaofResult::Error("ERR invalid port for REPLICAOF".to_string());
+                }
             }
         }
-        ReplicaofResult::Error("ERR syntax error for REPLICAOF. Use: REPLICAOF host port | REPLICAOF NO ONE".to_string())
+        ReplicaofResult::Error(
+            "ERR syntax error for REPLICAOF. Use: REPLICAOF host port | REPLICAOF NO ONE"
+                .to_string(),
+        )
     }
 
     fn handle_ping(&self, cmd: &Command) -> RespValue {
@@ -208,7 +232,7 @@ impl CommandHandler {
                         Err(_) => {
                             return RespValue::Error(
                                 "ERR value is not an integer or out of range".to_string(),
-                            )
+                            );
                         }
                     };
                     ttl_ms = Some(secs * 1000);
@@ -225,7 +249,7 @@ impl CommandHandler {
                         Err(_) => {
                             return RespValue::Error(
                                 "ERR value is not an integer or out of range".to_string(),
-                            )
+                            );
                         }
                     };
                     ttl_ms = Some(ms);
@@ -246,21 +270,19 @@ impl CommandHandler {
         }
 
         if nx && xx {
-            return RespValue::Error("ERR syntax error — NX and XX flags are mutually exclusive".to_string());
+            return RespValue::Error(
+                "ERR syntax error — NX and XX flags are mutually exclusive".to_string(),
+            );
         }
 
         // NX: only set if key does not exist
-        if nx {
-            if self.engine.get(&key).is_some() {
-                return RespValue::BulkString(None);
-            }
+        if nx && self.engine.get(&key).is_some() {
+            return RespValue::BulkString(None);
         }
 
         // XX: only set if key exists
-        if xx {
-            if self.engine.get(&key).is_none() {
-                return RespValue::BulkString(None);
-            }
+        if xx && self.engine.get(&key).is_none() {
+            return RespValue::BulkString(None);
         }
 
         let mem_type = MemoryType::Semantic;
@@ -322,14 +344,17 @@ impl CommandHandler {
     }
 
     fn handle_mset(&self, cmd: &Command) -> RespValue {
-        if cmd.args.len() < 2 || cmd.args.len() % 2 != 0 {
+        if cmd.args.len() < 2 || !cmd.args.len().is_multiple_of(2) {
             return RespValue::Error("ERR wrong number of arguments for 'MSET'".to_string());
         }
         let mut i = 0;
         while i < cmd.args.len() {
             let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
             let value = cmd.args[i + 1].clone();
-            match self.engine.set(&key, value.clone(), None, MemoryType::Semantic) {
+            match self
+                .engine
+                .set(&key, value.clone(), None, MemoryType::Semantic)
+            {
                 Ok(()) => {
                     if let Some(ref repl) = self.repl_state {
                         repl.record_set(key.as_bytes(), &value, MemoryType::Semantic, None);
@@ -408,7 +433,7 @@ impl CommandHandler {
             _ => {
                 return RespValue::Error(
                     "ERR type must be 'episodic', 'semantic', or 'procedural'".to_string(),
-                )
+                );
             }
         };
 
@@ -428,7 +453,7 @@ impl CommandHandler {
                         Err(_) => {
                             return RespValue::Error(
                                 "ERR value is not an integer or out of range".to_string(),
-                            )
+                            );
                         }
                     };
                     ttl_ms = Some(ms);
@@ -519,25 +544,30 @@ impl CommandHandler {
                 let path = std::path::Path::new(db_path);
                 match crate::store::persistence::snapshot(path, &self.engine, 3) {
                     Ok(snapshot_path) => {
-                        let entries = crate::store::persistence::collect_entries(&self.engine).len();
+                        let entries =
+                            crate::store::persistence::collect_entries(&self.engine).len();
                         RespValue::BulkString(Some(
-                            format!("OK snapshot saved: {} ({} entries)", snapshot_path.display(), entries)
-                                .into_bytes(),
+                            format!(
+                                "OK snapshot saved: {} ({} entries)",
+                                snapshot_path.display(),
+                                entries
+                            )
+                            .into_bytes(),
                         ))
                     }
                     Err(e) => RespValue::Error(format!("ERR snapshot failed: {e}")),
                 }
             }
-            None => RespValue::Error("ERR no db_path configured; persistence is disabled".to_string()),
+            None => {
+                RespValue::Error("ERR no db_path configured; persistence is disabled".to_string())
+            }
         }
     }
 
     fn handle_vsearch(&self, cmd: &Command) -> RespValue {
         // VSEARCH <namespace> <embedding_json> [COUNT <n>]
         if cmd.args.len() < 2 {
-            return RespValue::Error(
-                "ERR wrong number of arguments for 'VSEARCH'".to_string(),
-            );
+            return RespValue::Error("ERR wrong number of arguments for 'VSEARCH'".to_string());
         }
 
         let namespace = String::from_utf8_lossy(&cmd.args[0]).to_string();
@@ -547,9 +577,7 @@ impl CommandHandler {
         let embedding: Vec<f32> = match serde_json::from_str(&embedding_json) {
             Ok(vec) => vec,
             Err(e) => {
-                return RespValue::Error(format!(
-                    "ERR invalid embedding JSON: {e}"
-                ));
+                return RespValue::Error(format!("ERR invalid embedding JSON: {e}"));
             }
         };
 
@@ -842,7 +870,12 @@ mod tests {
         let handler = make_handler();
         let cmd = Command {
             name: "SET".to_string(),
-            args: vec![b"key".to_vec(), b"val".to_vec(), b"NX".to_vec(), b"XX".to_vec()],
+            args: vec![
+                b"key".to_vec(),
+                b"val".to_vec(),
+                b"NX".to_vec(),
+                b"XX".to_vec(),
+            ],
         };
         let resp = handler.handle(&cmd);
         match resp {
@@ -857,7 +890,13 @@ mod tests {
         // NX + EX should work together
         let cmd = Command {
             name: "SET".to_string(),
-            args: vec![b"nxex".to_vec(), b"val".to_vec(), b"NX".to_vec(), b"EX".to_vec(), b"10".to_vec()],
+            args: vec![
+                b"nxex".to_vec(),
+                b"val".to_vec(),
+                b"NX".to_vec(),
+                b"EX".to_vec(),
+                b"10".to_vec(),
+            ],
         };
         let resp = handler.handle(&cmd);
         assert_eq!(resp, RespValue::SimpleString("OK".to_string()));

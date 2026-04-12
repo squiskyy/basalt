@@ -4,9 +4,8 @@ use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Metadata returned alongside a value when using `get_with_meta`.
 #[derive(Debug, Clone)]
@@ -120,13 +119,12 @@ impl KvEngine {
     /// Route a key to its shard index using ahash with a per-instance random seed.
     #[inline]
     fn shard_index(&self, key: &str) -> usize {
-        let mut h = self.hash_state.build_hasher();
-        key.hash(&mut h);
-        h.finish() as usize & self.shard_mask
+        self.hash_state.hash_one(key) as usize & self.shard_mask
     }
 
     /// Increment the version counter for a specific namespace.
     /// This is called when data in that namespace is modified (set/delete).
+    #[allow(clippy::or_fun_call)]
     fn increment_namespace_version(&self, namespace: &str) -> u64 {
         let mut versions = self.namespace_versions.lock().unwrap();
         versions
@@ -148,7 +146,13 @@ impl KvEngine {
 
     /// Set a key with explicit TTL (in ms from now) and memory type.
     /// Returns Err(ShardFullError) if the target shard is at capacity.
-    pub fn set(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType) -> Result<(), ShardFullError> {
+    pub fn set(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        memory_type: MemoryType,
+    ) -> Result<(), ShardFullError> {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
@@ -167,7 +171,14 @@ impl KvEngine {
     /// Set a key with explicit TTL, memory type, and an optional embedding vector.
     /// Returns Err(ShardFullError) if the target shard is at capacity.
     /// The vector index version is incremented to trigger a rebuild on next search.
-    pub fn set_with_embedding(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType, embedding: Option<Vec<f32>>) -> Result<(), ShardFullError> {
+    pub fn set_with_embedding(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        memory_type: MemoryType,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<(), ShardFullError> {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
@@ -185,7 +196,13 @@ impl KvEngine {
 
     /// Force-set a key, ignoring shard capacity limits.
     /// Used during snapshot restore to ensure data integrity.
-    pub fn set_force(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType) {
+    pub fn set_force(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        memory_type: MemoryType,
+    ) {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
@@ -201,7 +218,14 @@ impl KvEngine {
     /// Force-set a key with embedding, ignoring shard capacity limits.
     /// Used during snapshot restore to ensure data integrity, including
     /// restoring embedding vectors for vector search.
-    pub fn set_force_with_embedding(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType, embedding: Option<Vec<f32>>) {
+    pub fn set_force_with_embedding(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        memory_type: MemoryType,
+        embedding: Option<Vec<f32>>,
+    ) {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
@@ -268,7 +292,10 @@ impl KvEngine {
     /// including their embedding vectors.
     /// Returns (key, value, EntryMetaWithEmbedding) tuples.
     /// Values are transparently decompressed if they were compressed at rest.
-    pub fn scan_prefix_with_embeddings(&self, prefix: &str) -> Vec<(String, Vec<u8>, EntryMetaWithEmbedding)> {
+    pub fn scan_prefix_with_embeddings(
+        &self,
+        prefix: &str,
+    ) -> Vec<(String, Vec<u8>, EntryMetaWithEmbedding)> {
         let now = now_ms();
         let mut results = Vec::new();
         for shard in &self.shards {
@@ -392,7 +419,7 @@ impl KvEngine {
             }
 
             // Rebuild the index (still holding the lock)
-            let index = indexes.entry(namespace.to_string()).or_insert_with(HnswIndex::new);
+            let index = indexes.entry(namespace.to_string()).or_default();
             index.rebuild(&entries, version);
 
             // Search using the rebuilt index (values are cached inside the index)
@@ -441,10 +468,18 @@ mod tests {
         let engine = KvEngine::new(4);
         // Insert entries: some expired (TTL=0 means expires_at=now, so is_expired is true),
         // some live (no TTL)
-        engine.set("expired1", b"val1".to_vec(), Some(0), MemoryType::Episodic).unwrap();
-        engine.set("expired2", b"val2".to_vec(), Some(0), MemoryType::Episodic).unwrap();
-        engine.set("live1", b"val3".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set("live2", b"val4".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set("expired1", b"val1".to_vec(), Some(0), MemoryType::Episodic)
+            .unwrap();
+        engine
+            .set("expired2", b"val2".to_vec(), Some(0), MemoryType::Episodic)
+            .unwrap();
+        engine
+            .set("live1", b"val3".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("live2", b"val4".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
 
         let reaped = engine.reap_all_expired().await;
         assert_eq!(reaped, 2);
@@ -464,17 +499,37 @@ mod tests {
     fn test_engine_set_returns_err_at_capacity() {
         // 1 shard (power of 2 = 1), max 3 entries
         let engine = KvEngine::with_max_entries(1, 3);
-        assert!(engine.set("k1", b"v1".to_vec(), None, MemoryType::Semantic).is_ok());
-        assert!(engine.set("k2", b"v2".to_vec(), None, MemoryType::Semantic).is_ok());
-        assert!(engine.set("k3", b"v3".to_vec(), None, MemoryType::Semantic).is_ok());
+        assert!(
+            engine
+                .set("k1", b"v1".to_vec(), None, MemoryType::Semantic)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .set("k2", b"v2".to_vec(), None, MemoryType::Semantic)
+                .is_ok()
+        );
+        assert!(
+            engine
+                .set("k3", b"v3".to_vec(), None, MemoryType::Semantic)
+                .is_ok()
+        );
         // 4th insert should fail
         let result = engine.set("k4", b"v4".to_vec(), None, MemoryType::Semantic);
         assert!(result.is_err());
         // Update existing key should still work
-        assert!(engine.set("k1", b"v1_updated".to_vec(), None, MemoryType::Semantic).is_ok());
+        assert!(
+            engine
+                .set("k1", b"v1_updated".to_vec(), None, MemoryType::Semantic)
+                .is_ok()
+        );
         // Delete and then insert should work
         engine.delete("k1");
-        assert!(engine.set("k5", b"v5".to_vec(), None, MemoryType::Semantic).is_ok());
+        assert!(
+            engine
+                .set("k5", b"v5".to_vec(), None, MemoryType::Semantic)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -483,7 +538,9 @@ mod tests {
 
         // Value > threshold and compressible
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes
-        engine.set("big_key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set("big_key", large_value.clone(), None, MemoryType::Semantic)
+            .unwrap();
 
         // Should transparently decompress
         let result = engine.get("big_key").unwrap();
@@ -501,7 +558,9 @@ mod tests {
         let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 0);
 
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
-        engine.set("big_key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set("big_key", large_value.clone(), None, MemoryType::Semantic)
+            .unwrap();
 
         let result = engine.get("big_key").unwrap();
         assert_eq!(result, large_value);
@@ -510,9 +569,15 @@ mod tests {
     #[test]
     fn test_engine_count_prefix() {
         let engine = KvEngine::new(4);
-        engine.set("ns:a", b"1".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set("ns:b", b"2".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set("other:c", b"3".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set("ns:a", b"1".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("ns:b", b"2".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("other:c", b"3".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
         assert_eq!(engine.count_prefix("ns:"), 2);
         assert_eq!(engine.count_prefix("other:"), 1);
         assert_eq!(engine.count_prefix("missing:"), 0);
@@ -521,8 +586,12 @@ mod tests {
     #[test]
     fn test_engine_count_prefix_skips_expired() {
         let engine = KvEngine::new(4);
-        engine.set("ns:live", b"1".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set("ns:exp", b"2".to_vec(), Some(0), MemoryType::Episodic).unwrap();
+        engine
+            .set("ns:live", b"1".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("ns:exp", b"2".to_vec(), Some(0), MemoryType::Episodic)
+            .unwrap();
         assert_eq!(engine.count_prefix("ns:"), 1);
     }
 
@@ -531,8 +600,12 @@ mod tests {
         let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10);
 
         let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
-        engine.set("ns:big", big_val.clone(), None, MemoryType::Semantic).unwrap();
-        engine.set("ns:small", b"tiny".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set("ns:big", big_val.clone(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("ns:small", b"tiny".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
 
         let results = engine.scan_prefix("ns:");
         assert_eq!(results.len(), 2);
@@ -550,7 +623,15 @@ mod tests {
     fn test_namespace_version_independent() {
         // Verify that modifying one namespace does not increment the version of another
         let engine = KvEngine::new(4);
-        engine.set_with_embedding("ns1:a", b"1".to_vec(), None, MemoryType::Semantic, Some(vec![1.0, 0.0])).unwrap();
+        engine
+            .set_with_embedding(
+                "ns1:a",
+                b"1".to_vec(),
+                None,
+                MemoryType::Semantic,
+                Some(vec![1.0, 0.0]),
+            )
+            .unwrap();
         // Version for ns1 should be > 0
         let ns1_v1 = engine.namespace_version("ns1");
         assert!(ns1_v1 > 0, "ns1 version should be > 0 after set");
@@ -558,19 +639,43 @@ mod tests {
         let ns2_v0 = engine.namespace_version("ns2");
         assert_eq!(ns2_v0, 0, "ns2 version should be 0 (never modified)");
         // Modify ns1 again
-        engine.set_with_embedding("ns1:b", b"2".to_vec(), None, MemoryType::Semantic, Some(vec![0.0, 1.0])).unwrap();
+        engine
+            .set_with_embedding(
+                "ns1:b",
+                b"2".to_vec(),
+                None,
+                MemoryType::Semantic,
+                Some(vec![0.0, 1.0]),
+            )
+            .unwrap();
         let ns1_v2 = engine.namespace_version("ns1");
         assert!(ns1_v2 > ns1_v1, "ns1 version should have incremented");
         // ns2 still 0
-        assert_eq!(engine.namespace_version("ns2"), 0, "ns2 version should still be 0");
+        assert_eq!(
+            engine.namespace_version("ns2"),
+            0,
+            "ns2 version should still be 0"
+        );
     }
 
     #[test]
     fn test_clear_removes_all_data() {
         let engine = KvEngine::new(4);
-        engine.set("key1", b"val1".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set("key2", b"val2".to_vec(), None, MemoryType::Semantic).unwrap();
-        engine.set_with_embedding("ns:emb1", b"val3".to_vec(), None, MemoryType::Semantic, Some(vec![1.0, 0.0])).unwrap();
+        engine
+            .set("key1", b"val1".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set("key2", b"val2".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+        engine
+            .set_with_embedding(
+                "ns:emb1",
+                b"val3".to_vec(),
+                None,
+                MemoryType::Semantic,
+                Some(vec![1.0, 0.0]),
+            )
+            .unwrap();
 
         assert!(engine.get("key1").is_some());
         assert!(engine.get("key2").is_some());

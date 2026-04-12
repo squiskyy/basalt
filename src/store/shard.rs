@@ -46,7 +46,6 @@ pub struct ShardFullError {
     pub current: usize,
 }
 
-
 /// Default maximum entries per shard.
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 
@@ -306,6 +305,11 @@ impl Shard {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// Whether this shard has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Remove all entries whose keys start with `prefix`.
     /// Returns the number of entries removed.
     pub fn delete_prefix(&self, prefix: &str) -> usize {
@@ -332,6 +336,7 @@ impl Default for Shard {
 }
 
 #[cfg(test)]
+#[allow(clippy::unnecessary_to_owned)]
 mod tests {
     use super::*;
 
@@ -383,10 +388,7 @@ mod tests {
             ("other:c", b"3".to_vec()),
         ] {
             shard
-                .set(
-                    k.into(),
-                    make_entry(v, None, MemoryType::Semantic),
-                )
+                .set(k.into(), make_entry(v, None, MemoryType::Semantic))
                 .unwrap();
         }
         let results = shard.scan_prefix("ns:");
@@ -401,9 +403,24 @@ mod tests {
     #[test]
     fn test_shard_reap_expired() {
         let shard = Shard::new();
-        shard.set("exp1".into(), make_entry(b"expired1".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
-        shard.set("exp2".into(), make_entry(b"expired2".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
-        shard.set("live".into(), make_entry(b"alive".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "exp1".into(),
+                make_entry(b"expired1".to_vec(), Some(1), MemoryType::Episodic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "exp2".into(),
+                make_entry(b"expired2".to_vec(), Some(1), MemoryType::Episodic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "live".into(),
+                make_entry(b"alive".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
         // Before reap: count includes expired entries
         assert_eq!(shard.len(), 3);
 
@@ -418,7 +435,12 @@ mod tests {
     #[test]
     fn test_shard_reap_expired_none_expired() {
         let shard = Shard::new();
-        shard.set("key1".into(), make_entry(b"val".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "key1".into(),
+                make_entry(b"val".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
         let reaped = shard.reap_expired();
         assert_eq!(reaped, 0);
         assert_eq!(shard.len(), 1);
@@ -443,23 +465,64 @@ mod tests {
     #[test]
     fn test_shard_max_entries_update_existing_key() {
         let shard = Shard::with_max_entries(2);
-        shard.set("key0".into(), make_entry(b"val0".to_vec(), None, MemoryType::Semantic)).unwrap();
-        shard.set("key1".into(), make_entry(b"val1".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "key0".into(),
+                make_entry(b"val0".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "key1".into(),
+                make_entry(b"val1".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
         // At capacity, but updating existing key should still work
-        assert!(shard.set("key0".into(), make_entry(b"val0_updated".to_vec(), None, MemoryType::Semantic)).is_ok());
+        assert!(
+            shard
+                .set(
+                    "key0".into(),
+                    make_entry(b"val0_updated".to_vec(), None, MemoryType::Semantic)
+                )
+                .is_ok()
+        );
         assert_eq!(shard.get("key0").unwrap(), b"val0_updated");
     }
 
     #[test]
     fn test_shard_max_entries_delete_then_insert() {
         let shard = Shard::with_max_entries(2);
-        shard.set("key0".into(), make_entry(b"val0".to_vec(), None, MemoryType::Semantic)).unwrap();
-        shard.set("key1".into(), make_entry(b"val1".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "key0".into(),
+                make_entry(b"val0".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "key1".into(),
+                make_entry(b"val1".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
         // At capacity
-        assert!(shard.set("key2".into(), make_entry(b"overflow".to_vec(), None, MemoryType::Semantic)).is_err());
+        assert!(
+            shard
+                .set(
+                    "key2".into(),
+                    make_entry(b"overflow".to_vec(), None, MemoryType::Semantic)
+                )
+                .is_err()
+        );
         // Delete one, now insert should work
         shard.delete("key0");
-        assert!(shard.set("key2".into(), make_entry(b"val2".to_vec(), None, MemoryType::Semantic)).is_ok());
+        assert!(
+            shard
+                .set(
+                    "key2".into(),
+                    make_entry(b"val2".to_vec(), None, MemoryType::Semantic)
+                )
+                .is_ok()
+        );
         assert_eq!(shard.get("key2").unwrap(), b"val2");
     }
 
@@ -537,10 +600,20 @@ mod tests {
 
         // Insert a large compressible value
         let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes(); // 1536 bytes
-        shard.set("ns:big".into(), make_entry(big_val.clone(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "ns:big".into(),
+                make_entry(big_val.clone(), None, MemoryType::Semantic),
+            )
+            .unwrap();
 
         // Insert a small value
-        shard.set("ns:small".into(), make_entry(b"tiny".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "ns:small".into(),
+                make_entry(b"tiny".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
 
         let results = shard.scan_prefix("ns:");
         assert_eq!(results.len(), 2);
@@ -577,8 +650,18 @@ mod tests {
     #[test]
     fn test_shard_count_prefix_skips_expired() {
         let shard = Shard::new();
-        shard.set("ns:live".into(), make_entry(b"1".to_vec(), None, MemoryType::Semantic)).unwrap();
-        shard.set("ns:exp".into(), make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
+        shard
+            .set(
+                "ns:live".into(),
+                make_entry(b"1".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "ns:exp".into(),
+                make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic),
+            )
+            .unwrap();
         // expired entry should not be counted
         assert_eq!(shard.count_prefix("ns:"), 1);
     }
@@ -588,9 +671,24 @@ mod tests {
         let shard = Shard::with_max_entries_and_threshold(100, 10);
         // Insert a large compressible value to verify keys_prefix avoids decompression
         let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
-        shard.set("ns:big".into(), make_entry(big_val, None, MemoryType::Semantic)).unwrap();
-        shard.set("ns:small".into(), make_entry(b"tiny".to_vec(), None, MemoryType::Semantic)).unwrap();
-        shard.set("other:x".into(), make_entry(b"nope".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard
+            .set(
+                "ns:big".into(),
+                make_entry(big_val, None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "ns:small".into(),
+                make_entry(b"tiny".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "other:x".into(),
+                make_entry(b"nope".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
 
         let keys = shard.keys_prefix("ns:");
         assert_eq!(keys.len(), 2);
@@ -602,8 +700,18 @@ mod tests {
     #[test]
     fn test_shard_keys_prefix_skips_expired() {
         let shard = Shard::new();
-        shard.set("ns:live".into(), make_entry(b"1".to_vec(), None, MemoryType::Semantic)).unwrap();
-        shard.set("ns:exp".into(), make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
+        shard
+            .set(
+                "ns:live".into(),
+                make_entry(b"1".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        shard
+            .set(
+                "ns:exp".into(),
+                make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic),
+            )
+            .unwrap();
         let keys = shard.keys_prefix("ns:");
         assert_eq!(keys, vec!["ns:live".to_string()]);
     }

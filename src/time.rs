@@ -30,7 +30,10 @@ pub fn now_ms() -> u64 {
             if fallback == 0 {
                 tracing::warn!("clock went backwards and no prior good time recorded, returning 0");
             } else {
-                tracing::warn!("clock went backwards, using last known good time {}ms", fallback);
+                tracing::warn!(
+                    "clock went backwards, using last known good time {}ms",
+                    fallback
+                );
             }
             fallback
         }
@@ -55,7 +58,12 @@ mod tests {
         let mut prev = now_ms();
         for _ in 0..100 {
             let cur = now_ms();
-            assert!(cur >= prev, "now_ms should be monotonic: got {} < {}", cur, prev);
+            assert!(
+                cur >= prev,
+                "now_ms should be monotonic: got {} < {}",
+                cur,
+                prev
+            );
             prev = cur;
         }
     }

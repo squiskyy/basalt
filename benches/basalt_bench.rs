@@ -1,6 +1,7 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+#![allow(unused_must_use)]
 use basalt::store::engine::KvEngine;
 use basalt::store::memory_type::MemoryType;
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 fn bench_set(c: &mut Criterion) {
     let engine = KvEngine::new(64);
@@ -13,7 +14,12 @@ fn bench_set(c: &mut Criterion) {
             let mut i = 0u64;
             b.iter(|| {
                 let key = format!("bench:set:{}", i);
-                engine.set(black_box(&key), black_box(value.clone()), None, MemoryType::Semantic);
+                engine.set(
+                    black_box(&key),
+                    black_box(value.clone()),
+                    None,
+                    MemoryType::Semantic,
+                );
                 i += 1;
             });
         });
@@ -57,10 +63,15 @@ fn bench_mixed_workload(c: &mut Criterion) {
     group.bench_function("read_heavy", |b| {
         let mut i = 0u64;
         b.iter(|| {
-            if i % 10 == 0 {
+            if i.is_multiple_of(10) {
                 // 10% writes
                 let key = format!("bench:write:{}", i);
-                engine.set(black_box(&key), b"new_value".to_vec(), None, MemoryType::Episodic);
+                engine.set(
+                    black_box(&key),
+                    b"new_value".to_vec(),
+                    None,
+                    MemoryType::Episodic,
+                );
             } else {
                 // 90% reads
                 let key = format!("bench:mix:{}", i % 50_000);
@@ -79,7 +90,12 @@ fn bench_namespace_scan(c: &mut Criterion) {
     for agent in 0..10u64 {
         for mem in 0..1000u64 {
             let key = format!("agent-{}:mem:{}", agent, mem);
-            engine.set(&key, b"memory data".to_vec(), Some(3600000), MemoryType::Episodic);
+            engine.set(
+                &key,
+                b"memory data".to_vec(),
+                Some(3600000),
+                MemoryType::Episodic,
+            );
         }
     }
 
@@ -101,7 +117,12 @@ fn bench_set_with_memory_type(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("bench:epi:{}", i);
-            engine.set(black_box(&key), b"observation data".to_vec(), None, MemoryType::Episodic);
+            engine.set(
+                black_box(&key),
+                b"observation data".to_vec(),
+                None,
+                MemoryType::Episodic,
+            );
             i += 1;
         });
     });
@@ -110,7 +131,12 @@ fn bench_set_with_memory_type(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("bench:sem:{}", i);
-            engine.set(black_box(&key), b"fact data".to_vec(), None, MemoryType::Semantic);
+            engine.set(
+                black_box(&key),
+                b"fact data".to_vec(),
+                None,
+                MemoryType::Semantic,
+            );
             i += 1;
         });
     });
@@ -119,7 +145,12 @@ fn bench_set_with_memory_type(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("bench:proc:{}", i);
-            engine.set(black_box(&key), b"skill data".to_vec(), None, MemoryType::Procedural);
+            engine.set(
+                black_box(&key),
+                b"skill data".to_vec(),
+                None,
+                MemoryType::Procedural,
+            );
             i += 1;
         });
     });

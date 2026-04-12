@@ -1,13 +1,13 @@
-pub mod wal;
 pub mod primary;
 pub mod replica;
+pub mod wal;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::watch;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::time::now_ms;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::watch;
 
 /// Replication role of this node.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +103,14 @@ impl ReplicationState {
     }
 
     /// Record a SET write with an optional embedding vector in the WAL.
-    pub fn record_set_with_embedding(&self, key: &[u8], value: &[u8], mem_type: MemoryType, ttl_ms: Option<u64>, embedding: Option<Vec<f32>>) {
+    pub fn record_set_with_embedding(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        mem_type: MemoryType,
+        ttl_ms: Option<u64>,
+        embedding: Option<Vec<f32>>,
+    ) {
         let entry = wal::WalEntry {
             op: wal::WalOp::Set,
             key: key.to_vec(),
@@ -171,7 +178,10 @@ impl ReplicationState {
                     self.wal.len(),
                 )
             }
-            ReplicationRole::Replica { primary_host, primary_port } => {
+            ReplicationRole::Replica {
+                primary_host,
+                primary_port,
+            } => {
                 format!(
                     "# Replication\r\nrole:replica\r\nprimary_host:{}\r\nprimary_port:{}\r\nreplication_offset:{}\r\n",
                     primary_host,

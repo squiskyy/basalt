@@ -222,7 +222,11 @@ async fn test_search_excludes_entries_without_embeddings() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1, "only embedded entries should appear in search");
+    assert_eq!(
+        results.len(),
+        1,
+        "only embedded entries should appear in search"
+    );
     assert_eq!(results[0]["key"].as_str().unwrap(), "with_emb");
 }
 
@@ -245,7 +249,10 @@ async fn test_search_empty_namespace_returns_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert!(results.is_empty(), "empty namespace should return no results");
+    assert!(
+        results.is_empty(),
+        "empty namespace should return no results"
+    );
 }
 
 /// Test that updating an entry with a new embedding changes search results.
@@ -282,7 +289,10 @@ async fn test_search_after_embedding_update() {
     let results = body["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     let first_dist = results[0]["distance"].as_f64().unwrap();
-    assert!(first_dist < 0.01, "distance to identical vector should be near 0, got {first_dist}");
+    assert!(
+        first_dist < 0.01,
+        "distance to identical vector should be near 0, got {first_dist}"
+    );
 
     // Now update the same key with a different embedding near [0,0,1]
     c.post(format!("{base}/store/update"))
@@ -315,7 +325,8 @@ async fn test_search_after_embedding_update() {
     assert!(
         updated_dist > first_dist,
         "updated distance should be larger after changing embedding to orthogonal vector: before={}, after={}",
-        first_dist, updated_dist
+        first_dist,
+        updated_dist
     );
 }
 
@@ -383,7 +394,11 @@ async fn test_search_after_delete() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1, "only one result should remain after delete");
+    assert_eq!(
+        results.len(),
+        1,
+        "only one result should remain after delete"
+    );
     assert_eq!(results[0]["key"].as_str().unwrap(), "keep");
 }
 
@@ -426,7 +441,11 @@ async fn test_search_after_batch_store_with_embeddings() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert_eq!(results.len(), 3, "only embedded entries should appear in search");
+    assert_eq!(
+        results.len(),
+        3,
+        "only embedded entries should appear in search"
+    );
 
     // "beta" should be the closest match
     assert_eq!(results[0]["key"].as_str().unwrap(), "beta");
@@ -531,5 +550,8 @@ async fn test_search_returns_correct_values() {
     assert_eq!(results[0]["key"].as_str().unwrap(), "doc1");
     // Distance to identical vector should be 0
     let dist = results[0]["distance"].as_f64().unwrap();
-    assert!(dist < 0.001, "distance to identical vector should be ~0, got {dist}");
+    assert!(
+        dist < 0.001,
+        "distance to identical vector should be ~0, got {dist}"
+    );
 }

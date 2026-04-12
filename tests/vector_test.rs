@@ -121,7 +121,10 @@ fn test_search_empty_namespace() {
 
     // Search in a namespace with no entries
     let results = engine.search_embedding("empty", &[1.0, 0.0], 10);
-    assert!(results.is_empty(), "empty namespace should return no results");
+    assert!(
+        results.is_empty(),
+        "empty namespace should return no results"
+    );
 }
 
 #[test]
@@ -263,7 +266,10 @@ async fn test_http_search_empty_namespace() {
 
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
-    assert!(results.is_empty(), "empty namespace should return empty results");
+    assert!(
+        results.is_empty(),
+        "empty namespace should return empty results"
+    );
 }
 
 #[tokio::test]
@@ -336,7 +342,11 @@ async fn test_http_batch_store_with_embeddings() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let results = body["results"].as_array().unwrap();
     // b3 has no embedding, so only b1 and b2 should appear
-    assert_eq!(results.len(), 2, "only entries with embeddings should appear in search");
+    assert_eq!(
+        results.len(),
+        2,
+        "only entries with embeddings should appear in search"
+    );
 }
 
 // ---------------------------------------------------------------------------

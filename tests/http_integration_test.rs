@@ -530,7 +530,8 @@ async fn test_snapshot_with_db_path_returns_200() {
     let _ = std::fs::remove_dir_all(&db_dir);
     std::fs::create_dir_all(&db_dir).unwrap();
 
-    let (base, _handle) = start_server(engine, auth, Some(db_dir.to_string_lossy().to_string())).await;
+    let (base, _handle) =
+        start_server(engine, auth, Some(db_dir.to_string_lossy().to_string())).await;
     let c = client();
 
     // Store something so the snapshot has data
@@ -655,16 +656,14 @@ async fn test_list_memories() {
         .await
         .unwrap();
     c.post(format!("{base}/store/list-ns"))
-        .json(&serde_json::json!({"key": "beta", "value": "b", "type": "episodic", "ttl_ms": 60000}))
+        .json(
+            &serde_json::json!({"key": "beta", "value": "b", "type": "episodic", "ttl_ms": 60000}),
+        )
         .send()
         .await
         .unwrap();
 
-    let resp = c
-        .get(format!("{base}/store/list-ns"))
-        .send()
-        .await
-        .unwrap();
+    let resp = c.get(format!("{base}/store/list-ns")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: serde_json::Value = resp.json().await.unwrap();

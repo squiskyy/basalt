@@ -65,13 +65,13 @@ mod io_uring_feature_gate_tests {
     /// that the rest of the resp module works fine without it.
     #[test]
     fn test_io_uring_module_gated_behind_feature() {
-        // The resp module should still be accessible
-        use basalt::resp;
         // The commands and parser modules should work
         use basalt::resp::commands::CommandHandler;
         use basalt::resp::parser::RespValue;
-        // The server module should work
-        use basalt::resp::server;
+        // The server module should work (just reference it)
+        let _: fn() = || {
+            let _ = basalt::resp::server::run;
+        };
 
         // Verify we can create a CommandHandler
         let engine = std::sync::Arc::new(basalt::store::engine::KvEngine::new(4));

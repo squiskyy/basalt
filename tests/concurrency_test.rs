@@ -25,7 +25,12 @@ async fn test_concurrent_set_get_delete() {
 
                 // Get
                 let got = e.get(&key);
-                assert_eq!(got, Some(value.as_bytes().to_vec()), "get after set failed for {}", key);
+                assert_eq!(
+                    got,
+                    Some(value.as_bytes().to_vec()),
+                    "get after set failed for {}",
+                    key
+                );
 
                 // Delete
                 let deleted = e.delete(&key);
@@ -33,7 +38,11 @@ async fn test_concurrent_set_get_delete() {
 
                 // Get after delete
                 let gone = e.get(&key);
-                assert!(gone.is_none(), "get after delete should return None for {}", key);
+                assert!(
+                    gone.is_none(),
+                    "get after delete should return None for {}",
+                    key
+                );
             }
         }));
     }
@@ -52,7 +61,9 @@ async fn test_concurrent_same_key_rw() {
     let num_rounds = 200;
 
     // Pre-populate a shared key
-    engine.set("shared", b"initial".to_vec(), None, MemoryType::Semantic).unwrap();
+    engine
+        .set("shared", b"initial".to_vec(), None, MemoryType::Semantic)
+        .unwrap();
 
     let write_count = Arc::new(AtomicUsize::new(0));
     let read_count = Arc::new(AtomicUsize::new(0));
@@ -69,7 +80,13 @@ async fn test_concurrent_same_key_rw() {
                 if task_id % 2 == 0 {
                     // Writer: set new value
                     let val = format!("writer-{}", task_id);
-                    e.set("shared", val.as_bytes().to_vec(), None, MemoryType::Semantic).unwrap();
+                    e.set(
+                        "shared",
+                        val.as_bytes().to_vec(),
+                        None,
+                        MemoryType::Semantic,
+                    )
+                    .unwrap();
                     wc.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // Reader: get value (may be any writer's value, but must be valid UTF-8)
@@ -87,7 +104,10 @@ async fn test_concurrent_same_key_rw() {
 
     // The shared key must still exist with some value
     let final_val = engine.get("shared");
-    assert!(final_val.is_some(), "shared key must still exist after concurrent rw");
+    assert!(
+        final_val.is_some(),
+        "shared key must still exist after concurrent rw"
+    );
 }
 
 /// Test concurrent namespace operations (scan_prefix, delete_prefix) interleaved with set/get.
@@ -97,8 +117,22 @@ async fn test_concurrent_namespace_operations() {
 
     // Pre-populate two namespaces
     for i in 0..50 {
-        engine.set(&format!("ns1:k{}", i), format!("v1-{}", i).into_bytes(), None, MemoryType::Semantic).unwrap();
-        engine.set(&format!("ns2:k{}", i), format!("v2-{}", i).into_bytes(), None, MemoryType::Semantic).unwrap();
+        engine
+            .set(
+                &format!("ns1:k{}", i),
+                format!("v1-{}", i).into_bytes(),
+                None,
+                MemoryType::Semantic,
+            )
+            .unwrap();
+        engine
+            .set(
+                &format!("ns2:k{}", i),
+                format!("v2-{}", i).into_bytes(),
+                None,
+                MemoryType::Semantic,
+            )
+            .unwrap();
     }
 
     let mut handles = Vec::new();
@@ -130,7 +164,13 @@ async fn test_concurrent_namespace_operations() {
         let e = Arc::clone(&engine);
         handles.push(tokio::spawn(async move {
             for i in 50..100 {
-                e.set(&format!("ns2:k{}", i), format!("v2-{}", i).into_bytes(), None, MemoryType::Semantic).unwrap();
+                e.set(
+                    &format!("ns2:k{}", i),
+                    format!("v2-{}", i).into_bytes(),
+                    None,
+                    MemoryType::Semantic,
+                )
+                .unwrap();
             }
         }));
     }
@@ -181,7 +221,8 @@ async fn test_concurrent_ttl_expiry() {
                     format!("ephemeral-{}-{}", i, j).into_bytes(),
                     Some(1), // 1ms TTL
                     MemoryType::Episodic,
-                ).unwrap();
+                )
+                .unwrap();
 
                 // Set some keys with no TTL (persistent)
                 let long_key = format!("ttl:long:{}:{}", i, j);
@@ -190,7 +231,8 @@ async fn test_concurrent_ttl_expiry() {
                     format!("persistent-{}-{}", i, j).into_bytes(),
                     None,
                     MemoryType::Semantic,
-                ).unwrap();
+                )
+                .unwrap();
 
                 // Try to get the short-lived key — it may or may not be expired
                 // This should NOT panic either way
@@ -198,7 +240,11 @@ async fn test_concurrent_ttl_expiry() {
 
                 // The persistent key should always be readable
                 let long_val = e.get(&long_key);
-                assert!(long_val.is_some(), "persistent key {} should exist", long_key);
+                assert!(
+                    long_val.is_some(),
+                    "persistent key {} should exist",
+                    long_key
+                );
             }
         }));
     }
@@ -261,15 +307,28 @@ async fn test_concurrent_mixed_memory_types() {
         handles.push(tokio::spawn(async move {
             // Episodic
             let epi_key = format!("epi:{}:data", i);
-            e.set(&epi_key, b"episodic".to_vec(), Some(600_000), MemoryType::Episodic).unwrap();
+            e.set(
+                &epi_key,
+                b"episodic".to_vec(),
+                Some(600_000),
+                MemoryType::Episodic,
+            )
+            .unwrap();
 
             // Semantic
             let sem_key = format!("sem:{}:fact", i);
-            e.set(&sem_key, b"semantic".to_vec(), None, MemoryType::Semantic).unwrap();
+            e.set(&sem_key, b"semantic".to_vec(), None, MemoryType::Semantic)
+                .unwrap();
 
             // Procedural
             let proc_key = format!("proc:{}:skill", i);
-            e.set(&proc_key, b"procedural".to_vec(), None, MemoryType::Procedural).unwrap();
+            e.set(
+                &proc_key,
+                b"procedural".to_vec(),
+                None,
+                MemoryType::Procedural,
+            )
+            .unwrap();
 
             // Read them back
             assert_eq!(e.get(&epi_key), Some(b"episodic".to_vec()));
@@ -310,10 +369,24 @@ async fn test_concurrent_reap_and_mutate() {
         let key = format!("mix:k{}", i);
         if i % 3 == 0 {
             // Short TTL — will expire
-            engine.set(&key, format!("v{}", i).into_bytes(), Some(1), MemoryType::Episodic).unwrap();
+            engine
+                .set(
+                    &key,
+                    format!("v{}", i).into_bytes(),
+                    Some(1),
+                    MemoryType::Episodic,
+                )
+                .unwrap();
         } else {
             // No TTL — persistent
-            engine.set(&key, format!("v{}", i).into_bytes(), None, MemoryType::Semantic).unwrap();
+            engine
+                .set(
+                    &key,
+                    format!("v{}", i).into_bytes(),
+                    None,
+                    MemoryType::Semantic,
+                )
+                .unwrap();
         }
     }
 
@@ -352,7 +425,8 @@ async fn test_concurrent_reap_and_mutate() {
         handles.push(tokio::spawn(async move {
             for j in 0..50 {
                 let key = format!("new:t{}:k{}", t, j);
-                e.set(&key, b"new_val".to_vec(), None, MemoryType::Procedural).unwrap();
+                e.set(&key, b"new_val".to_vec(), None, MemoryType::Procedural)
+                    .unwrap();
             }
         }));
     }

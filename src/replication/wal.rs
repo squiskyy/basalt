@@ -117,15 +117,18 @@ impl Wal {
     /// Uses binary search (O(log n)) since entries are sorted by sequence number.
     pub fn entries_from(&self, from_seq: u64) -> Vec<(u64, WalEntry)> {
         let inner = self.entries.lock().unwrap();
-        let start = inner
-            .buf
-            .partition_point(|(seq, _)| *seq < from_seq);
+        let start = inner.buf.partition_point(|(seq, _)| *seq < from_seq);
         inner.buf.range(start..).cloned().collect()
     }
 
     /// Get the oldest sequence number in the WAL, or None if empty.
     pub fn oldest_seq(&self) -> Option<u64> {
-        self.entries.lock().unwrap().buf.front().map(|(seq, _)| *seq)
+        self.entries
+            .lock()
+            .unwrap()
+            .buf
+            .front()
+            .map(|(seq, _)| *seq)
     }
 }
 
@@ -137,7 +140,7 @@ impl Wal {
 pub fn serialize_entry(entry: &WalEntry, seq: u64) -> Vec<u8> {
     let embedding_extra = match &entry.embedding {
         Some(emb) => 1 + 4 + emb.len() * 4, // flag + dim + f32s
-        None => 1, // flag only
+        None => 1,                          // flag only
     };
     let mut buf = Vec::with_capacity(
         8 + 1 + 8 + 4 + entry.key.len() + 4 + entry.value.len() + 1 + 8 + embedding_extra,
@@ -412,7 +415,11 @@ mod tests {
         let (_, decoded, _) = deserialize_entry(&data).unwrap();
         assert_eq!(decoded.ttl_ms, 0);
         // On the replica side, ttl_ms == 0 should be treated as None (no expiry)
-        let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+        let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+            None
+        } else {
+            Some(decoded.ttl_ms)
+        };
         assert_eq!(ttl, None, "ttl_ms=0 must round-trip as None (no expiry)");
     }
 
@@ -431,7 +438,11 @@ mod tests {
         let data = serialize_entry(&entry, 2);
         let (_, decoded, _) = deserialize_entry(&data).unwrap();
         assert_eq!(decoded.ttl_ms, 5000);
-        let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+        let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+            None
+        } else {
+            Some(decoded.ttl_ms)
+        };
         assert_eq!(ttl, Some(5000), "ttl_ms=5000 must round-trip as Some(5000)");
     }
 
@@ -450,7 +461,11 @@ mod tests {
         let data = serialize_entry(&entry, 3);
         let (_, decoded, _) = deserialize_entry(&data).unwrap();
         assert_eq!(decoded.ttl_ms, u64::MAX / 2);
-        let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+        let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+            None
+        } else {
+            Some(decoded.ttl_ms)
+        };
         assert_eq!(ttl, Some(u64::MAX / 2));
     }
 

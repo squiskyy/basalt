@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use basalt::resp::parser::{parse_pipeline, serialize, RespValue};
+use basalt::resp::parser::{RespValue, parse_pipeline, serialize};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn bench_parse_simple_string(c: &mut Criterion) {
     let input = b"+OK\r\n";
@@ -83,7 +83,9 @@ fn bench_serialize_pipeline(c: &mut Criterion) {
         .collect();
     c.bench_function("serialize_pipeline_10_oks", |b| {
         b.iter(|| {
-            black_box(&basalt::resp::parser::serialize_pipeline(black_box(&values)));
+            black_box(&basalt::resp::parser::serialize_pipeline(black_box(
+                &values,
+            )));
         });
     });
 }

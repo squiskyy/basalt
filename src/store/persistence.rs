@@ -31,7 +31,6 @@
 ///
 /// Snapshots are written atomically: write to a temp file, then rename.
 /// On startup, load the latest snapshot from the db_path directory.
-
 use crate::store::memory_type::MemoryType;
 use crate::time::now_ms;
 use std::fs;
@@ -65,7 +64,6 @@ const SNAPSHOT_PREFIX: &str = "snapshot-";
 const SNAPSHOT_EXT: &str = ".bin";
 
 /// Convert MemoryType to u8 for serialization.
-
 /// A single entry to be persisted, with its key.
 #[derive(Debug)]
 pub struct SnapshotEntry {
@@ -99,8 +97,12 @@ pub fn write_snapshot(
     let tmp_path = db_path.join(format!("{filename}.tmp"));
 
     // Write to temp file
-    let mut f = fs::File::create(&tmp_path)
-        .map_err(|e| format!("failed to create temp snapshot file {}: {e}", tmp_path.display()))?;
+    let mut f = fs::File::create(&tmp_path).map_err(|e| {
+        format!(
+            "failed to create temp snapshot file {}: {e}",
+            tmp_path.display()
+        )
+    })?;
 
     // Header
     f.write_all(MAGIC)
@@ -119,19 +121,18 @@ pub fn write_snapshot(
             .map_err(|e| format!("write key: {e}"))?;
 
         // Compress if threshold > 0 and value is large enough
-        let (flags, stored_value): (u8, Vec<u8>) = if compression_threshold > 0
-            && entry.value.len() > compression_threshold
-        {
-            let compressed = lz4_flex::compress_prepend_size(&entry.value);
-            // Only use compression if it actually reduces size
-            if compressed.len() < entry.value.len() {
-                (FLAG_COMPRESSED, compressed)
+        let (flags, stored_value): (u8, Vec<u8>) =
+            if compression_threshold > 0 && entry.value.len() > compression_threshold {
+                let compressed = lz4_flex::compress_prepend_size(&entry.value);
+                // Only use compression if it actually reduces size
+                if compressed.len() < entry.value.len() {
+                    (FLAG_COMPRESSED, compressed)
+                } else {
+                    (0u8, entry.value.clone())
+                }
             } else {
                 (0u8, entry.value.clone())
-            }
-        } else {
-            (0u8, entry.value.clone())
-        };
+            };
 
         f.write_all(&[flags])
             .map_err(|e| format!("write flags: {e}"))?;
@@ -147,13 +148,8 @@ pub fn write_snapshot(
         f.write_all(&[embedding_flag])
             .map_err(|e| format!("write embedding_flag: {e}"))?;
 
-        f.write_all(
-            &entry
-                .expires_at
-                .unwrap_or(0)
-                .to_le_bytes(),
-        )
-        .map_err(|e| format!("write expires_at: {e}"))?;
+        f.write_all(&entry.expires_at.unwrap_or(0).to_le_bytes())
+            .map_err(|e| format!("write expires_at: {e}"))?;
 
         // If embedding is present, write dim (u32 LE) then dim*f32 bytes
         if let Some(ref emb) = entry.embedding {
@@ -167,15 +163,12 @@ pub fn write_snapshot(
         }
     }
 
-    f.flush()
-        .map_err(|e| format!("flush snapshot: {e}"))?;
-    f.sync_all()
-        .map_err(|e| format!("fsync snapshot: {e}"))?;
+    f.flush().map_err(|e| format!("flush snapshot: {e}"))?;
+    f.sync_all().map_err(|e| format!("fsync snapshot: {e}"))?;
     drop(f);
 
     // Atomic rename
-    fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("rename snapshot: {e}"))?;
+    fs::rename(&tmp_path, &final_path).map_err(|e| format!("rename snapshot: {e}"))?;
 
     debug!(
         "snapshot written: {} ({} entries)",
@@ -222,7 +215,6 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     }
     let ver = version[0];
     let is_v1 = ver == VERSION_1;
-    let is_v2 = ver == VERSION_2;
     let is_v3 = ver == VERSION_3;
 
     let mut count_bytes = [0u8; 8];
@@ -287,7 +279,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
 
         // In v3, read embedding_flag before expires_at
         // In v1/v2, no embedding data
-        let embedding = if is_v3 {
+        let _embedding = if is_v3 {
             // embedding_flag: 0 = no embedding, 1 = has embedding
             let mut emb_flag_byte = [0u8; 1];
             f.read_exact(&mut emb_flag_byte)
@@ -384,14 +376,13 @@ pub fn find_latest_snapshot(db_path: &Path) -> Option<PathBuf> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if let Some(rest) = name_str.strip_prefix(SNAPSHOT_PREFIX) {
-            if let Some(ts_str) = rest.strip_suffix(SNAPSHOT_EXT) {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    match &latest {
-                        Some((current_ts, _)) if ts <= *current_ts => {}
-                        _ => latest = Some((ts, entry.path())),
-                    }
-                }
+        if let Some(rest) = name_str.strip_prefix(SNAPSHOT_PREFIX)
+            && let Some(ts_str) = rest.strip_suffix(SNAPSHOT_EXT)
+            && let Ok(ts) = ts_str.parse::<u64>()
+        {
+            match &latest {
+                Some((current_ts, _)) if ts <= *current_ts => {}
+                _ => latest = Some((ts, entry.path())),
             }
         }
     }
@@ -468,13 +459,30 @@ pub fn load_latest_snapshot(
             }
             let ttl_ms = exp - now;
             if entry.embedding.is_some() {
-                engine.set_force_with_embedding(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type, entry.embedding.clone());
+                engine.set_force_with_embedding(
+                    &entry.key,
+                    entry.value.clone(),
+                    Some(ttl_ms),
+                    entry.memory_type,
+                    entry.embedding.clone(),
+                );
             } else {
-                engine.set_force(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type);
+                engine.set_force(
+                    &entry.key,
+                    entry.value.clone(),
+                    Some(ttl_ms),
+                    entry.memory_type,
+                );
             }
         } else {
             if entry.embedding.is_some() {
-                engine.set_force_with_embedding(&entry.key, entry.value.clone(), None, entry.memory_type, entry.embedding.clone());
+                engine.set_force_with_embedding(
+                    &entry.key,
+                    entry.value.clone(),
+                    None,
+                    entry.memory_type,
+                    entry.embedding.clone(),
+                );
             } else {
                 engine.set_force(&entry.key, entry.value.clone(), None, entry.memory_type);
             }
@@ -513,7 +521,12 @@ pub fn snapshot(
     engine: &crate::store::engine::KvEngine,
     keep_snapshots: usize,
 ) -> Result<PathBuf, String> {
-    snapshot_with_threshold(db_path, engine, keep_snapshots, DEFAULT_COMPRESSION_THRESHOLD)
+    snapshot_with_threshold(
+        db_path,
+        engine,
+        keep_snapshots,
+        DEFAULT_COMPRESSION_THRESHOLD,
+    )
 }
 
 /// Perform a snapshot with a custom compression threshold.
@@ -743,9 +756,18 @@ mod tests {
 
     #[test]
     fn test_memory_type_roundtrip() {
-        assert_eq!(MemoryType::from_u8(MemoryType::Episodic.to_u8()), Some(MemoryType::Episodic));
-        assert_eq!(MemoryType::from_u8(MemoryType::Semantic.to_u8()), Some(MemoryType::Semantic));
-        assert_eq!(MemoryType::from_u8(MemoryType::Procedural.to_u8()), Some(MemoryType::Procedural));
+        assert_eq!(
+            MemoryType::from_u8(MemoryType::Episodic.to_u8()),
+            Some(MemoryType::Episodic)
+        );
+        assert_eq!(
+            MemoryType::from_u8(MemoryType::Semantic.to_u8()),
+            Some(MemoryType::Semantic)
+        );
+        assert_eq!(
+            MemoryType::from_u8(MemoryType::Procedural.to_u8()),
+            Some(MemoryType::Procedural)
+        );
         assert_eq!(MemoryType::from_u8(255), None);
     }
 
@@ -760,15 +782,13 @@ mod tests {
         let large_value: Vec<u8> = "ABCD".repeat(512).into_bytes(); // 2048 bytes of repeating data
         assert!(large_value.len() > 1024);
 
-        let entries = vec![
-            SnapshotEntry {
-                key: "large:data".to_string(),
-                value: large_value.clone(),
-                memory_type: MemoryType::Semantic,
-                expires_at: None,
-                embedding: None,
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "large:data".to_string(),
+            value: large_value.clone(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+        }];
 
         // Write with threshold of 1024
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
@@ -807,15 +827,13 @@ mod tests {
         let small_value = b"tiny data".to_vec();
         assert!(small_value.len() < 1024);
 
-        let entries = vec![
-            SnapshotEntry {
-                key: "small:data".to_string(),
-                value: small_value.clone(),
-                memory_type: MemoryType::Semantic,
-                expires_at: None,
-                embedding: None,
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "small:data".to_string(),
+            value: small_value.clone(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+        }];
 
         // Write with threshold of 1024
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
@@ -835,7 +853,11 @@ mod tests {
         let key_len_offset = 16; // after header
         let flags_offset = key_len_offset + 4 + key_bytes.len();
         let flags = raw[flags_offset];
-        assert_eq!(flags & FLAG_COMPRESSED, 0, "small value should NOT be compressed");
+        assert_eq!(
+            flags & FLAG_COMPRESSED,
+            0,
+            "small value should NOT be compressed"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1007,7 +1029,13 @@ mod tests {
         let emb0 = loaded[0].embedding.as_ref().unwrap();
         assert_eq!(emb0.len(), 5);
         for (i, &v) in embedding1.iter().enumerate() {
-            assert!((emb0[i] - v).abs() < 1e-6, "embedding1[{}] = {} vs {}", i, emb0[i], v);
+            assert!(
+                (emb0[i] - v).abs() < 1e-6,
+                "embedding1[{}] = {} vs {}",
+                i,
+                emb0[i],
+                v
+            );
         }
 
         // Entry with embedding and expiry
@@ -1019,7 +1047,13 @@ mod tests {
         let emb1 = loaded[1].embedding.as_ref().unwrap();
         assert_eq!(emb1.len(), 4);
         for (i, &v) in embedding2.iter().enumerate() {
-            assert!((emb1[i] - v).abs() < 1e-6, "embedding2[{}] = {} vs {}", i, emb1[i], v);
+            assert!(
+                (emb1[i] - v).abs() < 1e-6,
+                "embedding2[{}] = {} vs {}",
+                i,
+                emb1[i],
+                v
+            );
         }
 
         // Entry without embedding
@@ -1042,15 +1076,13 @@ mod tests {
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
         let embedding = vec![1.0f32, -1.0, 0.5, 0.25, 0.125];
 
-        let entries = vec![
-            SnapshotEntry {
-                key: "big:emb".to_string(),
-                value: large_value.clone(),
-                memory_type: MemoryType::Semantic,
-                expires_at: Some(12345678),
-                embedding: Some(embedding.clone()),
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "big:emb".to_string(),
+            value: large_value.clone(),
+            memory_type: MemoryType::Semantic,
+            expires_at: Some(12345678),
+            embedding: Some(embedding.clone()),
+        }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
         let loaded = read_snapshot(&path).unwrap();
@@ -1077,15 +1109,13 @@ mod tests {
 
         // Large value but compression disabled
         let large_value: Vec<u8> = "XYZ".repeat(1024).into_bytes(); // 3072 bytes
-        let entries = vec![
-            SnapshotEntry {
-                key: "big:data".to_string(),
-                value: large_value.clone(),
-                memory_type: MemoryType::Semantic,
-                expires_at: None,
-                embedding: None,
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "big:data".to_string(),
+            value: large_value.clone(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+        }];
 
         // threshold=0 disables compression
         let path = write_snapshot(&dir, &entries, 1000, 0).unwrap();
@@ -1100,7 +1130,11 @@ mod tests {
         let key_len_offset = 16; // after header
         let flags_offset = key_len_offset + 4 + key_bytes.len();
         let flags = raw[flags_offset];
-        assert_eq!(flags & FLAG_COMPRESSED, 0, "compression should be disabled with threshold=0");
+        assert_eq!(
+            flags & FLAG_COMPRESSED,
+            0,
+            "compression should be disabled with threshold=0"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1122,7 +1156,10 @@ mod tests {
         let result = read_snapshot(&path);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("unsupported snapshot version"), "error was: {err}");
+        assert!(
+            err.contains("unsupported snapshot version"),
+            "error was: {err}"
+        );
         assert!(err.contains("99"));
 
         fs::remove_dir_all(&dir).ok();

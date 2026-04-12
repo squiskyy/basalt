@@ -1,5 +1,5 @@
-use basalt::replication::wal::{Wal, WalEntry, WalOp, serialize_entry, deserialize_entry};
-use basalt::replication::{ReplicationState, ReplicationRole};
+use basalt::replication::wal::{Wal, WalEntry, WalOp, deserialize_entry, serialize_entry};
+use basalt::replication::{ReplicationRole, ReplicationState};
 use basalt::store::engine::KvEngine;
 use basalt::store::memory_type::MemoryType;
 use std::sync::Arc;
@@ -348,7 +348,11 @@ fn test_ttl_zero_means_no_expiry_roundtrip() {
     let (_, decoded, _) = deserialize_entry(&data).unwrap();
     assert_eq!(decoded.ttl_ms, 0);
     // Replica interprets ttl_ms==0 as None (no expiry)
-    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+        None
+    } else {
+        Some(decoded.ttl_ms)
+    };
     assert_eq!(ttl, None, "ttl_ms=0 must round-trip as None (no expiry)");
 }
 
@@ -367,7 +371,11 @@ fn test_ttl_positive_means_actual_ttl_roundtrip() {
     let data = serialize_entry(&entry, 2);
     let (_, decoded, _) = deserialize_entry(&data).unwrap();
     assert_eq!(decoded.ttl_ms, 5000);
-    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+        None
+    } else {
+        Some(decoded.ttl_ms)
+    };
     assert_eq!(ttl, Some(5000), "ttl_ms=5000 must round-trip as Some(5000)");
 }
 
@@ -386,7 +394,11 @@ fn test_ttl_large_value_roundtrip() {
     let data = serialize_entry(&entry, 3);
     let (_, decoded, _) = deserialize_entry(&data).unwrap();
     assert_eq!(decoded.ttl_ms, u64::MAX / 2);
-    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 {
+        None
+    } else {
+        Some(decoded.ttl_ms)
+    };
     assert_eq!(ttl, Some(u64::MAX / 2));
 }
 
@@ -398,7 +410,10 @@ fn test_record_set_none_ttl_stores_zero() {
     repl_state.record_set(b"key1", b"val1", MemoryType::Semantic, None);
     let entries = repl_state.wal().entries_from(1);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].1.ttl_ms, 0, "record_set with None TTL must store ttl_ms=0");
+    assert_eq!(
+        entries[0].1.ttl_ms, 0,
+        "record_set with None TTL must store ttl_ms=0"
+    );
 }
 
 #[test]
@@ -409,5 +424,8 @@ fn test_record_set_some_ttl_stores_value() {
     repl_state.record_set(b"key2", b"val2", MemoryType::Episodic, Some(10000));
     let entries = repl_state.wal().entries_from(1);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].1.ttl_ms, 10000, "record_set with Some(10000) must store ttl_ms=10000");
+    assert_eq!(
+        entries[0].1.ttl_ms, 10000,
+        "record_set with Some(10000) must store ttl_ms=10000"
+    );
 }

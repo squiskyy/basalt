@@ -11,7 +11,11 @@ pub mod store;
 pub mod time;
 
 #[derive(Parser, Debug)]
-#[command(name = "basalt", version, about = "Ultra-high performance KV store for AI memory")]
+#[command(
+    name = "basalt",
+    version,
+    about = "Ultra-high performance KV store for AI memory"
+)]
 struct Args {
     /// Path to TOML config file
     #[arg(long, value_name = "FILE")]
@@ -94,18 +98,16 @@ async fn main() {
 
     // Load config: start with file (if provided), then apply CLI overrides
     let mut cfg = match &args.config {
-        Some(path) => {
-            match config::Config::from_file(path) {
-                Ok(c) => {
-                    info!("loaded config from {}", path.display());
-                    c
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
+        Some(path) => match config::Config::from_file(path) {
+            Ok(c) => {
+                info!("loaded config from {}", path.display());
+                c
             }
-        }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
         None => config::Config::default(),
     };
 
@@ -155,9 +157,15 @@ async fn main() {
         }
     }
 
-    info!("basalt v{} - memory that moves fast", env!("CARGO_PKG_VERSION"));
+    info!(
+        "basalt v{} - memory that moves fast",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("shards: {}", cfg.server.shard_count);
-    info!("compression threshold: {} bytes", cfg.server.compression_threshold);
+    info!(
+        "compression threshold: {} bytes",
+        cfg.server.compression_threshold
+    );
     if auth.is_enabled() {
         info!("auth: enabled ({} tokens)", auth.list_tokens().len());
     } else {
@@ -165,7 +173,10 @@ async fn main() {
     }
     match &cfg.server.db_path {
         Some(path) => {
-            info!("persistence: {} (snapshot every {}ms, compression threshold {} bytes)", path, cfg.server.snapshot_interval_ms, cfg.server.snapshot_compression_threshold);
+            info!(
+                "persistence: {} (snapshot every {}ms, compression threshold {} bytes)",
+                path, cfg.server.snapshot_interval_ms, cfg.server.snapshot_compression_threshold
+            );
         }
         None => info!("persistence: disabled (no db_path)"),
     }
@@ -180,21 +191,21 @@ async fn main() {
 
     // Start auto-snapshot loop if configured
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    if let Some(ref db_path) = cfg.server.db_path {
-        if cfg.server.snapshot_interval_ms > 0 {
-            let snap_db_path = std::path::PathBuf::from(db_path);
-            let snap_engine = engine.clone();
-            let snap_interval = cfg.server.snapshot_interval_ms;
-            let snap_threshold = cfg.server.snapshot_compression_threshold;
-            tokio::spawn(store::persistence::start_snapshot_loop_with_threshold(
-                snap_db_path,
-                snap_engine,
-                snap_interval,
-                3, // keep last 3 snapshots
-                snap_threshold,
-                shutdown_rx.clone(),
-            ));
-        }
+    if let Some(ref db_path) = cfg.server.db_path
+        && cfg.server.snapshot_interval_ms > 0
+    {
+        let snap_db_path = std::path::PathBuf::from(db_path);
+        let snap_engine = engine.clone();
+        let snap_interval = cfg.server.snapshot_interval_ms;
+        let snap_threshold = cfg.server.snapshot_compression_threshold;
+        tokio::spawn(store::persistence::start_snapshot_loop_with_threshold(
+            snap_db_path,
+            snap_engine,
+            snap_interval,
+            3, // keep last 3 snapshots
+            snap_threshold,
+            shutdown_rx.clone(),
+        ));
     }
 
     // Start expired-entry sweep loop if configured
@@ -202,10 +213,7 @@ async fn main() {
         let sweep_engine = engine.clone();
         let sweep_interval = cfg.server.sweep_interval_ms;
         let mut sweep_shutdown = shutdown_rx.clone();
-        info!(
-            "expired-entry sweep enabled: every {}ms",
-            sweep_interval
-        );
+        info!("expired-entry sweep enabled: every {}ms", sweep_interval);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -239,12 +247,21 @@ async fn main() {
         engine.clone(),
         cfg.server.wal_size,
     ));
-    info!("replication: primary mode, WAL size: {} entries", cfg.server.wal_size);
+    info!(
+        "replication: primary mode, WAL size: {} entries",
+        cfg.server.wal_size
+    );
 
     let http_repl_state = repl_state.clone();
     let http_shutdown_rx = shutdown_rx.clone();
     let http_server = tokio::spawn(async move {
-        let app = http::server::app(http_engine, http_auth, http_config.db_path.clone(), http_config.snapshot_compression_threshold, Some(http_repl_state));
+        let app = http::server::app(
+            http_engine,
+            http_auth,
+            http_config.db_path.clone(),
+            http_config.snapshot_compression_threshold,
+            Some(http_repl_state),
+        );
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         info!("HTTP server listening on {}", addr);
@@ -257,7 +274,7 @@ async fn main() {
             .unwrap();
     });
 
-    let mut resp_shutdown_rx = shutdown_rx.clone();
+    let resp_shutdown_rx = shutdown_rx.clone();
     let resp_server = tokio::spawn(async move {
         #[cfg(feature = "io-uring")]
         if resp_config.io_uring {
@@ -267,7 +284,14 @@ async fn main() {
             let uring_repl_state = repl_state.clone();
             // io_uring runs in its own thread (blocking), separate from tokio
             std::thread::spawn(move || {
-                if let Err(e) = resp::uring_server::run(&host, port, resp_engine, resp_auth, db_path, uring_repl_state) {
+                if let Err(e) = resp::uring_server::run(
+                    &host,
+                    port,
+                    resp_engine,
+                    resp_auth,
+                    db_path,
+                    uring_repl_state,
+                ) {
                     eprintln!("io_uring RESP server error: {e}");
                 }
             });
@@ -291,7 +315,7 @@ async fn main() {
 
         #[cfg(not(feature = "io-uring"))]
         {
-            let mut rx = resp_shutdown_rx;
+            let rx = resp_shutdown_rx;
             if let Err(e) = resp::server::run_with_replication(
                 &resp_config.resp_host,
                 resp_config.resp_port,

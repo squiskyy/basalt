@@ -131,11 +131,7 @@ impl HnswIndex {
     ///
     /// Returns results sorted by distance (closest first).
     /// Uses the cached values map from the last rebuild.
-    pub fn search(
-        &self,
-        embedding: &[f32],
-        top_k: usize,
-    ) -> Vec<VectorSearchResult> {
+    pub fn search(&self, embedding: &[f32], top_k: usize) -> Vec<VectorSearchResult> {
         let index = match &self.index {
             Some(idx) => idx,
             None => return Vec::new(),

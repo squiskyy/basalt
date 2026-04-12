@@ -7,14 +7,13 @@
 /// RESP: `AUTH <token>` command (Redis-compatible).
 ///
 /// Only `/store/*` paths require auth; all other paths are allowed through.
-
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
-use axum::Json;
 use papaya::HashMap as ConcurrentHashMap;
 
 use super::models::SimpleResponse;
@@ -28,8 +27,8 @@ pub struct Token {
     pub namespaces: Vec<String>,
 }
 
-/// The auth store — holds all tokens in a concurrent HashMap for fast lookup.
-#[derive(Debug, Clone)]
+/// The auth store - holds all tokens in a concurrent HashMap for fast lookup.
+#[derive(Debug, Clone, Default)]
 pub struct AuthStore {
     /// token_value -> Token
     tokens: Arc<ConcurrentHashMap<String, Token>>,
@@ -77,7 +76,10 @@ impl AuthStore {
         pinned
             .get(token_value)
             .map(|token| {
-                token.namespaces.iter().any(|ns| ns == "*" || ns == namespace)
+                token
+                    .namespaces
+                    .iter()
+                    .any(|ns| ns == "*" || ns == namespace)
             })
             .unwrap_or(false)
     }
@@ -197,9 +199,7 @@ mod tests {
 
     #[test]
     fn test_auth_wildcard() {
-        let store = AuthStore::from_list(vec![
-            ("bsk-admin".to_string(), vec!["*".to_string()]),
-        ]);
+        let store = AuthStore::from_list(vec![("bsk-admin".to_string(), vec!["*".to_string()])]);
         assert!(store.is_enabled());
         assert!(store.is_authorized("bsk-admin", "agent-1"));
         assert!(store.is_authorized("bsk-admin", "anything"));
@@ -210,7 +210,10 @@ mod tests {
     fn test_auth_scoped() {
         let store = AuthStore::from_list(vec![
             ("bsk-agent1".to_string(), vec!["agent-1".to_string()]),
-            ("bsk-agent2".to_string(), vec!["agent-2".to_string(), "shared".to_string()]),
+            (
+                "bsk-agent2".to_string(),
+                vec!["agent-2".to_string(), "shared".to_string()],
+            ),
         ]);
         assert!(store.is_authorized("bsk-agent1", "agent-1"));
         assert!(!store.is_authorized("bsk-agent1", "agent-2"));
@@ -222,9 +225,8 @@ mod tests {
 
     #[test]
     fn test_add_remove_token() {
-        let store = AuthStore::from_list(vec![
-            ("bsk-other".to_string(), vec!["other".to_string()]),
-        ]);
+        let store =
+            AuthStore::from_list(vec![("bsk-other".to_string(), vec!["other".to_string()])]);
         store.add_token("bsk-new".to_string(), vec!["ns-1".to_string()]);
         assert!(store.is_authorized("bsk-new", "ns-1"));
         assert!(store.remove_token("bsk-new"));
@@ -235,9 +237,18 @@ mod tests {
 
     #[test]
     fn test_extract_namespace() {
-        assert_eq!(extract_namespace_from_path("/store/agent-1/mem:1"), Some("agent-1"));
-        assert_eq!(extract_namespace_from_path("/store/agent-1"), Some("agent-1"));
-        assert_eq!(extract_namespace_from_path("/store/agent-1/batch"), Some("agent-1"));
+        assert_eq!(
+            extract_namespace_from_path("/store/agent-1/mem:1"),
+            Some("agent-1")
+        );
+        assert_eq!(
+            extract_namespace_from_path("/store/agent-1"),
+            Some("agent-1")
+        );
+        assert_eq!(
+            extract_namespace_from_path("/store/agent-1/batch"),
+            Some("agent-1")
+        );
         assert_eq!(extract_namespace_from_path("/health"), None);
         assert_eq!(extract_namespace_from_path("/info"), None);
     }

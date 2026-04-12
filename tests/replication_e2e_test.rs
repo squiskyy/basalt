@@ -13,8 +13,8 @@
 //! 3. Replica applies the deserialized entries to its local engine
 //! 4. Verify the replica engine has the same data as the primary
 
-use basalt::replication::wal::{Wal, WalEntry, WalOp, serialize_entry, deserialize_entry};
-use basalt::replication::{ReplicationState, ReplicationRole};
+use basalt::replication::wal::{WalOp, deserialize_entry, serialize_entry};
+use basalt::replication::{ReplicationRole, ReplicationState};
 use basalt::store::engine::KvEngine;
 use basalt::store::memory_type::MemoryType;
 use std::sync::Arc;
@@ -110,7 +110,12 @@ fn test_e2e_replication_delete_sync() {
 
     // Write a key on primary
     primary_engine
-        .set("ns:delkey", b"will_be_deleted".to_vec(), None, MemoryType::Semantic)
+        .set(
+            "ns:delkey",
+            b"will_be_deleted".to_vec(),
+            None,
+            MemoryType::Semantic,
+        )
         .unwrap();
     primary_state.record_set(b"ns:delkey", b"will_be_deleted", MemoryType::Semantic, None);
 
@@ -126,7 +131,11 @@ fn test_e2e_replication_delete_sync() {
 
         match decoded_entry.op {
             WalOp::Set => {
-                let ttl = if decoded_entry.ttl_ms == 0 { None } else { Some(decoded_entry.ttl_ms) };
+                let ttl = if decoded_entry.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(decoded_entry.ttl_ms)
+                };
                 replica_engine.set_force_with_embedding(
                     &String::from_utf8_lossy(&decoded_entry.key),
                     decoded_entry.value.clone(),
@@ -187,7 +196,11 @@ fn test_e2e_replication_delete_prefix_sync() {
 
         match decoded_entry.op {
             WalOp::Set => {
-                let ttl = if decoded_entry.ttl_ms == 0 { None } else { Some(decoded_entry.ttl_ms) };
+                let ttl = if decoded_entry.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(decoded_entry.ttl_ms)
+                };
                 replica_engine.set_force_with_embedding(
                     &String::from_utf8_lossy(&decoded_entry.key),
                     decoded_entry.value.clone(),
@@ -281,7 +294,11 @@ fn test_e2e_replication_snapshot_plus_wal() {
 
         match decoded_entry.op {
             WalOp::Set => {
-                let ttl = if decoded_entry.ttl_ms == 0 { None } else { Some(decoded_entry.ttl_ms) };
+                let ttl = if decoded_entry.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(decoded_entry.ttl_ms)
+                };
                 replica_engine.set_force_with_embedding(
                     &String::from_utf8_lossy(&decoded_entry.key),
                     decoded_entry.value.clone(),
@@ -365,7 +382,11 @@ fn test_e2e_replication_with_embeddings() {
 
         match decoded_entry.op {
             WalOp::Set => {
-                let ttl = if decoded_entry.ttl_ms == 0 { None } else { Some(decoded_entry.ttl_ms) };
+                let ttl = if decoded_entry.ttl_ms == 0 {
+                    None
+                } else {
+                    Some(decoded_entry.ttl_ms)
+                };
                 replica_engine.set_force_with_embedding(
                     &String::from_utf8_lossy(&decoded_entry.key),
                     decoded_entry.value.clone(),

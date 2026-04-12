@@ -2,7 +2,6 @@
 ///
 /// Can be loaded from a TOML config file or built from CLI args.
 /// CLI args override config file values.
-
 use std::fs;
 use std::path::Path;
 use tracing::warn;
@@ -45,14 +44,6 @@ pub struct ServerConfig {
     pub wal_size: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthConfig {
-    /// Path to auth tokens file (one token per line).
-    pub tokens_file: Option<String>,
-    /// Tokens specified directly (from CLI --auth flags).
-    pub tokens: Vec<String>,
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -74,13 +65,12 @@ impl Default for ServerConfig {
     }
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            tokens_file: None,
-            tokens: Vec::new(),
-        }
-    }
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    /// Path to auth tokens file (one token per line).
+    pub tokens_file: Option<String>,
+    /// Tokens specified directly (from CLI --auth flags).
+    pub tokens: Vec<String>,
 }
 
 /// TOML-deserializable config structure.
@@ -145,7 +135,10 @@ impl Config {
             http_port: file.server.http_port.unwrap_or(server_defaults.http_port),
             resp_host: file.server.resp_host.unwrap_or(server_defaults.resp_host),
             resp_port: file.server.resp_port.unwrap_or(server_defaults.resp_port),
-            shard_count: file.server.shard_count.unwrap_or(server_defaults.shard_count),
+            shard_count: file
+                .server
+                .shard_count
+                .unwrap_or(server_defaults.shard_count),
             #[cfg(feature = "io-uring")]
             io_uring: file.server.io_uring.unwrap_or(false),
             db_path: file.server.db_path,
@@ -182,6 +175,7 @@ impl Config {
 
     /// Apply CLI arg overrides on top of the loaded config.
     /// Only overwrites values that were explicitly set via CLI.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_cli_overrides(
         &mut self,
         http_host: Option<String>,
@@ -492,7 +486,7 @@ http_port = 9999
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "# Admin token - full access").unwrap();
         writeln!(f, "bsk-admin *").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "# Agent 1 - scoped access").unwrap();
         writeln!(f, "bsk-agent1 agent-1 shared").unwrap();
         writeln!(f, "bsk-agent2 agent-2").unwrap();

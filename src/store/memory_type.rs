@@ -75,7 +75,11 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip() {
-        for mt in [MemoryType::Episodic, MemoryType::Semantic, MemoryType::Procedural] {
+        for mt in [
+            MemoryType::Episodic,
+            MemoryType::Semantic,
+            MemoryType::Procedural,
+        ] {
             let json = serde_json::to_string(&mt).unwrap();
             let back: MemoryType = serde_json::from_str(&json).unwrap();
             assert_eq!(mt, back);

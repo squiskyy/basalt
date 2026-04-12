@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
-use axum::Router;
 
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
 
-use super::auth::{auth_middleware, AuthStore};
+use super::auth::{AuthStore, auth_middleware};
 use super::models::{
     BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, HealthResponse,
     InfoResponse, ListQuery, ListResponse, SearchRequest, SearchResponse, SearchResult,
@@ -29,7 +29,13 @@ pub struct AppState {
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
-pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>, compression_threshold: usize, repl_state: Option<Arc<crate::replication::ReplicationState>>) -> Router {
+pub fn app(
+    engine: Arc<KvEngine>,
+    auth: Arc<AuthStore>,
+    db_path: Option<String>,
+    compression_threshold: usize,
+    repl_state: Option<Arc<crate::replication::ReplicationState>>,
+) -> Router {
     let state = AppState {
         engine,
         auth,
@@ -54,7 +60,10 @@ pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>,
         .route("/store/{namespace}/{key}", get(get_memory))
         .route("/store/{namespace}/{key}", delete(delete_memory))
         .route("/snapshot", post(trigger_snapshot))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     Router::new()
         .merge(public)
@@ -91,9 +100,13 @@ async fn store_memory(
     let value_bytes = body.value.into_bytes();
 
     let result = if body.embedding.is_some() {
-        state
-            .engine
-            .set_with_embedding(&internal_key, value_bytes, body.ttl_ms, memory_type, body.embedding)
+        state.engine.set_with_embedding(
+            &internal_key,
+            value_bytes,
+            body.ttl_ms,
+            memory_type,
+            body.embedding,
+        )
     } else {
         state
             .engine
@@ -108,7 +121,10 @@ async fn store_memory(
             };
             (StatusCode::CREATED, axum::Json(resp)).into_response()
         }
-        Err(ShardFullError { max_entries, current }) => {
+        Err(ShardFullError {
+            max_entries,
+            current,
+        }) => {
             let body = serde_json::json!({
                 "error": "max entries exceeded",
                 "max_entries": max_entries,
@@ -250,17 +266,27 @@ async fn batch_store(
         let memory_type = item.r#type.unwrap_or(MemoryType::Semantic);
         let value_bytes = item.value.as_bytes();
         let result = if item.embedding.is_some() {
-            state
-                .engine
-                .set_with_embedding(&internal_key, value_bytes.to_vec(), item.ttl_ms, memory_type, item.embedding.clone())
+            state.engine.set_with_embedding(
+                &internal_key,
+                value_bytes.to_vec(),
+                item.ttl_ms,
+                memory_type,
+                item.embedding.clone(),
+            )
         } else {
-            state
-                .engine
-                .set(&internal_key, value_bytes.to_vec(), item.ttl_ms, memory_type)
+            state.engine.set(
+                &internal_key,
+                value_bytes.to_vec(),
+                item.ttl_ms,
+                memory_type,
+            )
         };
         match result {
             Ok(()) => stored += 1,
-            Err(ShardFullError { max_entries, current }) => {
+            Err(ShardFullError {
+                max_entries,
+                current,
+            }) => {
                 let body = serde_json::json!({
                     "error": "max entries exceeded",
                     "max_entries": max_entries,
@@ -319,7 +345,9 @@ async fn search_memories(
     Path(namespace): Path<String>,
     axum::Json(req): axum::Json<SearchRequest>,
 ) -> impl IntoResponse {
-    let results = state.engine.search_embedding(&namespace, &req.embedding, req.top_k);
+    let results = state
+        .engine
+        .search_embedding(&namespace, &req.embedding, req.top_k);
     let search_results: Vec<SearchResult> = results
         .into_iter()
         .map(|r| SearchResult {
@@ -340,7 +368,12 @@ async fn trigger_snapshot(State(state): State<AppState>) -> impl IntoResponse {
     match &state.db_path {
         Some(db_path) => {
             let path = std::path::Path::new(db_path);
-            match crate::store::persistence::snapshot_with_threshold(path, &state.engine, 3, state.compression_threshold) {
+            match crate::store::persistence::snapshot_with_threshold(
+                path,
+                &state.engine,
+                3,
+                state.compression_threshold,
+            ) {
                 Ok(snapshot_path) => {
                     let entries = crate::store::persistence::collect_entries(&state.engine).len();
                     let resp = SnapshotResponse {
