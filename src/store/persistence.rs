@@ -1,16 +1,25 @@
 /// Persistence module for Basalt KV store.
 ///
-/// Simple, fast binary snapshot format:
+/// Binary snapshot format (version 2):
 ///   - Magic bytes: b"BASALT\x00" (8 bytes)
-///   - Version: u8 (1 byte, currently 1)
+///   - Version: u8 (1 byte, currently 2)
 ///   - Entry count: u64 (8 bytes, little-endian)
-///   - For each entry:
+///   - For each entry (version 2):
 ///     - key_len: u32 (4 bytes, LE)
 ///     - key: [u8; key_len]
-///     - val_len: u32 (4 bytes, LE)
-///     - value: [u8; val_len]
+///     - flags: u8 (1 byte, bit 0 = LZ4 compressed, bits 1-7 reserved)
+///     - val_len: u32 (4 bytes, LE, length of stored value bytes)
+///     - value: [u8; val_len] (compressed if flag bit 0 set)
 ///     - memory_type: u8 (0=episodic, 1=semantic, 2=procedural)
 ///     - expires_at: u64 (8 bytes, LE, 0 = no expiry)
+///
+/// Version 1 format (backward compatible on read):
+///   Same as above but without the flags byte per entry.
+///   When reading version 1, entries are read without flags (no compression).
+///
+/// Values larger than snapshot_compression_threshold are LZ4-compressed
+/// before writing and decompressed on read. Threshold default: 1024 bytes.
+/// Setting threshold to 0 disables compression entirely.
 ///
 /// Snapshots are written atomically: write to a temp file, then rename.
 /// On startup, load the latest snapshot from the db_path directory.
@@ -25,7 +34,16 @@ use tracing::{debug, error, info, warn};
 const MAGIC: &[u8; 7] = b"BASALT\x00";
 
 /// Current snapshot format version.
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+
+/// Version 1 (legacy, no compression/flags byte).
+const VERSION_1: u8 = 1;
+
+/// Flag bit: entry value is LZ4-compressed.
+const FLAG_COMPRESSED: u8 = 0b0000_0001;
+
+/// Default compression threshold in bytes.
+const DEFAULT_COMPRESSION_THRESHOLD: usize = 1024;
 
 /// File name pattern for snapshots: `snapshot-<timestamp>.bin`
 const SNAPSHOT_PREFIX: &str = "snapshot-";
@@ -63,10 +81,14 @@ pub struct SnapshotEntry {
 ///
 /// Writes to a temp file first, then renames to the final path.
 /// Returns the path of the written snapshot file.
+///
+/// Values larger than `compression_threshold` bytes are LZ4-compressed
+/// before writing. Set threshold to 0 to disable compression.
 pub fn write_snapshot(
     db_path: &Path,
     entries: &[SnapshotEntry],
     timestamp_ms: u64,
+    compression_threshold: usize,
 ) -> Result<PathBuf, String> {
     // Ensure db_path directory exists
     fs::create_dir_all(db_path)
@@ -95,9 +117,27 @@ pub fn write_snapshot(
             .map_err(|e| format!("write key_len: {e}"))?;
         f.write_all(key_bytes)
             .map_err(|e| format!("write key: {e}"))?;
-        f.write_all(&(entry.value.len() as u32).to_le_bytes())
+
+        // Compress if threshold > 0 and value is large enough
+        let (flags, stored_value): (u8, Vec<u8>) = if compression_threshold > 0
+            && entry.value.len() > compression_threshold
+        {
+            let compressed = lz4_flex::compress_prepend_size(&entry.value);
+            // Only use compression if it actually reduces size
+            if compressed.len() < entry.value.len() {
+                (FLAG_COMPRESSED, compressed)
+            } else {
+                (0u8, entry.value.clone())
+            }
+        } else {
+            (0u8, entry.value.clone())
+        };
+
+        f.write_all(&[flags])
+            .map_err(|e| format!("write flags: {e}"))?;
+        f.write_all(&(stored_value.len() as u32).to_le_bytes())
             .map_err(|e| format!("write val_len: {e}"))?;
-        f.write_all(&entry.value)
+        f.write_all(&stored_value)
             .map_err(|e| format!("write value: {e}"))?;
         f.write_all(&[memory_type_to_u8(entry.memory_type)])
             .map_err(|e| format!("write memory_type: {e}"))?;
@@ -129,6 +169,9 @@ pub fn write_snapshot(
 
 /// Read a snapshot from disk.
 ///
+/// Supports both version 1 (no flags byte, no compression) and version 2
+/// (flags byte per entry, optional LZ4 decompression).
+///
 /// Returns the list of entries stored in the snapshot.
 pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut f = fs::File::open(path)
@@ -148,14 +191,16 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut version = [0u8; 1];
     f.read_exact(&mut version)
         .map_err(|e| format!("read version: {e}"))?;
-    if version[0] != VERSION {
+    if version[0] != VERSION && version[0] != VERSION_1 {
         return Err(format!(
-            "unsupported snapshot version {} in {} (expected {})",
+            "unsupported snapshot version {} in {} (expected {} or {})",
             version[0],
             path.display(),
+            VERSION_1,
             VERSION
         ));
     }
+    let is_v1 = version[0] == VERSION_1;
 
     let mut count_bytes = [0u8; 8];
     f.read_exact(&mut count_bytes)
@@ -178,15 +223,32 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let key = String::from_utf8(key_bytes)
             .map_err(|e| format!("invalid key UTF-8 at entry {i}: {e}"))?;
 
+        // flags (only in version 2+)
+        let flags = if is_v1 {
+            0u8
+        } else {
+            let mut flags_byte = [0u8; 1];
+            f.read_exact(&mut flags_byte)
+                .map_err(|e| format!("read flags at entry {i}: {e}"))?;
+            flags_byte[0]
+        };
+
         // val_len
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read val_len at entry {i}: {e}"))?;
         let val_len = u32::from_le_bytes(len_bytes) as usize;
 
-        // value
-        let mut value = vec![0u8; val_len];
-        f.read_exact(&mut value)
+        // value (compressed if flag set)
+        let mut stored_value = vec![0u8; val_len];
+        f.read_exact(&mut stored_value)
             .map_err(|e| format!("read value at entry {i}: {e}"))?;
+
+        let value = if (flags & FLAG_COMPRESSED) != 0 {
+            lz4_flex::decompress_size_prepended(&stored_value)
+                .map_err(|e| format!("LZ4 decompress failed at entry {i} key '{}': {e}", key))?
+        } else {
+            stored_value
+        };
 
         // memory_type
         let mut mt_byte = [0u8; 1];
@@ -362,13 +424,23 @@ pub fn snapshot(
     engine: &crate::store::engine::KvEngine,
     keep_snapshots: usize,
 ) -> Result<PathBuf, String> {
+    snapshot_with_threshold(db_path, engine, keep_snapshots, DEFAULT_COMPRESSION_THRESHOLD)
+}
+
+/// Perform a snapshot with a custom compression threshold.
+pub fn snapshot_with_threshold(
+    db_path: &Path,
+    engine: &crate::store::engine::KvEngine,
+    keep_snapshots: usize,
+    compression_threshold: usize,
+) -> Result<PathBuf, String> {
     let entries = collect_entries(engine);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time went backwards")
         .as_millis() as u64;
 
-    let path = write_snapshot(db_path, &entries, now_ms)?;
+    let path = write_snapshot(db_path, &entries, now_ms, compression_threshold)?;
     let pruned = prune_snapshots(db_path, keep_snapshots);
     if pruned > 0 {
         debug!("pruned {pruned} old snapshot(s)");
@@ -383,6 +455,26 @@ pub async fn start_snapshot_loop(
     engine: std::sync::Arc<crate::store::engine::KvEngine>,
     interval_ms: u64,
     keep_snapshots: usize,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    start_snapshot_loop_with_threshold(
+        db_path,
+        engine,
+        interval_ms,
+        keep_snapshots,
+        DEFAULT_COMPRESSION_THRESHOLD,
+        shutdown,
+    )
+    .await
+}
+
+/// Start the auto-snapshot background task with a custom compression threshold.
+pub async fn start_snapshot_loop_with_threshold(
+    db_path: PathBuf,
+    engine: std::sync::Arc<crate::store::engine::KvEngine>,
+    interval_ms: u64,
+    keep_snapshots: usize,
+    compression_threshold: usize,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     if interval_ms == 0 {
@@ -391,14 +483,14 @@ pub async fn start_snapshot_loop(
     }
 
     info!(
-        "auto-snapshot enabled: every {}ms, keeping {} snapshots",
-        interval_ms, keep_snapshots
+        "auto-snapshot enabled: every {}ms, keeping {} snapshots, compression threshold {} bytes",
+        interval_ms, keep_snapshots, compression_threshold
     );
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)) => {
-                match snapshot(&db_path, &engine, keep_snapshots) {
+                match snapshot_with_threshold(&db_path, &engine, keep_snapshots, compression_threshold) {
                     Ok(path) => info!("auto-snapshot saved: {} ({} entries)", path.display(), {
                         let entries = collect_entries(&engine);
                         entries.len()
@@ -408,7 +500,7 @@ pub async fn start_snapshot_loop(
             }
             _ = shutdown.changed() => {
                 info!("auto-snapshot shutting down, performing final snapshot...");
-                match snapshot(&db_path, &engine, keep_snapshots) {
+                match snapshot_with_threshold(&db_path, &engine, keep_snapshots, compression_threshold) {
                     Ok(path) => info!("final snapshot saved: {}", path.display()),
                     Err(e) => error!("final snapshot failed: {e}"),
                 }
@@ -451,7 +543,7 @@ mod tests {
             },
         ];
 
-        let path = write_snapshot(&dir, &entries, 1000).unwrap();
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
         assert!(path.exists());
 
         let loaded = read_snapshot(&path).unwrap();
@@ -533,7 +625,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let entries: Vec<SnapshotEntry> = vec![];
-        let path = write_snapshot(&dir, &entries, 1000).unwrap();
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
 
         let loaded = read_snapshot(&path).unwrap();
         assert_eq!(loaded.len(), 0);
@@ -563,5 +655,207 @@ mod tests {
         assert_eq!(u8_to_memory_type(memory_type_to_u8(MemoryType::Semantic)), Some(MemoryType::Semantic));
         assert_eq!(u8_to_memory_type(memory_type_to_u8(MemoryType::Procedural)), Some(MemoryType::Procedural));
         assert_eq!(u8_to_memory_type(255), None);
+    }
+
+    #[test]
+    fn test_compression_large_values() {
+        let dir = std::env::temp_dir().join("basalt_test_compression_large");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a value that is larger than the threshold (1024 bytes)
+        // Use a compressible pattern so LZ4 actually reduces size
+        let large_value: Vec<u8> = "ABCD".repeat(512).into_bytes(); // 2048 bytes of repeating data
+        assert!(large_value.len() > 1024);
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "large:data".to_string(),
+                value: large_value.clone(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+            },
+        ];
+
+        // Write with threshold of 1024
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+
+        // Read back and verify data integrity
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "large:data");
+        assert_eq!(loaded[0].value, large_value);
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+
+        // Verify the snapshot file is smaller than the uncompressed data
+        let file_size = fs::metadata(&path).unwrap().len() as usize;
+        let uncompressed_data_size = large_value.len();
+        // File should be smaller than if the value were stored uncompressed
+        // (header is ~17 bytes + key overhead, so file should be well under uncompressed size + header)
+        assert!(
+            file_size < uncompressed_data_size + 100,
+            "file size {} should be less than uncompressed data size {} + overhead",
+            file_size,
+            uncompressed_data_size
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_no_compression_small_values() {
+        let dir = std::env::temp_dir().join("basalt_test_no_compress_small");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Small value well below the threshold
+        let small_value = b"tiny data".to_vec();
+        assert!(small_value.len() < 1024);
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "small:data".to_string(),
+                value: small_value.clone(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+            },
+        ];
+
+        // Write with threshold of 1024
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+
+        // Read back
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "small:data");
+        assert_eq!(loaded[0].value, small_value);
+
+        // Verify the snapshot file does NOT have the compressed flag set
+        // by reading the raw bytes and checking the flags byte
+        let raw = fs::read(&path).unwrap();
+        // Header: 7 bytes magic + 1 byte version + 8 bytes count = 16
+        // Then: 4 bytes key_len + key bytes + 1 byte flags
+        let key_bytes = b"small:data";
+        let key_len_offset = 16; // after header
+        let flags_offset = key_len_offset + 4 + key_bytes.len();
+        let flags = raw[flags_offset];
+        assert_eq!(flags & FLAG_COMPRESSED, 0, "small value should NOT be compressed");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_backward_compatibility_v1() {
+        let dir = std::env::temp_dir().join("basalt_test_v1_compat");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create a version 1 snapshot (no flags byte)
+        let path = dir.join("snapshot-1000.bin");
+        let mut data = Vec::new();
+
+        // Magic
+        data.extend_from_slice(b"BASALT\x00");
+        // Version 1
+        data.push(1u8);
+        // Count: 2 entries
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        // Entry 1: key="hello", value="world", memory_type=Semantic, expires_at=0
+        let key1 = b"hello";
+        data.extend_from_slice(&(key1.len() as u32).to_le_bytes());
+        data.extend_from_slice(key1);
+        let val1 = b"world";
+        data.extend_from_slice(&(val1.len() as u32).to_le_bytes());
+        data.extend_from_slice(val1);
+        data.push(1u8); // Semantic
+        data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+        // Entry 2: key="test", value=[0,1,2,3], memory_type=Procedural, expires_at=99999
+        let key2 = b"test";
+        data.extend_from_slice(&(key2.len() as u32).to_le_bytes());
+        data.extend_from_slice(key2);
+        let val2: Vec<u8> = vec![0, 1, 2, 3];
+        data.extend_from_slice(&(val2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&val2);
+        data.push(2u8); // Procedural
+        data.extend_from_slice(&99999u64.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        // Read back using version 2 reader — should handle v1 format
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].key, "hello");
+        assert_eq!(loaded[0].value, b"world".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+
+        assert_eq!(loaded[1].key, "test");
+        assert_eq!(loaded[1].value, vec![0, 1, 2, 3]);
+        assert_eq!(loaded[1].memory_type, MemoryType::Procedural);
+        assert_eq!(loaded[1].expires_at, Some(99999));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_compression_disabled_with_zero_threshold() {
+        let dir = std::env::temp_dir().join("basalt_test_no_compress_zero");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Large value but compression disabled
+        let large_value: Vec<u8> = "XYZ".repeat(1024).into_bytes(); // 3072 bytes
+        let entries = vec![
+            SnapshotEntry {
+                key: "big:data".to_string(),
+                value: large_value.clone(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+            },
+        ];
+
+        // threshold=0 disables compression
+        let path = write_snapshot(&dir, &entries, 1000, 0).unwrap();
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].value, large_value);
+
+        // Verify no compression flag in file
+        let raw = fs::read(&path).unwrap();
+        let key_bytes = b"big:data";
+        let key_len_offset = 16; // after header
+        let flags_offset = key_len_offset + 4 + key_bytes.len();
+        let flags = raw[flags_offset];
+        assert_eq!(flags & FLAG_COMPRESSED, 0, "compression should be disabled with threshold=0");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_unsupported_version() {
+        let dir = std::env::temp_dir().join("basalt_test_bad_version");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("snapshot-badver.bin");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"BASALT\x00");
+        data.push(99u8); // unsupported version
+        data.extend_from_slice(&0u64.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        let result = read_snapshot(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("unsupported snapshot version"), "error was: {err}");
+        assert!(err.contains("99"));
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

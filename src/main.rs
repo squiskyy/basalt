@@ -56,6 +56,10 @@ struct Args {
     #[arg(long, value_name = "N")]
     max_entries: Option<usize>,
 
+    /// Minimum value size (bytes) to LZ4-compress in snapshots (overrides config file, 0 = disable)
+    #[arg(long, value_name = "BYTES")]
+    snapshot_compression_threshold: Option<usize>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -110,6 +114,7 @@ async fn main() {
         args.auth,
         args.auth_file,
         args.max_entries,
+        args.snapshot_compression_threshold,
     );
 
     // Resolve auth tokens from file + CLI
@@ -146,7 +151,7 @@ async fn main() {
     }
     match &cfg.server.db_path {
         Some(path) => {
-            info!("persistence: {} (snapshot every {}ms)", path, cfg.server.snapshot_interval_ms);
+            info!("persistence: {} (snapshot every {}ms, compression threshold {} bytes)", path, cfg.server.snapshot_interval_ms, cfg.server.snapshot_compression_threshold);
         }
         None => info!("persistence: disabled (no db_path)"),
     }
@@ -166,11 +171,13 @@ async fn main() {
             let snap_db_path = std::path::PathBuf::from(db_path);
             let snap_engine = engine.clone();
             let snap_interval = cfg.server.snapshot_interval_ms;
-            tokio::spawn(store::persistence::start_snapshot_loop(
+            let snap_threshold = cfg.server.snapshot_compression_threshold;
+            tokio::spawn(store::persistence::start_snapshot_loop_with_threshold(
                 snap_db_path,
                 snap_engine,
                 snap_interval,
                 3, // keep last 3 snapshots
+                snap_threshold,
                 shutdown_rx.clone(),
             ));
         }

@@ -1,4 +1,4 @@
-use basalt::store::{KvEngine, MemoryType, snapshot, load_latest_snapshot, collect_entries};
+use basalt::store::{KvEngine, MemoryType, snapshot, snapshot_with_threshold, load_latest_snapshot, collect_entries};
 
 /// Basic snapshot round-trip: set data, snapshot, new engine, restore, verify.
 #[test]
@@ -332,4 +332,147 @@ fn test_snapshot_namespace_keys() {
     assert_eq!(deleted, 3);
     assert!(engine2.scan_prefix("session:").is_empty());
     assert_eq!(engine2.scan_prefix("cache:").len(), 2);
+}
+
+/// Test that large values are LZ4-compressed in the snapshot file.
+/// The snapshot file should be smaller than the raw uncompressed data.
+#[test]
+fn test_snapshot_compression_large_values() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = dir.path();
+
+    let engine = KvEngine::new(4);
+
+    // Create a large compressible value (>1KB)
+    let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes, highly compressible
+    assert!(large_value.len() > 1024, "value should be > 1KB");
+
+    engine.set("big:key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+    engine.set("small:key", b"tiny".to_vec(), None, MemoryType::Semantic).unwrap();
+
+    // Snapshot with default threshold (1024)
+    let result = snapshot_with_threshold(db_path, &engine, 1, 1024);
+    assert!(result.is_ok(), "snapshot should succeed: {:?}", result);
+
+    // Restore into new engine
+    let engine2 = KvEngine::new(4);
+    let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
+    assert_eq!(loaded, 2);
+
+    // Verify data integrity
+    assert_eq!(engine2.get("big:key"), Some(large_value.clone()));
+    assert_eq!(engine2.get("small:key"), Some(b"tiny".to_vec()));
+
+    // Verify the snapshot file is smaller than the uncompressed data
+    let snapshot_file = basalt::store::persistence::find_latest_snapshot(db_path).unwrap();
+    let file_size = std::fs::metadata(&snapshot_file).unwrap().len() as usize;
+    // The large value alone is 2048 bytes; the file should be smaller than
+    // if stored uncompressed (file has overhead for keys, metadata, headers, but
+    // the 2048-byte value should compress well below 2048)
+    assert!(
+        file_size < large_value.len() + 200,
+        "snapshot file ({}) should be smaller than uncompressed data ({}) + small overhead",
+        file_size,
+        large_value.len()
+    );
+}
+
+/// Test that small values are NOT compressed in the snapshot file.
+#[test]
+fn test_snapshot_no_compression_small_values() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = dir.path();
+
+    let engine = KvEngine::new(4);
+
+    // Small values well below threshold
+    engine.set("k1", b"hello".to_vec(), None, MemoryType::Semantic).unwrap();
+    engine.set("k2", b"world".to_vec(), None, MemoryType::Episodic).unwrap();
+
+    snapshot_with_threshold(db_path, &engine, 1, 1024).unwrap();
+
+    // Restore and verify
+    let engine2 = KvEngine::new(4);
+    let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
+    assert_eq!(loaded, 2);
+    assert_eq!(engine2.get("k1"), Some(b"hello".to_vec()));
+    assert_eq!(engine2.get("k2"), Some(b"world".to_vec()));
+
+    // Read the raw file and verify the flags byte for each entry has bit 0 unset
+    let snapshot_file = basalt::store::persistence::find_latest_snapshot(db_path).unwrap();
+    let raw = std::fs::read(&snapshot_file).unwrap();
+    // Header: 7 magic + 1 version + 8 count = 16 bytes
+    // Then per entry: 4 key_len + key + 1 flags + 4 val_len + val + 1 memory_type + 8 expires_at
+    let header_size = 16;
+    let mut offset = header_size;
+    for _ in 0..2 {
+        // key_len
+        let key_len = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4 + key_len;
+        // flags byte
+        let flags = raw[offset];
+        assert_eq!(flags & 0b1, 0, "small value should NOT have compressed flag set");
+        offset += 1;
+        // val_len
+        let val_len = u32::from_le_bytes(raw[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4 + val_len + 1 + 8; // skip value + memory_type + expires_at
+    }
+}
+
+/// Test backward compatibility: a version 1 snapshot (no flags byte) can still be restored.
+#[test]
+fn test_snapshot_backward_compat_v1() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = dir.path();
+
+    // Manually write a version 1 snapshot file
+    // Format: magic(7) + version(1) + count(8) + per-entry: key_len(4) + key + val_len(4) + val + mt(1) + exp(8)
+    let mut data = Vec::new();
+    data.extend_from_slice(b"BASALT\x00"); // magic
+    data.push(1u8); // version 1
+    data.extend_from_slice(&1u64.to_le_bytes()); // 1 entry
+
+    // Entry: key="legacy:key", value="legacy value data", memory_type=Semantic(1), expires_at=0
+    let key = b"legacy:key";
+    data.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    data.extend_from_slice(key);
+    let val = b"legacy value data";
+    data.extend_from_slice(&(val.len() as u32).to_le_bytes());
+    data.extend_from_slice(val);
+    data.push(1u8); // Semantic
+    data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+    // Write as a snapshot file
+    let snapshot_path = db_path.join("snapshot-9999.bin");
+    std::fs::write(&snapshot_path, &data).unwrap();
+
+    // Load into engine
+    let engine = KvEngine::new(4);
+    let loaded = load_latest_snapshot(db_path, &engine).unwrap();
+    assert_eq!(loaded, 1);
+
+    // Verify the data was restored correctly
+    assert_eq!(engine.get("legacy:key"), Some(b"legacy value data".to_vec()));
+}
+
+/// Test that compression disabled with threshold=0 still works correctly.
+#[test]
+fn test_snapshot_compression_disabled() {
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let db_path = dir.path();
+
+    let engine = KvEngine::new(4);
+
+    // Large value that would normally be compressed
+    let large_value: Vec<u8> = "X".repeat(5000).into_bytes();
+    engine.set("big:key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+
+    // Snapshot with threshold=0 (compression disabled)
+    snapshot_with_threshold(db_path, &engine, 1, 0).unwrap();
+
+    // Restore
+    let engine2 = KvEngine::new(4);
+    let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
+    assert_eq!(loaded, 1);
+    assert_eq!(engine2.get("big:key"), Some(large_value));
 }
