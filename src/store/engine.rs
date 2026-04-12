@@ -1,5 +1,5 @@
 use crate::store::memory_type::MemoryType;
-use crate::store::shard::{Entry, Shard};
+use crate::store::shard::{Entry, Shard, ShardFullError};
 use fxhash::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ pub struct EntryMeta {
 pub struct KvEngine {
     shards: Vec<Shard>,
     shard_mask: usize,
+    max_entries: usize,
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -43,12 +44,20 @@ fn now_ms() -> u64 {
 impl KvEngine {
     /// Create a new KvEngine with the given target shard count.
     /// The actual shard count will be rounded up to the next power of 2.
+    /// Each shard gets a default max_entries of 1,000,000.
     pub fn new(shard_count: usize) -> Self {
+        Self::with_max_entries(shard_count, 1_000_000)
+    }
+
+    /// Create a new KvEngine with the given target shard count and
+    /// max entries per shard.
+    pub fn with_max_entries(shard_count: usize, max_entries: usize) -> Self {
         let count = next_power_of_2(shard_count.max(1));
-        let shards = (0..count).map(|_| Shard::new()).collect();
+        let shards = (0..count).map(|_| Shard::with_max_entries(max_entries)).collect();
         KvEngine {
             shards,
             shard_mask: count - 1,
+            max_entries,
         }
     }
 
@@ -61,7 +70,8 @@ impl KvEngine {
     }
 
     /// Set a key with explicit TTL (in ms from now) and memory type.
-    pub fn set(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType) {
+    /// Returns Err(ShardFullError) if the target shard is at capacity.
+    pub fn set(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType) -> Result<(), ShardFullError> {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
@@ -69,7 +79,20 @@ impl KvEngine {
             memory_type,
         };
         let idx = self.shard_index(key);
-        self.shards[idx].set(key.to_string(), entry);
+        self.shards[idx].set(key.to_string(), entry)
+    }
+
+    /// Force-set a key, ignoring shard capacity limits.
+    /// Used during snapshot restore to ensure data integrity.
+    pub fn set_force(&self, key: &str, value: Vec<u8>, ttl_ms: Option<u64>, memory_type: MemoryType) {
+        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let entry = Entry {
+            value,
+            expires_at,
+            memory_type,
+        };
+        let idx = self.shard_index(key);
+        self.shards[idx].set_force(key.to_string(), entry);
     }
 
     /// Get the value for a key. Returns None if missing or expired.
@@ -151,6 +174,11 @@ impl KvEngine {
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
+
+    /// Return the max entries per shard.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
 }
 
 impl Default for KvEngine {
@@ -185,10 +213,10 @@ mod tests {
         let engine = KvEngine::new(4);
         // Insert entries: some expired (TTL=0 means expires_at=now, so is_expired is true),
         // some live (no TTL)
-        engine.set("expired1", b"val1".to_vec(), Some(0), MemoryType::Episodic);
-        engine.set("expired2", b"val2".to_vec(), Some(0), MemoryType::Episodic);
-        engine.set("live1", b"val3".to_vec(), None, MemoryType::Semantic);
-        engine.set("live2", b"val4".to_vec(), None, MemoryType::Semantic);
+        engine.set("expired1", b"val1".to_vec(), Some(0), MemoryType::Episodic).unwrap();
+        engine.set("expired2", b"val2".to_vec(), Some(0), MemoryType::Episodic).unwrap();
+        engine.set("live1", b"val3".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set("live2", b"val4".to_vec(), None, MemoryType::Semantic).unwrap();
 
         let reaped = engine.reap_all_expired().await;
         assert_eq!(reaped, 2);
@@ -196,5 +224,28 @@ mod tests {
         assert!(engine.get("live2").is_some());
         assert!(engine.get("expired1").is_none());
         assert!(engine.get("expired2").is_none());
+    }
+
+    #[test]
+    fn test_engine_max_entries() {
+        let engine = KvEngine::with_max_entries(4, 1_000_000);
+        assert_eq!(engine.max_entries(), 1_000_000);
+    }
+
+    #[test]
+    fn test_engine_set_returns_err_at_capacity() {
+        // 1 shard (power of 2 = 1), max 3 entries
+        let engine = KvEngine::with_max_entries(1, 3);
+        assert!(engine.set("k1", b"v1".to_vec(), None, MemoryType::Semantic).is_ok());
+        assert!(engine.set("k2", b"v2".to_vec(), None, MemoryType::Semantic).is_ok());
+        assert!(engine.set("k3", b"v3".to_vec(), None, MemoryType::Semantic).is_ok());
+        // 4th insert should fail
+        let result = engine.set("k4", b"v4".to_vec(), None, MemoryType::Semantic);
+        assert!(result.is_err());
+        // Update existing key should still work
+        assert!(engine.set("k1", b"v1_updated".to_vec(), None, MemoryType::Semantic).is_ok());
+        // Delete and then insert should work
+        engine.delete("k1");
+        assert!(engine.set("k5", b"v5".to_vec(), None, MemoryType::Semantic).is_ok());
     }
 }

@@ -104,8 +104,9 @@ impl CommandHandler {
             }
         }
 
-        self.engine.set(&key, value, ttl_ms, MemoryType::Semantic);
-        RespValue::SimpleString("OK".to_string())
+        self.engine.set(&key, value, ttl_ms, MemoryType::Semantic)
+            .map(|_| RespValue::SimpleString("OK".to_string()))
+            .unwrap_or_else(|_| RespValue::Error("ERR max entries exceeded".to_string()))
     }
 
     fn handle_get(&self, cmd: &Command) -> RespValue {
@@ -159,7 +160,12 @@ impl CommandHandler {
         while i < cmd.args.len() {
             let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
             let value = cmd.args[i + 1].clone();
-            self.engine.set(&key, value, None, MemoryType::Semantic);
+            match self.engine.set(&key, value, None, MemoryType::Semantic) {
+                Ok(()) => {}
+                Err(_) => {
+                    return RespValue::Error("ERR max entries exceeded".to_string());
+                }
+            }
             i += 2;
         }
         RespValue::SimpleString("OK".to_string())
@@ -245,8 +251,9 @@ impl CommandHandler {
             }
         }
 
-        self.engine.set(&key, value, ttl_ms, memory_type);
-        RespValue::SimpleString("OK".to_string())
+        self.engine.set(&key, value, ttl_ms, memory_type)
+            .map(|_| RespValue::SimpleString("OK".to_string()))
+            .unwrap_or_else(|_| RespValue::Error("ERR max entries exceeded".to_string()))
     }
 
     fn handle_mgett(&self, cmd: &Command) -> RespValue {

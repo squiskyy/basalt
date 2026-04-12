@@ -9,6 +9,7 @@ use axum::Router;
 
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::store::shard::ShardFullError;
 
 use super::auth::{auth_middleware, AuthStore};
 use super::models::{
@@ -81,15 +82,26 @@ async fn store_memory(
     let memory_type = body.r#type.unwrap_or(MemoryType::Semantic);
     let value_bytes = body.value.into_bytes();
 
-    state
+    match state
         .engine
-        .set(&internal_key, value_bytes, body.ttl_ms, memory_type);
-
-    let resp = SimpleResponse {
-        ok: true,
-        deleted: None,
-    };
-    (StatusCode::CREATED, axum::Json(resp))
+        .set(&internal_key, value_bytes, body.ttl_ms, memory_type)
+    {
+        Ok(()) => {
+            let resp = SimpleResponse {
+                ok: true,
+                deleted: None,
+            };
+            (StatusCode::CREATED, axum::Json(resp)).into_response()
+        }
+        Err(ShardFullError { max_entries, current }) => {
+            let body = serde_json::json!({
+                "error": "max entries exceeded",
+                "max_entries": max_entries,
+                "current": current,
+            });
+            (StatusCode::INSUFFICIENT_STORAGE, axum::Json(body)).into_response()
+        }
+    }
 }
 
 async fn list_memories(
@@ -217,14 +229,25 @@ async fn batch_store(
         let internal_key = format!("{}:{}", namespace, item.key);
         let memory_type = item.r#type.unwrap_or(MemoryType::Semantic);
         let value_bytes = item.value.as_bytes();
-        state
+        match state
             .engine
-            .set(&internal_key, value_bytes.to_vec(), item.ttl_ms, memory_type);
-        stored += 1;
+            .set(&internal_key, value_bytes.to_vec(), item.ttl_ms, memory_type)
+        {
+            Ok(()) => stored += 1,
+            Err(ShardFullError { max_entries, current }) => {
+                let body = serde_json::json!({
+                    "error": "max entries exceeded",
+                    "max_entries": max_entries,
+                    "current": current,
+                    "stored": stored,
+                });
+                return (StatusCode::INSUFFICIENT_STORAGE, axum::Json(body)).into_response();
+            }
+        }
     }
 
     let resp = BatchStoreResponse { ok: true, stored };
-    (StatusCode::CREATED, axum::Json(resp))
+    (StatusCode::CREATED, axum::Json(resp)).into_response()
 }
 
 async fn batch_get(

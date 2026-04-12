@@ -22,6 +22,13 @@ impl Entry {
     }
 }
 
+/// Error returned when a shard has reached its entry limit.
+#[derive(Debug, Clone)]
+pub struct ShardFullError {
+    pub max_entries: usize,
+    pub current: usize,
+}
+
 /// Returns current time in milliseconds since UNIX epoch.
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -30,6 +37,9 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Default maximum entries per shard.
+const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
+
 /// A single shard of the KV store, backed by a papaya concurrent HashMap.
 ///
 /// Sharding is used to reduce contention across keys. Each shard is independent
@@ -37,23 +47,51 @@ fn now_ms() -> u64 {
 pub struct Shard {
     map: HashMap<String, Entry>,
     count: AtomicUsize,
+    max_entries: usize,
 }
 
 impl Shard {
     pub fn new() -> Self {
+        Shard::with_max_entries(DEFAULT_MAX_ENTRIES)
+    }
+
+    /// Create a shard with a specific entry limit.
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Shard {
             map: HashMap::new(),
             count: AtomicUsize::new(0),
+            max_entries,
         }
     }
 
     /// Insert or replace a key-value entry.
-    pub fn set(&self, key: String, entry: Entry) {
+    ///
+    /// If the key already exists, the value is replaced and the count stays the same.
+    /// If the key is new and the shard is at capacity, returns `Err(ShardFullError)`.
+    /// The count check is approximate (TOCTOU race is acceptable for a memory guard rail).
+    pub fn set(&self, key: String, entry: Entry) -> Result<(), ShardFullError> {
         let is_update = self.map.pin().get(&key).is_some();
+        if !is_update && self.count.load(Ordering::Relaxed) >= self.max_entries {
+            return Err(ShardFullError {
+                max_entries: self.max_entries,
+                current: self.count.load(Ordering::Relaxed),
+            });
+        }
         self.map.pin().insert(key, entry);
         if is_update {
             // Replace: count stays the same
         } else {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Force-set a key, ignoring shard capacity limits.
+    /// Used during snapshot restore to ensure data integrity.
+    pub fn set_force(&self, key: String, entry: Entry) {
+        let is_update = self.map.pin().get(&key).is_some();
+        self.map.pin().insert(key, entry);
+        if !is_update {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -172,7 +210,7 @@ mod tests {
             expires_at: None,
             memory_type: MemoryType::Semantic,
         };
-        shard.set("key1".into(), entry);
+        shard.set("key1".into(), entry).unwrap();
         let val = shard.get("key1").unwrap();
         assert_eq!(val, b"hello");
     }
@@ -185,7 +223,7 @@ mod tests {
             expires_at: None,
             memory_type: MemoryType::Semantic,
         };
-        shard.set("key2".into(), entry);
+        shard.set("key2".into(), entry).unwrap();
         assert!(shard.delete("key2"));
         assert!(!shard.delete("key2"));
         assert_eq!(shard.get("key2"), None);
@@ -199,7 +237,7 @@ mod tests {
             expires_at: Some(1), // already expired
             memory_type: MemoryType::Episodic,
         };
-        shard.set("expired_key".into(), entry);
+        shard.set("expired_key".into(), entry).unwrap();
         assert_eq!(shard.get("expired_key"), None);
         assert_eq!(shard.len(), 0);
     }
@@ -219,7 +257,7 @@ mod tests {
                     expires_at: None,
                     memory_type: MemoryType::Semantic,
                 },
-            );
+            ).unwrap();
         }
         let results = shard.scan_prefix("ns:");
         assert_eq!(results.len(), 2);
@@ -236,7 +274,7 @@ mod tests {
                 expires_at: Some(1), // already expired
                 memory_type: MemoryType::Episodic,
             },
-        );
+        ).unwrap();
         shard.set(
             "exp2".into(),
             Entry {
@@ -244,7 +282,7 @@ mod tests {
                 expires_at: Some(1),
                 memory_type: MemoryType::Episodic,
             },
-        );
+        ).unwrap();
         shard.set(
             "live".into(),
             Entry {
@@ -252,7 +290,7 @@ mod tests {
                 expires_at: None,
                 memory_type: MemoryType::Semantic,
             },
-        );
+        ).unwrap();
         // Before reap: count includes expired entries
         assert_eq!(shard.len(), 3);
 
@@ -274,9 +312,91 @@ mod tests {
                 expires_at: None,
                 memory_type: MemoryType::Semantic,
             },
-        );
+        ).unwrap();
         let reaped = shard.reap_expired();
         assert_eq!(reaped, 0);
         assert_eq!(shard.len(), 1);
+    }
+
+    #[test]
+    fn test_shard_max_entries_rejects_at_capacity() {
+        let shard = Shard::with_max_entries(3);
+        for i in 0..3 {
+            let entry = Entry {
+                value: format!("val{i}").into_bytes(),
+                expires_at: None,
+                memory_type: MemoryType::Semantic,
+            };
+            assert!(shard.set(format!("key{i}"), entry).is_ok());
+        }
+        // 4th insert should fail
+        let entry = Entry {
+            value: b"overflow".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        let result = shard.set("key3_extra".into(), entry);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.max_entries, 3);
+        assert!(err.current >= 3);
+    }
+
+    #[test]
+    fn test_shard_max_entries_update_existing_key() {
+        let shard = Shard::with_max_entries(2);
+        let entry = Entry {
+            value: b"val0".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        shard.set("key0".into(), entry).unwrap();
+        let entry = Entry {
+            value: b"val1".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        shard.set("key1".into(), entry).unwrap();
+        // At capacity, but updating existing key should still work
+        let entry = Entry {
+            value: b"val0_updated".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        assert!(shard.set("key0".into(), entry).is_ok());
+        assert_eq!(shard.get("key0").unwrap(), b"val0_updated");
+    }
+
+    #[test]
+    fn test_shard_max_entries_delete_then_insert() {
+        let shard = Shard::with_max_entries(2);
+        let entry = Entry {
+            value: b"val0".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        shard.set("key0".into(), entry).unwrap();
+        let entry = Entry {
+            value: b"val1".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        shard.set("key1".into(), entry).unwrap();
+        // At capacity
+        let entry = Entry {
+            value: b"overflow".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        assert!(shard.set("key2".into(), entry).is_err());
+        // Delete one, now insert should work
+        shard.delete("key0");
+        let entry = Entry {
+            value: b"val2".to_vec(),
+            expires_at: None,
+            memory_type: MemoryType::Semantic,
+        };
+        assert!(shard.set("key2".into(), entry).is_ok());
+        assert_eq!(shard.get("key2").unwrap(), b"val2");
     }
 }

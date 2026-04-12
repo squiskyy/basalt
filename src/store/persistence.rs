@@ -320,9 +320,9 @@ pub fn load_latest_snapshot(
                 continue;
             }
             let ttl_ms = exp - now;
-            engine.set(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type);
+            engine.set_force(&entry.key, entry.value.clone(), Some(ttl_ms), entry.memory_type);
         } else {
-            engine.set(&entry.key, entry.value.clone(), None, entry.memory_type);
+            engine.set_force(&entry.key, entry.value.clone(), None, entry.memory_type);
         }
         loaded += 1;
     }

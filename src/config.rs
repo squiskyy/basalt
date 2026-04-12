@@ -35,6 +35,8 @@ pub struct ServerConfig {
     pub snapshot_interval_ms: u64,
     /// How often to sweep expired entries (milliseconds). 0 = disabled.
     pub sweep_interval_ms: u64,
+    /// Maximum entries per shard. Rejects new entries when at capacity.
+    pub max_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ impl Default for ServerConfig {
             db_path: None,
             snapshot_interval_ms: 60_000,
             sweep_interval_ms: 30_000,
+            max_entries: 1_000_000,
         }
     }
 }
@@ -102,6 +105,8 @@ struct ServerFile {
     snapshot_interval_ms: Option<u64>,
     #[serde(default)]
     sweep_interval_ms: Option<u64>,
+    #[serde(default)]
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -137,6 +142,7 @@ impl Config {
                 .server
                 .sweep_interval_ms
                 .unwrap_or(server_defaults.sweep_interval_ms),
+            max_entries: file.server.max_entries.unwrap_or(server_defaults.max_entries),
         };
 
         let auth = AuthConfig {
@@ -162,6 +168,7 @@ impl Config {
         sweep_interval_ms: Option<u64>,
         auth_tokens: Vec<String>,
         auth_tokens_file: Option<String>,
+        max_entries: Option<usize>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -196,6 +203,9 @@ impl Config {
         }
         if let Some(v) = auth_tokens_file {
             self.auth.tokens_file = Some(v);
+        }
+        if let Some(v) = max_entries {
+            self.server.max_entries = v;
         }
     }
 
@@ -323,6 +333,7 @@ mod tests {
         assert_eq!(config.server.shard_count, 64);
         assert!(config.server.db_path.is_none());
         assert_eq!(config.server.snapshot_interval_ms, 60_000);
+        assert_eq!(config.server.max_entries, 1_000_000);
         assert!(config.auth.tokens_file.is_none());
         assert!(config.auth.tokens.is_empty());
     }
@@ -397,6 +408,7 @@ http_port = 9999
             Some(5_000u64), // sweep_interval_ms
             vec!["bsk-test:*".to_string()],
             Some("/path/to/tokens".to_string()),
+            Some(500_000), // max_entries
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);
@@ -405,6 +417,7 @@ http_port = 9999
         assert_eq!(config.server.db_path, Some("/data/basalt".to_string()));
         assert_eq!(config.server.snapshot_interval_ms, 10_000);
         assert_eq!(config.server.sweep_interval_ms, 5_000);
+        assert_eq!(config.server.max_entries, 500_000);
         assert_eq!(config.auth.tokens, vec!["bsk-test:*"]);
         assert_eq!(config.auth.tokens_file, Some("/path/to/tokens".to_string()));
     }

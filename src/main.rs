@@ -52,6 +52,10 @@ struct Args {
     #[arg(long, value_name = "MS")]
     sweep_interval: Option<u64>,
 
+    /// Maximum entries per shard (overrides config file, rejects writes when at capacity)
+    #[arg(long, value_name = "N")]
+    max_entries: Option<usize>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -105,6 +109,7 @@ async fn main() {
         args.sweep_interval,
         args.auth,
         args.auth_file,
+        args.max_entries,
     );
 
     // Resolve auth tokens from file + CLI
@@ -115,7 +120,10 @@ async fn main() {
         http::auth::AuthStore::from_list(auth_tokens)
     };
 
-    let engine = Arc::new(store::engine::KvEngine::new(cfg.server.shard_count));
+    let engine = Arc::new(store::engine::KvEngine::with_max_entries(
+        cfg.server.shard_count,
+        cfg.server.max_entries,
+    ));
     let auth = Arc::new(auth_store);
 
     // Load snapshot if db_path is configured

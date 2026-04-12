@@ -3,7 +3,7 @@ use basalt::store::{KvEngine, MemoryType};
 #[test]
 fn test_set_get_basic() {
     let engine = KvEngine::new(4);
-    engine.set("hello", b"world".to_vec(), None, MemoryType::Semantic);
+    engine.set("hello", b"world".to_vec(), None, MemoryType::Semantic).unwrap();
     let val = engine.get("hello").unwrap();
     assert_eq!(val, b"world");
 
@@ -20,10 +20,10 @@ fn test_set_get_with_ttl() {
         b"gone".to_vec(),
         Some(1),
         MemoryType::Episodic,
-    );
+    ).unwrap();
 
     // Set a persistent key
-    engine.set("persistent", b"here".to_vec(), None, MemoryType::Semantic);
+    engine.set("persistent", b"here".to_vec(), None, MemoryType::Semantic).unwrap();
 
     // Wait a bit for the TTL to expire
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -38,7 +38,7 @@ fn test_set_get_with_ttl() {
 #[test]
 fn test_delete() {
     let engine = KvEngine::new(4);
-    engine.set("to_delete", b"value".to_vec(), None, MemoryType::Semantic);
+    engine.set("to_delete", b"value".to_vec(), None, MemoryType::Semantic).unwrap();
     assert!(engine.delete("to_delete"));
     assert!(!engine.delete("to_delete")); // already deleted
     assert!(engine.get("to_delete").is_none());
@@ -53,19 +53,19 @@ fn test_namespace_via_prefix() {
         b"data1".to_vec(),
         None,
         MemoryType::Semantic,
-    );
+    ).unwrap();
     engine.set(
         "session:def",
         b"data2".to_vec(),
         None,
         MemoryType::Semantic,
-    );
+    ).unwrap();
     engine.set(
         "cache:xyz",
         b"data3".to_vec(),
         None,
         MemoryType::Semantic,
-    );
+    ).unwrap();
 
     // Scan the "session:" namespace
     let session_entries = engine.scan_prefix("session:");
@@ -80,10 +80,10 @@ fn test_namespace_via_prefix() {
 #[test]
 fn test_delete_prefix() {
     let engine = KvEngine::new(8);
-    engine.set("ns:a", b"1".to_vec(), None, MemoryType::Semantic);
-    engine.set("ns:b", b"2".to_vec(), None, MemoryType::Semantic);
-    engine.set("ns:c", b"3".to_vec(), None, MemoryType::Semantic);
-    engine.set("other:d", b"4".to_vec(), None, MemoryType::Semantic);
+    engine.set("ns:a", b"1".to_vec(), None, MemoryType::Semantic).unwrap();
+    engine.set("ns:b", b"2".to_vec(), None, MemoryType::Semantic).unwrap();
+    engine.set("ns:c", b"3".to_vec(), None, MemoryType::Semantic).unwrap();
+    engine.set("other:d", b"4".to_vec(), None, MemoryType::Semantic).unwrap();
 
     let removed = engine.delete_prefix("ns:");
     assert_eq!(removed, 3);
@@ -105,7 +105,7 @@ fn test_get_with_meta() {
         b"meta_val".to_vec(),
         Some(10_000),
         MemoryType::Episodic,
-    );
+    ).unwrap();
 
     let (value, meta) = engine.get_with_meta("meta_key").unwrap();
     assert_eq!(value, b"meta_val");
@@ -117,7 +117,7 @@ fn test_get_with_meta() {
     assert!(remaining <= 10_000, "remaining ttl should not exceed 10s, got {remaining}");
 
     // Test a key with no TTL (Semantic)
-    engine.set("no_ttl", b"val".to_vec(), None, MemoryType::Semantic);
+    engine.set("no_ttl", b"val".to_vec(), None, MemoryType::Semantic).unwrap();
     let (_, meta2) = engine.get_with_meta("no_ttl").unwrap();
     assert_eq!(meta2.memory_type, MemoryType::Semantic);
     assert!(meta2.ttl_remaining_ms.is_none());
@@ -137,7 +137,7 @@ fn test_episodic_has_ttl() {
     // Verify that using the default TTL with the engine works
     let engine = KvEngine::new(4);
     let ttl = MemoryType::Episodic.default_ttl_ms();
-    engine.set("episodic_key", b"ephemeral".to_vec(), ttl, MemoryType::Episodic);
+    engine.set("episodic_key", b"ephemeral".to_vec(), ttl, MemoryType::Episodic).unwrap();
 
     let (_, meta) = engine.get_with_meta("episodic_key").unwrap();
     assert_eq!(meta.memory_type, MemoryType::Episodic);
