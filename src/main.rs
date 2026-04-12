@@ -274,7 +274,7 @@ async fn main() {
             .unwrap();
     });
 
-    let resp_shutdown_rx = shutdown_rx.clone();
+    let mut resp_shutdown_rx = shutdown_rx.clone();
     let resp_server = tokio::spawn(async move {
         #[cfg(feature = "io-uring")]
         if resp_config.io_uring {
