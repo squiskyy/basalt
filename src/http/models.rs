@@ -75,6 +75,7 @@ pub struct HealthResponse {
 pub struct InfoResponse {
     pub version: String,
     pub shards: usize,
+    pub compression_threshold: usize,
 }
 
 /// Query parameters for list endpoints.

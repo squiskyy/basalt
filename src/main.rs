@@ -60,6 +60,10 @@ struct Args {
     #[arg(long, value_name = "BYTES")]
     snapshot_compression_threshold: Option<usize>,
 
+    /// Minimum value size (bytes) to LZ4-compress values in memory at runtime (overrides config file, 0 = disable)
+    #[arg(long, value_name = "BYTES")]
+    compression_threshold: Option<usize>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -115,6 +119,7 @@ async fn main() {
         args.auth_file,
         args.max_entries,
         args.snapshot_compression_threshold,
+        args.compression_threshold,
     );
 
     // Resolve auth tokens from file + CLI
@@ -125,9 +130,10 @@ async fn main() {
         http::auth::AuthStore::from_list(auth_tokens)
     };
 
-    let engine = Arc::new(store::engine::KvEngine::with_max_entries(
+    let engine = Arc::new(store::engine::KvEngine::with_max_entries_and_compression(
         cfg.server.shard_count,
         cfg.server.max_entries,
+        cfg.server.compression_threshold,
     ));
     let auth = Arc::new(auth_store);
 
@@ -144,6 +150,7 @@ async fn main() {
 
     info!("basalt v{} — memory that moves fast", env!("CARGO_PKG_VERSION"));
     info!("shards: {}", cfg.server.shard_count);
+    info!("compression threshold: {} bytes", cfg.server.compression_threshold);
     if auth.is_enabled() {
         info!("auth: enabled ({} tokens)", auth.list_tokens().len());
     } else {

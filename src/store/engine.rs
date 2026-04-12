@@ -20,6 +20,7 @@ pub struct KvEngine {
     shards: Vec<Shard>,
     shard_mask: usize,
     max_entries: usize,
+    compression_threshold: usize,
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -44,7 +45,8 @@ fn now_ms() -> u64 {
 impl KvEngine {
     /// Create a new KvEngine with the given target shard count.
     /// The actual shard count will be rounded up to the next power of 2.
-    /// Each shard gets a default max_entries of 1,000,000.
+    /// Each shard gets a default max_entries of 1,000,000 and default compression
+    /// threshold of 1024 bytes.
     pub fn new(shard_count: usize) -> Self {
         Self::with_max_entries(shard_count, 1_000_000)
     }
@@ -53,11 +55,35 @@ impl KvEngine {
     /// max entries per shard.
     pub fn with_max_entries(shard_count: usize, max_entries: usize) -> Self {
         let count = next_power_of_2(shard_count.max(1));
-        let shards = (0..count).map(|_| Shard::with_max_entries(max_entries)).collect();
+        let shards = (0..count)
+            .map(|_| Shard::with_max_entries(max_entries))
+            .collect();
         KvEngine {
             shards,
             shard_mask: count - 1,
             max_entries,
+            compression_threshold: 1024,
+        }
+    }
+
+    /// Create a new KvEngine with the given target shard count,
+    /// max entries per shard, and compression threshold.
+    /// compression_threshold: minimum value size (bytes) to LZ4-compress in memory.
+    /// 0 = disable compression.
+    pub fn with_max_entries_and_compression(
+        shard_count: usize,
+        max_entries: usize,
+        compression_threshold: usize,
+    ) -> Self {
+        let count = next_power_of_2(shard_count.max(1));
+        let shards = (0..count)
+            .map(|_| Shard::with_max_entries_and_threshold(max_entries, compression_threshold))
+            .collect();
+        KvEngine {
+            shards,
+            shard_mask: count - 1,
+            max_entries,
+            compression_threshold,
         }
     }
 
@@ -75,6 +101,7 @@ impl KvEngine {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
+            compressed: false, // Shard::set will compress if needed
             expires_at,
             memory_type,
         };
@@ -88,6 +115,7 @@ impl KvEngine {
         let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
         let entry = Entry {
             value,
+            compressed: false, // Shard::set_force will compress if needed
             expires_at,
             memory_type,
         };
@@ -96,12 +124,14 @@ impl KvEngine {
     }
 
     /// Get the value for a key. Returns None if missing or expired.
+    /// Values are transparently decompressed if they were compressed at rest.
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let idx = self.shard_index(key);
         self.shards[idx].get(key)
     }
 
     /// Get the value along with metadata (memory type and remaining TTL).
+    /// Values are transparently decompressed if they were compressed at rest.
     pub fn get_with_meta(&self, key: &str) -> Option<(Vec<u8>, EntryMeta)> {
         let idx = self.shard_index(key);
         let entry = self.shards[idx].get_entry(key)?;
@@ -122,6 +152,7 @@ impl KvEngine {
 
     /// Scan all entries whose keys start with `prefix` across all shards.
     /// Returns (key, value, EntryMeta) tuples.
+    /// Values are transparently decompressed if they were compressed at rest.
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>, EntryMeta)> {
         let now = now_ms();
         let mut results = Vec::new();
@@ -178,6 +209,11 @@ impl KvEngine {
     /// Return the max entries per shard.
     pub fn max_entries(&self) -> usize {
         self.max_entries
+    }
+
+    /// Return the compression threshold in bytes.
+    pub fn compression_threshold(&self) -> usize {
+        self.compression_threshold
     }
 }
 
@@ -247,5 +283,55 @@ mod tests {
         // Delete and then insert should work
         engine.delete("k1");
         assert!(engine.set("k5", b"v5".to_vec(), None, MemoryType::Semantic).is_ok());
+    }
+
+    #[test]
+    fn test_engine_compression_large_value() {
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10);
+
+        // Value > threshold and compressible
+        let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes
+        engine.set("big_key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+
+        // Should transparently decompress
+        let result = engine.get("big_key").unwrap();
+        assert_eq!(result, large_value);
+
+        // get_with_meta should also decompress
+        let (val, meta) = engine.get_with_meta("big_key").unwrap();
+        assert_eq!(val, large_value);
+        assert_eq!(meta.memory_type, MemoryType::Semantic);
+    }
+
+    #[test]
+    fn test_engine_compression_disabled() {
+        // threshold = 0 disables compression
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 0);
+
+        let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
+        engine.set("big_key", large_value.clone(), None, MemoryType::Semantic).unwrap();
+
+        let result = engine.get("big_key").unwrap();
+        assert_eq!(result, large_value);
+    }
+
+    #[test]
+    fn test_engine_scan_prefix_with_compression() {
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10);
+
+        let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
+        engine.set("ns:big", big_val.clone(), None, MemoryType::Semantic).unwrap();
+        engine.set("ns:small", b"tiny".to_vec(), None, MemoryType::Semantic).unwrap();
+
+        let results = engine.scan_prefix("ns:");
+        assert_eq!(results.len(), 2);
+
+        for (key, value, _meta) in &results {
+            if key == "ns:big" {
+                assert_eq!(value, &big_val);
+            } else if key == "ns:small" {
+                assert_eq!(value, b"tiny");
+            }
+        }
     }
 }

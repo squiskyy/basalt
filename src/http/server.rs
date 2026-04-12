@@ -69,6 +69,7 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
     let resp = InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         shards: state.engine.shard_count(),
+        compression_threshold: state.engine.compression_threshold(),
     };
     (StatusCode::OK, axum::Json(resp))
 }

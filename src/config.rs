@@ -37,8 +37,10 @@ pub struct ServerConfig {
     pub sweep_interval_ms: u64,
     /// Maximum entries per shard. Rejects new entries when at capacity.
     pub max_entries: usize,
-    /// Minimum value size (bytes) to compress in snapshots. 0 = disable compression.
+    /// Minimum value size (bytes) to LZ4-compress in snapshots. 0 = disable compression.
     pub snapshot_compression_threshold: usize,
+    /// Minimum value size (bytes) to LZ4-compress values in memory (runtime). 0 = disable.
+    pub compression_threshold: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,7 @@ impl Default for ServerConfig {
             sweep_interval_ms: 30_000,
             max_entries: 1_000_000,
             snapshot_compression_threshold: 1024,
+            compression_threshold: 1024,
         }
     }
 }
@@ -112,6 +115,8 @@ struct ServerFile {
     max_entries: Option<usize>,
     #[serde(default)]
     snapshot_compression_threshold: Option<usize>,
+    #[serde(default)]
+    compression_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -155,6 +160,10 @@ impl Config {
                 .server
                 .snapshot_compression_threshold
                 .unwrap_or(server_defaults.snapshot_compression_threshold),
+            compression_threshold: file
+                .server
+                .compression_threshold
+                .unwrap_or(server_defaults.compression_threshold),
         };
 
         let auth = AuthConfig {
@@ -182,6 +191,7 @@ impl Config {
         auth_tokens_file: Option<String>,
         max_entries: Option<usize>,
         snapshot_compression_threshold: Option<usize>,
+        compression_threshold: Option<usize>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -222,6 +232,9 @@ impl Config {
         }
         if let Some(v) = snapshot_compression_threshold {
             self.server.snapshot_compression_threshold = v;
+        }
+        if let Some(v) = compression_threshold {
+            self.server.compression_threshold = v;
         }
     }
 
@@ -350,6 +363,7 @@ mod tests {
         assert!(config.server.db_path.is_none());
         assert_eq!(config.server.snapshot_interval_ms, 60_000);
         assert_eq!(config.server.max_entries, 1_000_000);
+        assert_eq!(config.server.compression_threshold, 1024);
         assert!(config.auth.tokens_file.is_none());
         assert!(config.auth.tokens.is_empty());
     }
@@ -426,6 +440,7 @@ http_port = 9999
             Some("/path/to/tokens".to_string()),
             Some(500_000), // max_entries
             None,          // snapshot_compression_threshold
+            None,          // compression_threshold
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);

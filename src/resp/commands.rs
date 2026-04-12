@@ -195,8 +195,9 @@ impl CommandHandler {
         // INFO optionally takes a section name; we ignore it and return everything
         let _ = cmd; // suppress unused warning
         let info = format!(
-            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{}\r\n",
-            self.engine.shard_count()
+            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{}\r\ncompression_threshold:{}\r\n",
+            self.engine.shard_count(),
+            self.engine.compression_threshold()
         );
         RespValue::BulkString(Some(info.into_bytes()))
     }
