@@ -7,6 +7,7 @@ use crate::http::auth::AuthStore;
 use crate::store::engine::KvEngine;
 
 use super::commands::CommandHandler;
+use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
 /// Run the RESP2 TCP server.
@@ -22,15 +23,15 @@ pub async fn run(
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
     db_path: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind((host, port)).await?;
+) -> Result<(), RespError> {
+    let listener = TcpListener::bind((host, port)).await.map_err(RespError::Bind)?;
     tracing::info!("RESP server listening on {host}:{port}");
 
     let handler = Arc::new(CommandHandler::new(engine, db_path));
     let auth_enabled = auth.is_enabled();
 
     loop {
-        let (socket, addr) = listener.accept().await?;
+        let (socket, addr) = listener.accept().await.map_err(RespError::Accept)?;
         let handler = Arc::clone(&handler);
         let auth = Arc::clone(&auth);
         let auth_enabled = auth_enabled;
@@ -47,7 +48,7 @@ async fn handle_connection(
     handler: Arc<CommandHandler>,
     auth: Arc<AuthStore>,
     auth_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), RespError> {
     let (mut reader, mut writer) = stream.into_split();
 
     // Recyclable read buffer — grows to fit workload but doesn't shrink
@@ -60,7 +61,7 @@ async fn handle_connection(
     let mut auth_token: Option<String> = None;
 
     loop {
-        let n = reader.read(&mut tmp).await?;
+        let n = reader.read(&mut tmp).await.map_err(RespError::Read)?;
         if n == 0 {
             // Connection closed by client
             return Ok(());
@@ -113,8 +114,8 @@ async fn handle_connection(
             // Batch-serialize all responses into one write — reduces syscalls
             if !responses.is_empty() {
                 let out = serialize_pipeline(&responses);
-                writer.write_all(&out).await?;
-                writer.flush().await?;
+                writer.write_all(&out).await.map_err(RespError::Write)?;
+                writer.flush().await.map_err(RespError::Write)?;
             }
         }
 

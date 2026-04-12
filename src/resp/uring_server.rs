@@ -27,6 +27,7 @@ use crate::http::auth::AuthStore;
 use crate::store::engine::KvEngine;
 
 use super::commands::CommandHandler;
+use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
 const RING_SIZE: u32 = 1024;
@@ -62,12 +63,12 @@ pub fn run(
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
     db_path: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind((host, port))?;
+) -> Result<(), RespError> {
+    let listener = TcpListener::bind((host, port)).map_err(RespError::Bind)?;
     let listener_fd = listener.as_raw_fd();
     tracing::info!("io_uring RESP server listening on {host}:{port}");
 
-    let mut ring = IoUring::new(RING_SIZE)?;
+    let mut ring = IoUring::new(RING_SIZE).map_err(RespError::Submit)?;
     let (submitter, mut sq, mut cq) = ring.split();
 
     // Pre-allocate slab to MAX_CONNECTIONS to prevent reallocation.
@@ -93,13 +94,13 @@ pub fn run(
         sq.push(&accept_e).expect("SQ full for accept");
     }
     sq.sync();
-    submitter.submit()?;
+    submitter.submit().map_err(RespError::Submit)?;
 
     loop {
         match submitter.submit_and_wait(1) {
             Ok(_) => {}
             Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(RespError::Submit(e)),
         }
         cq.sync();
 
@@ -329,14 +330,14 @@ fn drain_backlog(
     backlog: &mut VecDeque<squeue::Entry>,
     sq: &mut io_uring::SubmissionQueue,
     submitter: &io_uring::Submitter,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), RespError> {
     loop {
         sq.sync();
         if sq.is_full() {
             match submitter.submit() {
                 Ok(_) => {}
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => break,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(RespError::Submit(e)),
             }
             sq.sync();
         }
