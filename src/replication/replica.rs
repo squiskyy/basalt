@@ -40,6 +40,11 @@ pub async fn replicate_from_primary(
     let current_seq = read_full_resync(&mut reader).await?;
     tracing::info!("received FULLRESYNC with seq {current_seq}");
 
+    // Clear all existing data before applying the full resync snapshot
+    // to ensure stale phantom keys from a previous state are removed.
+    engine.clear();
+    tracing::info!("cleared existing engine data before applying full resync snapshot");
+
     // Read snapshot entries
     let snapshot_count = read_snapshot_count(&mut reader).await?;
     tracing::info!("receiving {snapshot_count} snapshot entries from primary");
