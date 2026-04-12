@@ -10,8 +10,8 @@ use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 
 use super::models::{
-    HealthResponse, InfoResponse, ListQuery, ListResponse, SimpleResponse, StoreRequest,
-    StoreResponse,
+    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, HealthResponse,
+    InfoResponse, ListQuery, ListResponse, SimpleResponse, StoreRequest, StoreResponse,
 };
 
 /// Shared application state wrapping the KV engine.
@@ -29,6 +29,8 @@ pub fn app(engine: Arc<KvEngine>) -> Router {
         .route("/store/{namespace}", post(store_memory))
         .route("/store/{namespace}", get(list_memories))
         .route("/store/{namespace}", delete(delete_namespace))
+        .route("/store/{namespace}/batch", post(batch_store))
+        .route("/store/{namespace}/batch/get", post(batch_get))
         .route("/store/{namespace}/{key}", get(get_memory))
         .route("/store/{namespace}/{key}", delete(delete_memory))
         .with_state(state)
@@ -64,11 +66,9 @@ async fn store_memory(
         .engine
         .set(&internal_key, value_bytes, body.ttl_ms, memory_type);
 
-    let resp = StoreResponse {
-        key: body.key,
-        value: String::new(), // acknowledged, no echo-back of value
-        r#type: Some(memory_type.to_string()),
-        ttl_ms: body.ttl_ms,
+    let resp = SimpleResponse {
+        ok: true,
+        deleted: None,
     };
     (StatusCode::CREATED, axum::Json(resp))
 }
@@ -133,11 +133,14 @@ async fn get_memory(
             };
             (StatusCode::OK, axum::Json(resp)).into_response()
         }
-        None => (StatusCode::NOT_FOUND, axum::Json(SimpleResponse {
-            ok: false,
-            deleted: None,
-        }))
-        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            axum::Json(SimpleResponse {
+                ok: false,
+                deleted: None,
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -181,4 +184,62 @@ async fn delete_namespace(
             deleted: Some(count),
         }),
     )
+}
+
+// --- Batch handlers ---
+
+async fn batch_store(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    axum::Json(body): axum::Json<BatchStoreRequest>,
+) -> impl IntoResponse {
+    let mut stored = 0usize;
+    for item in &body.memories {
+        let internal_key = format!("{}:{}", namespace, item.key);
+        let memory_type = item.r#type.unwrap_or(MemoryType::Semantic);
+        let value_bytes = item.value.as_bytes();
+        state
+            .engine
+            .set(&internal_key, value_bytes.to_vec(), item.ttl_ms, memory_type);
+        stored += 1;
+    }
+
+    let resp = BatchStoreResponse { ok: true, stored };
+    (StatusCode::CREATED, axum::Json(resp))
+}
+
+async fn batch_get(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    axum::Json(body): axum::Json<BatchGetRequest>,
+) -> impl IntoResponse {
+    let mut memories = Vec::with_capacity(body.keys.len());
+    let mut missing = Vec::new();
+
+    for key in &body.keys {
+        let internal_key = format!("{}:{}", namespace, key);
+        match state.engine.get_with_meta(&internal_key) {
+            Some((value, meta)) => {
+                memories.push(StoreResponse {
+                    key: key.clone(),
+                    value: String::from_utf8_lossy(&value).to_string(),
+                    r#type: Some(meta.memory_type.to_string()),
+                    ttl_ms: meta.ttl_remaining_ms,
+                });
+            }
+            None => {
+                missing.push(key.clone());
+            }
+        }
+    }
+
+    let resp = BatchGetResponse {
+        memories,
+        missing: if missing.is_empty() {
+            None
+        } else {
+            Some(missing)
+        },
+    };
+    (StatusCode::OK, axum::Json(resp))
 }
