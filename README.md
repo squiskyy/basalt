@@ -375,6 +375,3 @@ Returns `412` (HTTP) or `-ERR no db_path configured` (RESP) if persistence is di
 - **Startup**: Loads the latest snapshot from `db_path`, skips expired entries
 - **Episodic memories**: TTL is preserved in snapshots — expired entries are skipped on load
 
-## License
-
-MIT
