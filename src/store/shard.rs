@@ -107,10 +107,17 @@ impl Shard {
     ///
     /// If the key already exists, the value is replaced and the count stays the same.
     /// If the key is new and the shard is at capacity, returns `Err(ShardFullError)`.
-    /// The count check is approximate (TOCTOU race is acceptable for a memory guard rail).
+    /// The capacity pre-check is approximate (acceptable for a memory guard rail),
+    /// but the count increment is determined atomically from the insert return value,
+    /// eliminating the TOCTOU race between checking key existence and inserting.
     pub fn set(&self, key: String, entry: Entry) -> Result<(), ShardFullError> {
-        let is_update = self.map.pin().get(&key).is_some();
-        if !is_update && self.count.load(Ordering::Relaxed) >= self.max_entries {
+        // Approximate capacity guard rail. If at capacity, only allow the
+        // insert when the key likely already exists (an update). This check
+        // is a best-effort guard; the authoritative count adjustment is based
+        // on the insert return value below, eliminating the TOCTOU race.
+        if self.count.load(Ordering::Relaxed) >= self.max_entries
+            && self.map.pin().get(&key).is_none()
+        {
             return Err(ShardFullError {
                 max_entries: self.max_entries,
                 current: self.count.load(Ordering::Relaxed),
@@ -129,19 +136,23 @@ impl Shard {
         } else {
             entry
         };
-        self.map.pin().insert(key, entry);
-        if is_update {
-            // Replace: count stays the same
-        } else {
+        // insert returns None for new keys, Some(&old) for updates.
+        // This eliminates the TOCTOU race: we know definitively whether this
+        // was an insert or an update based on the atomic operation's result.
+        let pin = self.map.pin();
+        let is_update = pin.insert(key, entry).is_some();
+        drop(pin);
+        if !is_update {
+            // New key inserted: increment count
             self.count.fetch_add(1, Ordering::Relaxed);
         }
+        // else: update of existing key, count unchanged
         Ok(())
     }
 
     /// Force-set a key, ignoring shard capacity limits.
     /// Used during snapshot restore to ensure data integrity.
     pub fn set_force(&self, key: String, entry: Entry) {
-        let is_update = self.map.pin().get(&key).is_some();
         // Compress the value if needed (only if not already compressed)
         let entry = if !entry.compressed {
             let (value, compressed) = self.maybe_compress(entry.value);
@@ -155,10 +166,17 @@ impl Shard {
         } else {
             entry
         };
-        self.map.pin().insert(key, entry);
+        // insert returns None for new keys, Some(&old) for updates.
+        // This eliminates the TOCTOU race: the count is adjusted based on
+        // the atomic insert result, not a separate get-check.
+        let pin = self.map.pin();
+        let is_update = pin.insert(key, entry).is_some();
+        drop(pin);
         if !is_update {
+            // New key inserted: increment count
             self.count.fetch_add(1, Ordering::Relaxed);
         }
+        // else: update of existing key, count unchanged
     }
 
     /// Get the value bytes for a key, returning None if missing or expired.
