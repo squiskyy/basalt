@@ -48,10 +48,11 @@ pub async fn send_full_resync(
         .map_err(|e| format!("write snapshot count: {e}"))?;
 
     for (key, value, meta) in &entries {
-        // Convert expires_at to remaining TTL
+        // Convert expires_at to remaining TTL.
+        // Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
         let ttl_str = match meta.ttl_remaining_ms {
             Some(ms) => ms.to_string(),
-            None => "-1".to_string(),
+            None => "0".to_string(),
         };
         let mt_str = meta.memory_type.to_string();
 

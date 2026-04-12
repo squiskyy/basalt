@@ -47,7 +47,8 @@ pub async fn replicate_from_primary(
     for i in 0..snapshot_count {
         let entry = read_snapshot_entry(&mut reader).await?;
         // Apply to local engine using set_force
-        let ttl = if entry.ttl_ms == 0 || entry.ttl_ms == u64::MAX {
+        // Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
+        let ttl = if entry.ttl_ms == 0 {
             None
         } else {
             Some(entry.ttl_ms)
@@ -232,13 +233,14 @@ fn parse_snapshot_entry(value: crate::resp::parser::RespValue) -> Result<Snapsho
         _ => return Err(format!("invalid memory type: {mt_str}")),
     };
     // Element 4: ttl_ms
+    // Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
+    // Parse as u64 directly to avoid sign-extension issues from i64.
     let ttl_str = extract_bulk_string_or_err(&arr[4], "ttl")?;
     let ttl_str = String::from_utf8_lossy(&ttl_str).to_string();
-    let ttl_ms: i64 = ttl_str
+    let ttl_ms: u64 = ttl_str
         .trim()
         .parse()
-        .map_err(|e| format!("invalid ttl: {e}"))?;
-    let ttl_ms = if ttl_ms < 0 { 0u64 } else { ttl_ms as u64 };
+        .map_err(|e| format!("invalid ttl_ms: {e}"))?;
 
     Ok(SnapshotEntry {
         key,
@@ -287,6 +289,7 @@ fn extract_bulk_string(val: &crate::resp::parser::RespValue) -> Option<Vec<u8>> 
 }
 
 /// Apply a WAL entry to the local engine.
+/// Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
 fn apply_wal_entry(engine: &Arc<KvEngine>, entry: &wal::WalEntry) {
     match entry.op {
         wal::WalOp::Set => {

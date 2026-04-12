@@ -19,6 +19,7 @@ fn test_wal_append_and_read() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 0,
         timestamp_ms: 100,
+        embedding: None,
     };
     let e2 = WalEntry {
         op: WalOp::Set,
@@ -27,6 +28,7 @@ fn test_wal_append_and_read() {
         mem_type: MemoryType::Episodic,
         ttl_ms: 5000,
         timestamp_ms: 200,
+        embedding: None,
     };
 
     let seq1 = wal.append(e1);
@@ -71,6 +73,7 @@ fn test_wal_circular_buffer() {
             mem_type: MemoryType::Semantic,
             ttl_ms: 0,
             timestamp_ms: i,
+            embedding: None,
         });
     }
 
@@ -107,6 +110,7 @@ fn test_wal_serialize_deserialize() {
         mem_type: MemoryType::Episodic,
         ttl_ms: 30000,
         timestamp_ms: 1234567890,
+        embedding: None,
     };
 
     let data = serialize_entry(&entry, 42);
@@ -136,6 +140,7 @@ fn test_wal_empty() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 0,
         timestamp_ms: 0,
+        embedding: None,
     });
     assert_eq!(wal.len(), 1);
     assert!(!wal.is_empty());
@@ -155,6 +160,7 @@ fn test_wal_sequence_numbers() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 0,
         timestamp_ms: 0,
+        embedding: None,
     });
     assert_eq!(seq1, 1);
     assert_eq!(wal.current_seq(), 2);
@@ -166,6 +172,7 @@ fn test_wal_sequence_numbers() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 0,
         timestamp_ms: 0,
+        embedding: None,
     });
     assert_eq!(seq2, 2);
     assert_eq!(wal.current_seq(), 3);
@@ -177,6 +184,7 @@ fn test_wal_sequence_numbers() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 0,
         timestamp_ms: 0,
+        embedding: None,
     });
     assert_eq!(seq3, 3);
     assert_eq!(wal.current_seq(), 4);
@@ -263,6 +271,7 @@ fn test_wal_serialize_roundtrip_all_ops() {
         mem_type: MemoryType::Semantic,
         ttl_ms: 9999,
         timestamp_ms: 111111,
+        embedding: None,
     };
     let set_data = serialize_entry(&set_entry, 1);
     let (seq, decoded, consumed) = deserialize_entry(&set_data).unwrap();
@@ -283,6 +292,7 @@ fn test_wal_serialize_roundtrip_all_ops() {
         mem_type: MemoryType::Episodic,
         ttl_ms: 0,
         timestamp_ms: 222222,
+        embedding: None,
     };
     let del_data = serialize_entry(&del_entry, 2);
     let (seq, decoded, consumed) = deserialize_entry(&del_data).unwrap();
@@ -303,6 +313,7 @@ fn test_wal_serialize_roundtrip_all_ops() {
         mem_type: MemoryType::Procedural,
         ttl_ms: 0,
         timestamp_ms: 333333,
+        embedding: None,
     };
     let dpx_data = serialize_entry(&dpx_entry, 3);
     let (seq, decoded, consumed) = deserialize_entry(&dpx_data).unwrap();
@@ -314,4 +325,89 @@ fn test_wal_serialize_roundtrip_all_ops() {
     assert_eq!(decoded.mem_type, MemoryType::Procedural);
     assert_eq!(decoded.ttl_ms, 0);
     assert_eq!(decoded.timestamp_ms, 333333);
+}
+
+// ---------------------------------------------------------------------------
+// TTL wire format round-trip tests (issue #18)
+// Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ttl_zero_means_no_expiry_roundtrip() {
+    // ttl_ms=0 must round-trip as no expiry (None)
+    let entry = WalEntry {
+        op: WalOp::Set,
+        key: b"noexpiry".to_vec(),
+        value: b"val".to_vec(),
+        mem_type: MemoryType::Semantic,
+        ttl_ms: 0,
+        timestamp_ms: 1000,
+        embedding: None,
+    };
+    let data = serialize_entry(&entry, 1);
+    let (_, decoded, _) = deserialize_entry(&data).unwrap();
+    assert_eq!(decoded.ttl_ms, 0);
+    // Replica interprets ttl_ms==0 as None (no expiry)
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    assert_eq!(ttl, None, "ttl_ms=0 must round-trip as None (no expiry)");
+}
+
+#[test]
+fn test_ttl_positive_means_actual_ttl_roundtrip() {
+    // ttl_ms>0 must round-trip as an actual TTL
+    let entry = WalEntry {
+        op: WalOp::Set,
+        key: b"withttl".to_vec(),
+        value: b"val".to_vec(),
+        mem_type: MemoryType::Episodic,
+        ttl_ms: 5000,
+        timestamp_ms: 2000,
+        embedding: None,
+    };
+    let data = serialize_entry(&entry, 2);
+    let (_, decoded, _) = deserialize_entry(&data).unwrap();
+    assert_eq!(decoded.ttl_ms, 5000);
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    assert_eq!(ttl, Some(5000), "ttl_ms=5000 must round-trip as Some(5000)");
+}
+
+#[test]
+fn test_ttl_large_value_roundtrip() {
+    // Large TTL values must round-trip without sign extension or truncation
+    let entry = WalEntry {
+        op: WalOp::Set,
+        key: b"largettl".to_vec(),
+        value: b"val".to_vec(),
+        mem_type: MemoryType::Procedural,
+        ttl_ms: u64::MAX / 2,
+        timestamp_ms: 3000,
+        embedding: None,
+    };
+    let data = serialize_entry(&entry, 3);
+    let (_, decoded, _) = deserialize_entry(&data).unwrap();
+    assert_eq!(decoded.ttl_ms, u64::MAX / 2);
+    let ttl: Option<u64> = if decoded.ttl_ms == 0 { None } else { Some(decoded.ttl_ms) };
+    assert_eq!(ttl, Some(u64::MAX / 2));
+}
+
+#[test]
+fn test_record_set_none_ttl_stores_zero() {
+    let engine = Arc::new(KvEngine::new(4));
+    let repl_state = ReplicationState::new_primary(engine, 100);
+    // record_set with None TTL must store ttl_ms=0 in the WAL entry
+    repl_state.record_set(b"key1", b"val1", MemoryType::Semantic, None);
+    let entries = repl_state.wal().entries_from(1);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1.ttl_ms, 0, "record_set with None TTL must store ttl_ms=0");
+}
+
+#[test]
+fn test_record_set_some_ttl_stores_value() {
+    let engine = Arc::new(KvEngine::new(4));
+    let repl_state = ReplicationState::new_primary(engine, 100);
+    // record_set with Some(TTL) must store that TTL in the WAL entry
+    repl_state.record_set(b"key2", b"val2", MemoryType::Episodic, Some(10000));
+    let entries = repl_state.wal().entries_from(1);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1.ttl_ms, 10000, "record_set with Some(10000) must store ttl_ms=10000");
 }

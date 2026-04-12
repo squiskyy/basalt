@@ -96,6 +96,8 @@ impl ReplicationState {
     }
 
     /// Record a SET write in the WAL and update offset.
+    /// Wire format: ttl_ms = 0 means no expiry, ttl_ms > 0 means expire in N ms.
+    /// When ttl_ms is None, we store 0 in the WalEntry.
     pub fn record_set(&self, key: &[u8], value: &[u8], mem_type: MemoryType, ttl_ms: Option<u64>) {
         let entry = wal::WalEntry {
             op: wal::WalOp::Set,
@@ -104,6 +106,7 @@ impl ReplicationState {
             mem_type,
             ttl_ms: ttl_ms.unwrap_or(0),
             timestamp_ms: now_ms(),
+            embedding: None,
         };
         let seq = self.wal.append(entry);
         self.replication_offset.store(seq, Ordering::Relaxed);
@@ -118,6 +121,7 @@ impl ReplicationState {
             mem_type: MemoryType::Semantic, // doesn't matter for delete
             ttl_ms: 0,
             timestamp_ms: now_ms(),
+            embedding: None,
         };
         let seq = self.wal.append(entry);
         self.replication_offset.store(seq, Ordering::Relaxed);
@@ -132,6 +136,7 @@ impl ReplicationState {
             mem_type: MemoryType::Semantic,
             ttl_ms: 0,
             timestamp_ms: now_ms(),
+            embedding: None,
         };
         let seq = self.wal.append(entry);
         self.replication_offset.store(seq, Ordering::Relaxed);
