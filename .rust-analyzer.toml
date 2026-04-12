@@ -1,0 +1,14 @@
+# Rust-analyzer configuration for Basalt
+# Ensures edition 2024 is properly recognized
+
+# Use cargo metadata for project discovery
+cargo.buildScripts.enable = true
+
+# Link to the stable toolchain that supports edition 2024
+rustc.source = "discover"
+
+# Enable all cargo features for analysis (including io-uring)
+cargo.features = ["io-uring"]
+
+# Check with all features on save
+cargo.checkOnSave.features = ["io-uring"]
