@@ -182,7 +182,7 @@ impl CommandHandler {
     }
 
     fn handle_set(&self, cmd: &Command) -> RespValue {
-        // SET key value [EX seconds] [PX milliseconds]
+        // SET key value [EX seconds] [PX milliseconds] [NX] [XX]
         if cmd.args.len() < 2 {
             return RespValue::Error("ERR wrong number of arguments for 'SET'".to_string());
         }
@@ -190,6 +190,8 @@ impl CommandHandler {
         let key = String::from_utf8_lossy(&cmd.args[0]).to_string();
         let value = cmd.args[1].clone();
         let mut ttl_ms: Option<u64> = None;
+        let mut nx = false;
+        let mut xx = false;
 
         let mut i = 2;
         while i < cmd.args.len() {
@@ -229,9 +231,35 @@ impl CommandHandler {
                     ttl_ms = Some(ms);
                     i += 2;
                 }
+                "NX" => {
+                    nx = true;
+                    i += 1;
+                }
+                "XX" => {
+                    xx = true;
+                    i += 1;
+                }
                 _ => {
                     return RespValue::Error(format!("ERR syntax error — unknown flag '{flag}'"));
                 }
+            }
+        }
+
+        if nx && xx {
+            return RespValue::Error("ERR syntax error — NX and XX flags are mutually exclusive".to_string());
+        }
+
+        // NX: only set if key does not exist
+        if nx {
+            if self.engine.get(&key).is_some() {
+                return RespValue::BulkString(None);
+            }
+        }
+
+        // XX: only set if key exists
+        if xx {
+            if self.engine.get(&key).is_none() {
+                return RespValue::BulkString(None);
             }
         }
 
@@ -716,6 +744,123 @@ mod tests {
             RespValue::Error(s) => assert!(s.contains("unknown command")),
             _ => panic!("expected error"),
         }
+    }
+
+    #[test]
+    fn test_set_nx_key_does_not_exist() {
+        let handler = make_handler();
+        // NX on a non-existent key should set and return OK
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"nxkey".to_vec(), b"val".to_vec(), b"NX".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        assert_eq!(resp, RespValue::SimpleString("OK".to_string()));
+
+        let get_cmd = Command {
+            name: "GET".to_string(),
+            args: vec![b"nxkey".to_vec()],
+        };
+        let resp = handler.handle(&get_cmd);
+        assert_eq!(resp, RespValue::BulkString(Some(b"val".to_vec())));
+    }
+
+    #[test]
+    fn test_set_nx_key_exists() {
+        let handler = make_handler();
+        // Set the key first
+        let set_cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"nxkey2".to_vec(), b"original".to_vec()],
+        };
+        handler.handle(&set_cmd);
+        // NX on an existing key should return nil
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"nxkey2".to_vec(), b"newval".to_vec(), b"NX".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        assert_eq!(resp, RespValue::BulkString(None));
+
+        // Value should remain unchanged
+        let get_cmd = Command {
+            name: "GET".to_string(),
+            args: vec![b"nxkey2".to_vec()],
+        };
+        let resp = handler.handle(&get_cmd);
+        assert_eq!(resp, RespValue::BulkString(Some(b"original".to_vec())));
+    }
+
+    #[test]
+    fn test_set_xx_key_does_not_exist() {
+        let handler = make_handler();
+        // XX on a non-existent key should return nil
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"xxkey".to_vec(), b"val".to_vec(), b"XX".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        assert_eq!(resp, RespValue::BulkString(None));
+
+        // Key should not have been set
+        let get_cmd = Command {
+            name: "GET".to_string(),
+            args: vec![b"xxkey".to_vec()],
+        };
+        let resp = handler.handle(&get_cmd);
+        assert_eq!(resp, RespValue::BulkString(None));
+    }
+
+    #[test]
+    fn test_set_xx_key_exists() {
+        let handler = make_handler();
+        // Set the key first
+        let set_cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"xxkey2".to_vec(), b"original".to_vec()],
+        };
+        handler.handle(&set_cmd);
+        // XX on an existing key should set and return OK
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"xxkey2".to_vec(), b"updated".to_vec(), b"XX".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        assert_eq!(resp, RespValue::SimpleString("OK".to_string()));
+
+        // Value should be updated
+        let get_cmd = Command {
+            name: "GET".to_string(),
+            args: vec![b"xxkey2".to_vec()],
+        };
+        let resp = handler.handle(&get_cmd);
+        assert_eq!(resp, RespValue::BulkString(Some(b"updated".to_vec())));
+    }
+
+    #[test]
+    fn test_set_nx_and_xx_mutually_exclusive() {
+        let handler = make_handler();
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"key".to_vec(), b"val".to_vec(), b"NX".to_vec(), b"XX".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        match resp {
+            RespValue::Error(s) => assert!(s.contains("mutually exclusive")),
+            _ => panic!("expected error for NX+XX"),
+        }
+    }
+
+    #[test]
+    fn test_set_nx_with_ex() {
+        let handler = make_handler();
+        // NX + EX should work together
+        let cmd = Command {
+            name: "SET".to_string(),
+            args: vec![b"nxex".to_vec(), b"val".to_vec(), b"NX".to_vec(), b"EX".to_vec(), b"10".to_vec()],
+        };
+        let resp = handler.handle(&cmd);
+        assert_eq!(resp, RespValue::SimpleString("OK".to_string()));
     }
 
     #[test]
