@@ -375,17 +375,6 @@ Returns `412` (HTTP) or `-ERR no db_path configured` (RESP) if persistence is di
 - **Startup**: Loads the latest snapshot from `db_path`, skips expired entries
 - **Episodic memories**: TTL is preserved in snapshots — expired entries are skipped on load
 
-## Roadmap
-
-- [x] **SIMD RESP parsing** — memchr-powered CRLF scanning (AVX2/SSE2 on x86_64, NEON on aarch64)
-- [x] **Batch endpoints** — POST /store/{ns}/batch and /store/{ns}/batch/get
-- [x] **Auth** — bearer tokens with namespace scoping (HTTP + RESP AUTH command)
-- [x] **Persistence** — binary snapshots with auto-interval, manual trigger, startup restore
-- [ ] Vector search — HNSW index for semantic memory embeddings
-- [x] io_uring RESP server — zero-syscall I/O for Linux (feature flag: `--features io-uring`)
-- [ ] Replication — primary-replica async replication
-- [ ] Compression — LZ4/zstd for values > 1KB
-
 ## License
 
 MIT
