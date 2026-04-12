@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 memchr = "2"
+toml = "0.8"
 io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]

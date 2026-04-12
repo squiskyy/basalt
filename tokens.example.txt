@@ -1,0 +1,18 @@
+# Basalt auth tokens file
+#
+# Format: <token> <namespace1> [namespace2 ...]
+# - One token per line
+# - Use * for wildcard (access to all namespaces)
+# - Lines starting with # are comments
+# - Blank lines are ignored
+#
+# Examples:
+
+# Admin token — full access to all namespaces
+# bsk-admin-your-secret-here *
+
+# Agent token — scoped to its own namespace + a shared space
+# bsk-agent1-your-secret-here agent-1 shared
+
+# Read-only monitoring service
+# bsk-monitor-your-secret-here metrics

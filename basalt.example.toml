@@ -1,0 +1,28 @@
+# Basalt configuration file
+#
+# Place at ~/.config/basalt/basalt.toml or pass via --config path
+# CLI flags override values set here.
+
+[server]
+# HTTP REST API bind address
+http_host = "127.0.0.1"
+http_port = 7380
+
+# RESP2 (Redis-compatible) bind address
+resp_host = "127.0.0.1"
+resp_port = 6380
+
+# Number of shards (each is an independent concurrent HashMap)
+# Must be a power of 2. Default: 64
+shard_count = 64
+
+[auth]
+# Path to a tokens file (one token per line)
+# Format: <token> <namespace1> [namespace2 ...]
+# Use * for wildcard (all namespaces)
+# Lines starting with # are comments, blank lines ignored.
+tokens_file = "/etc/basalt/tokens.txt"
+
+# You can also set tokens directly in CLI args:
+#   basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared"
+# CLI tokens override file tokens with the same value.

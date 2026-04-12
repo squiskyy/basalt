@@ -90,6 +90,58 @@ redis-cli -p 6380 GET mykey
 # → "myvalue"
 ```
 
+## Configuration
+
+Basalt can be configured via CLI flags, a TOML config file, or both (CLI overrides config file).
+
+### CLI flags
+
+```bash
+basalt --http-port 8080 --resp-port 6379 --shards 128
+basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared"
+basalt --auth-file /etc/basalt/tokens.txt
+```
+
+### Config file
+
+```bash
+basalt --config /etc/basalt/basalt.toml
+```
+
+```toml
+# basalt.toml
+[server]
+http_host = "127.0.0.1"
+http_port = 7380
+resp_host = "127.0.0.1"
+resp_port = 6380
+shard_count = 64
+
+[auth]
+tokens_file = "/etc/basalt/tokens.txt"
+```
+
+CLI flags override config file values. See `basalt.example.toml` for a full example.
+
+### Auth tokens file
+
+One token per line, whitespace-delimited: `<token> <namespace1> [namespace2 ...]`
+
+```text
+# Admin — full access to all namespaces
+bsk-admin-secret *
+
+# Agent 1 — own namespace + shared
+bsk-agent1-abc123 agent-1 shared
+
+# Agent 2 — only its namespace
+bsk-agent2-def456 agent-2
+```
+
+Use `--auth-file /path/to/tokens.txt` on the CLI or set `tokens_file` in the config. See `tokens.example.txt`.
+
+CLI `--auth` flags override file entries with the same token value.
+
 ## HTTP API
 
 | Method | Path | Description |
