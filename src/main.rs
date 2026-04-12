@@ -8,6 +8,7 @@ pub mod http;
 pub mod replication;
 pub mod resp;
 pub mod store;
+pub mod time;
 
 #[derive(Parser, Debug)]
 #[command(name = "basalt", version, about = "Ultra-high performance KV store for AI memory")]

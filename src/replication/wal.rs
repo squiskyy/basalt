@@ -136,7 +136,7 @@ pub fn serialize_entry(entry: &WalEntry, seq: u64) -> Vec<u8> {
     // value
     buf.extend_from_slice(&entry.value);
     // mem_type: u8
-    buf.push(memory_type_to_u8(entry.mem_type));
+    buf.push(entry.mem_type.to_u8());
     // ttl_ms: u64 LE
     buf.extend_from_slice(&entry.ttl_ms.to_le_bytes());
     buf
@@ -191,7 +191,7 @@ pub fn deserialize_entry(data: &[u8]) -> Result<(u64, WalEntry, usize), String> 
     if data.len() < off + 1 {
         return Err(format!("data too short for mem_type at offset {off}"));
     }
-    let mem_type = u8_to_memory_type(data[off]).ok_or_else(|| format!("invalid mem_type: {}", data[off]))?;
+    let mem_type = MemoryType::from_u8(data[off]).ok_or_else(|| format!("invalid mem_type: {}", data[off]))?;
     off += 1;
 
     // ttl_ms: u64 LE
@@ -211,23 +211,6 @@ pub fn deserialize_entry(data: &[u8]) -> Result<(u64, WalEntry, usize), String> 
     };
 
     Ok((seq, entry, off))
-}
-
-fn memory_type_to_u8(mt: MemoryType) -> u8 {
-    match mt {
-        MemoryType::Episodic => 0,
-        MemoryType::Semantic => 1,
-        MemoryType::Procedural => 2,
-    }
-}
-
-fn u8_to_memory_type(v: u8) -> Option<MemoryType> {
-    match v {
-        0 => Some(MemoryType::Episodic),
-        1 => Some(MemoryType::Semantic),
-        2 => Some(MemoryType::Procedural),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

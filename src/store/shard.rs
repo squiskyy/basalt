@@ -1,7 +1,7 @@
 use crate::store::memory_type::MemoryType;
+use crate::time::now_ms;
 use papaya::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single entry stored in a shard.
 #[derive(Debug, Clone)]
@@ -46,13 +46,6 @@ pub struct ShardFullError {
     pub current: usize,
 }
 
-/// Returns current time in milliseconds since UNIX epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis() as u64
-}
 
 /// Default maximum entries per shard.
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;

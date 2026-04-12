@@ -1,11 +1,11 @@
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, Shard, ShardFullError};
 use crate::store::vector::{HnswIndex, VectorSearchResult, current_version, increment_version};
+use crate::time::now_ms;
 use fxhash::FxHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Metadata returned alongside a value when using `get_with_meta`.
 #[derive(Debug, Clone)]
@@ -38,14 +38,6 @@ fn next_power_of_2(n: usize) -> usize {
         return n;
     }
     1usize << (usize::BITS - n.leading_zeros())
-}
-
-/// Returns current time in milliseconds since UNIX epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis() as u64
 }
 
 impl KvEngine {

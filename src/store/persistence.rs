@@ -25,6 +25,7 @@
 /// On startup, load the latest snapshot from the db_path directory.
 
 use crate::store::memory_type::MemoryType;
+use crate::time::now_ms;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,23 +51,6 @@ const SNAPSHOT_PREFIX: &str = "snapshot-";
 const SNAPSHOT_EXT: &str = ".bin";
 
 /// Convert MemoryType to u8 for serialization.
-fn memory_type_to_u8(mt: MemoryType) -> u8 {
-    match mt {
-        MemoryType::Episodic => 0,
-        MemoryType::Semantic => 1,
-        MemoryType::Procedural => 2,
-    }
-}
-
-/// Convert u8 to MemoryType for deserialization.
-fn u8_to_memory_type(v: u8) -> Option<MemoryType> {
-    match v {
-        0 => Some(MemoryType::Episodic),
-        1 => Some(MemoryType::Semantic),
-        2 => Some(MemoryType::Procedural),
-        _ => None,
-    }
-}
 
 /// A single entry to be persisted, with its key.
 #[derive(Debug)]
@@ -139,7 +123,7 @@ pub fn write_snapshot(
             .map_err(|e| format!("write val_len: {e}"))?;
         f.write_all(&stored_value)
             .map_err(|e| format!("write value: {e}"))?;
-        f.write_all(&[memory_type_to_u8(entry.memory_type)])
+        f.write_all(&[entry.memory_type.to_u8()])
             .map_err(|e| format!("write memory_type: {e}"))?;
         f.write_all(
             &entry
@@ -254,7 +238,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut mt_byte = [0u8; 1];
         f.read_exact(&mut mt_byte)
             .map_err(|e| format!("read memory_type at entry {i}: {e}"))?;
-        let memory_type = u8_to_memory_type(mt_byte[0]).ok_or_else(|| {
+        let memory_type = MemoryType::from_u8(mt_byte[0]).ok_or_else(|| {
             format!(
                 "invalid memory_type {} at entry {i} in {}",
                 mt_byte[0],
@@ -651,10 +635,10 @@ mod tests {
 
     #[test]
     fn test_memory_type_roundtrip() {
-        assert_eq!(u8_to_memory_type(memory_type_to_u8(MemoryType::Episodic)), Some(MemoryType::Episodic));
-        assert_eq!(u8_to_memory_type(memory_type_to_u8(MemoryType::Semantic)), Some(MemoryType::Semantic));
-        assert_eq!(u8_to_memory_type(memory_type_to_u8(MemoryType::Procedural)), Some(MemoryType::Procedural));
-        assert_eq!(u8_to_memory_type(255), None);
+        assert_eq!(MemoryType::from_u8(MemoryType::Episodic.to_u8()), Some(MemoryType::Episodic));
+        assert_eq!(MemoryType::from_u8(MemoryType::Semantic.to_u8()), Some(MemoryType::Semantic));
+        assert_eq!(MemoryType::from_u8(MemoryType::Procedural.to_u8()), Some(MemoryType::Procedural));
+        assert_eq!(MemoryType::from_u8(255), None);
     }
 
     #[test]

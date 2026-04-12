@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::watch;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::time::now_ms;
 
 /// Replication role of this node.
 #[derive(Debug, Clone, PartialEq)]
@@ -170,11 +171,4 @@ impl ReplicationState {
             }
         }
     }
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis() as u64
 }
