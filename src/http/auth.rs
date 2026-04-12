@@ -3,10 +3,10 @@
 /// Tokens are configured at startup via CLI args or a config file.
 /// Each token can be scoped to specific namespaces, or `["*"]` for full access.
 ///
-/// HTTP: `Authorization: Bearer <token>` header on all `/store/*` endpoints.
+/// HTTP: `Authorization: Bearer *** header on all `/store/*` endpoints.
 /// RESP: `AUTH <token>` command (Redis-compatible).
 ///
-/// `/health` and `/info` remain unauthenticated.
+/// Only `/store/*` paths require auth; all other paths are allowed through.
 
 use std::sync::Arc;
 
@@ -119,14 +119,15 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Extract namespace from the path: /store/{namespace}/...
     let path = request.uri().path();
-    let namespace = extract_namespace_from_path(path);
 
-    // Some paths don't need auth
-    if path == "/health" || path == "/info" {
+    // Only /store/* paths require auth; all other paths are allowed through
+    if !path.starts_with("/store/") {
         return next.run(request).await;
     }
+
+    // Extract namespace from the path: /store/{namespace}/...
+    let namespace = extract_namespace_from_path(path);
 
     // Extract bearer token
     let token = match extract_bearer(&request) {
@@ -149,8 +150,7 @@ pub async fn auth_middleware(
             return next.run(request).await;
         }
     } else {
-        // No namespace in path (shouldn't happen for /store/*, but be safe)
-        // Just check if token exists
+        // No namespace in path (e.g. bare /store/), check with empty namespace
         if auth_store.is_authorized(token, "") {
             return next.run(request).await;
         }
