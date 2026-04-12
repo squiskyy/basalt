@@ -339,13 +339,12 @@ pub fn run(
                         match value.to_command() {
                             Some(cmd) => {
                                 // Per-command namespace authorization check
-                                if let Some(ref token) = conn.auth_token {
-                                    if let Err(err_resp) =
+                                if let Some(ref token) = conn.auth_token
+                                    && let Err(err_resp) =
                                         check_command_namespace(&cmd, &auth, token)
-                                    {
-                                        responses.push(err_resp);
-                                        continue;
-                                    }
+                                {
+                                    responses.push(err_resp);
+                                    continue;
                                 }
                                 responses.push(handler.handle(&cmd));
                             }
@@ -486,6 +485,7 @@ fn drain_backlog(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn close_conn(
     fd: i32,
     conn_id: usize,
