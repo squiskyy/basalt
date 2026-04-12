@@ -5,6 +5,9 @@
 
 use memchr::memchr;
 
+/// Maximum allowed size for a RESP BulkString value (512 MB).
+pub const MAX_BULK_STRING_SIZE: usize = 512 * 1024 * 1024;
+
 /// A parsed RESP2 value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
@@ -106,6 +109,12 @@ fn parse_one(input: &[u8]) -> Result<(RespValue, usize), ParseError> {
             }
 
             let len = len as usize;
+
+            if len > MAX_BULK_STRING_SIZE {
+                return Err(ParseError::Invalid(format!(
+                    "BulkString length {len} exceeds maximum allowed size of {MAX_BULK_STRING_SIZE}"
+                )));
+            }
             let data_start = end + 2;
             let data_end = data_start + len;
 

@@ -100,14 +100,13 @@ impl Wal {
 
     /// Get all entries with sequence number >= `from_seq`.
     /// Returns a vector of (seq, entry) pairs.
+    /// Uses binary search (O(log n)) since entries are sorted by sequence number.
     pub fn entries_from(&self, from_seq: u64) -> Vec<(u64, WalEntry)> {
         let inner = self.entries.lock().unwrap();
-        inner
+        let start = inner
             .buf
-            .iter()
-            .filter(|(seq, _)| *seq >= from_seq)
-            .cloned()
-            .collect()
+            .partition_point(|(seq, _)| *seq < from_seq);
+        inner.buf.range(start..).cloned().collect()
     }
 
     /// Get the oldest sequence number in the WAL, or None if empty.

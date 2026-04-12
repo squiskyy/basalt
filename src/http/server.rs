@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::IntoResponse;
@@ -57,6 +57,7 @@ pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>,
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }
 
