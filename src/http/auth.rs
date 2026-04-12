@@ -82,6 +82,16 @@ impl AuthStore {
             .unwrap_or(false)
     }
 
+    /// Check if a token exists in the store (valid token, regardless of namespace).
+    /// Returns true if auth is disabled (no tokens configured) or the token exists.
+    pub fn token_exists(&self, token_value: &str) -> bool {
+        let pinned = self.tokens.pin();
+        if pinned.is_empty() {
+            return true;
+        }
+        pinned.get(token_value).is_some()
+    }
+
     /// Check if auth is enabled (any tokens configured).
     pub fn is_enabled(&self) -> bool {
         !self.tokens.pin().is_empty()

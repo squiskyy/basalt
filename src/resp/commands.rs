@@ -6,6 +6,105 @@ use crate::replication::ReplicationState;
 
 use super::parser::{Command, RespValue};
 
+/// Extract the namespace from a key in "namespace:key" format.
+/// Returns the namespace portion (before the first ':'), or the full key if no ':' is present.
+pub fn extract_namespace(key: &str) -> &str {
+    match key.find(':') {
+        Some(pos) => &key[..pos],
+        None => key,
+    }
+}
+
+/// Commands that do not access any key and thus need no per-command namespace check.
+const NO_KEY_COMMANDS: &[&str] = &["PING", "INFO", "SNAP", "AUTH", "REPLICAOF"];
+
+/// Return the first key-carrying argument index for a given command name.
+/// Returns None for commands that carry no keys.
+fn first_key_arg_index(cmd_name: &str) -> Option<usize> {
+    match cmd_name.to_uppercase().as_str() {
+        "GET" | "DEL" | "MGETT" | "MTYPE" => Some(0),
+        "SET" | "MSETT" => Some(0),
+        "MGET" => Some(0),  // multiple keys starting at arg 0
+        "MSET" => Some(0),  // key-value pairs starting at arg 0
+        "KEYS" | "MSCAN" => Some(0),  // prefix/pattern arg
+        "VSEARCH" => Some(0),  // namespace arg
+        _ => None,
+    }
+}
+
+/// Check whether a command is authorized for a given auth token by extracting
+/// the namespace from its key arguments and verifying against the AuthStore.
+/// Returns Ok(()) if authorized, or Err(response) with a RESP error.
+pub fn check_command_namespace(
+    cmd: &Command,
+    auth: &crate::http::auth::AuthStore,
+    token: &str,
+) -> Result<(), RespValue> {
+    let name = cmd.name.to_uppercase();
+
+    // Commands that don't touch keys don't need namespace checks
+    if NO_KEY_COMMANDS.contains(&name.as_str()) {
+        return Ok(());
+    }
+
+    // If token has wildcard access, skip per-key checks
+    if auth.is_authorized(token, "*") {
+        return Ok(());
+    }
+
+    let key_index = match first_key_arg_index(&name) {
+        Some(i) => i,
+        None => return Ok(()), // unknown command, let it through to CommandHandler
+    };
+
+    if cmd.args.is_empty() {
+        return Ok(()); // will be caught by command handler arg validation
+    }
+
+    // For MSET, keys are at even indices (0, 2, 4, ...); check all of them
+    if name == "MSET" {
+        let mut i = 0;
+        while i < cmd.args.len() {
+            let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
+            let ns = extract_namespace(&key);
+            if !auth.is_authorized(token, ns) {
+                return Err(RespValue::Error(
+                    format!("NOAUTH Token not authorized for namespace '{}'", ns),
+                ));
+            }
+            i += 2;
+        }
+        return Ok(());
+    }
+
+    // For MGET, all args are keys
+    if name == "MGET" || name == "DEL" {
+        for arg in &cmd.args {
+            let key = String::from_utf8_lossy(arg).to_string();
+            let ns = extract_namespace(&key);
+            if !auth.is_authorized(token, ns) {
+                return Err(RespValue::Error(
+                    format!("NOAUTH Token not authorized for namespace '{}'", ns),
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    // For single-key commands, check the first key arg
+    if key_index < cmd.args.len() {
+        let key = String::from_utf8_lossy(&cmd.args[key_index]).to_string();
+        let ns = extract_namespace(&key);
+        if !auth.is_authorized(token, ns) {
+            return Err(RespValue::Error(
+                format!("NOAUTH Token not authorized for namespace '{}'", ns),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Handles RESP commands by dispatching to the KvEngine.
 pub struct CommandHandler {
     engine: Arc<KvEngine>,

@@ -324,7 +324,71 @@ async fn test_auth_wrong_token() {
 }
 
 // ---------------------------------------------------------------------------
-// j. Pipelining: send multiple commands in one write, read all responses
+// j. AUTH with scoped token: per-command namespace enforcement
+// ---------------------------------------------------------------------------
+
+/// Start a RESP server with a scoped (non-wildcard) auth token.
+async fn start_scoped_auth_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let engine = Arc::new(KvEngine::new(4));
+    let auth = Arc::new(AuthStore::from_list(vec![
+        ("bsk-scoped".to_string(), vec!["ns-alpha".to_string()]),
+        ("bsk-wildcard".to_string(), vec!["*".to_string()]),
+    ]));
+    start_resp_server(engine, auth, None).await
+}
+
+#[tokio::test]
+async fn test_auth_scoped_token_can_access_own_namespace() {
+    let (port, _handle) = start_scoped_auth_resp_server().await;
+    let mut stream = connect(port).await;
+
+    let resp = send_and_read(&mut stream, "AUTH", &["bsk-scoped"]).await;
+    assert_eq!(resp, "+OK\r\n", "AUTH with scoped token should succeed");
+
+    // SET a key in the allowed namespace
+    let resp = send_and_read(&mut stream, "SET", &["ns-alpha:mykey", "myvalue"]).await;
+    assert_eq!(resp, "+OK\r\n", "SET in allowed namespace should succeed");
+
+    // GET from allowed namespace
+    let resp = send_and_read(&mut stream, "GET", &["ns-alpha:mykey"]).await;
+    assert!(resp.contains("myvalue"), "GET from allowed namespace should return value, got: {resp}");
+}
+
+#[tokio::test]
+async fn test_auth_scoped_token_cannot_access_other_namespace() {
+    let (port, _handle) = start_scoped_auth_resp_server().await;
+    let mut stream = connect(port).await;
+
+    let resp = send_and_read(&mut stream, "AUTH", &["bsk-scoped"]).await;
+    assert_eq!(resp, "+OK\r\n", "AUTH with scoped token should succeed");
+
+    // SET a key in a disallowed namespace
+    let resp = send_and_read(&mut stream, "SET", &["ns-beta:mykey", "myvalue"]).await;
+    assert!(resp.starts_with("-NOAUTH"), "SET in disallowed namespace should fail, got: {resp}");
+
+    // GET from disallowed namespace
+    let resp = send_and_read(&mut stream, "GET", &["ns-beta:mykey"]).await;
+    assert!(resp.starts_with("-NOAUTH"), "GET from disallowed namespace should fail, got: {resp}");
+}
+
+#[tokio::test]
+async fn test_auth_wildcard_token_can_access_any_namespace() {
+    let (port, _handle) = start_scoped_auth_resp_server().await;
+    let mut stream = connect(port).await;
+
+    let resp = send_and_read(&mut stream, "AUTH", &["bsk-wildcard"]).await;
+    assert_eq!(resp, "+OK\r\n", "AUTH with wildcard token should succeed");
+
+    // SET a key in any namespace
+    let resp = send_and_read(&mut stream, "SET", &["ns-beta:mykey", "myvalue"]).await;
+    assert_eq!(resp, "+OK\r\n", "SET with wildcard token in any namespace should succeed");
+
+    let resp = send_and_read(&mut stream, "GET", &["ns-beta:mykey"]).await;
+    assert!(resp.contains("myvalue"), "GET with wildcard token should work, got: {resp}");
+}
+
+// ---------------------------------------------------------------------------
+// k. Pipelining: send multiple commands in one write, read all responses
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

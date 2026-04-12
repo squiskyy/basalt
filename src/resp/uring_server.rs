@@ -26,7 +26,7 @@ use io_uring::{opcode, squeue, types, IoUring};
 use crate::http::auth::AuthStore;
 use crate::store::engine::KvEngine;
 
-use super::commands::CommandHandler;
+use super::commands::{check_command_namespace, CommandHandler};
 use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
@@ -232,7 +232,16 @@ pub fn run(
                             continue;
                         }
                         match value.to_command() {
-                            Some(cmd) => responses.push(handler.handle(&cmd)),
+                            Some(cmd) => {
+                                // Per-command namespace authorization check
+                                if let Some(ref token) = conn.auth_token {
+                                    if let Err(err_resp) = check_command_namespace(&cmd, &auth, token) {
+                                        responses.push(err_resp);
+                                        continue;
+                                    }
+                                }
+                                responses.push(handler.handle(&cmd));
+                            }
                             None => responses.push(RespValue::Error("ERR invalid command format".into())),
                         }
                     }
@@ -386,7 +395,10 @@ fn handle_auth_resp(
         return RespValue::Error("ERR wrong number of arguments for 'AUTH'".to_string());
     }
     let token = String::from_utf8_lossy(&cmd.args[0]).to_string();
-    if auth.is_authorized(&token, "*") || auth.list_tokens().iter().any(|(t, _)| t == &token) {
+    // Check if this token exists at all (valid token).
+    // For AUTH, we just verify the token is valid - per-command namespace
+    // checks happen on each subsequent command.
+    if auth.token_exists(&token) {
         *authenticated = true;
         *auth_token = Some(token);
         RespValue::SimpleString("OK".to_string())

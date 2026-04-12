@@ -7,7 +7,7 @@ use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
 
-use super::commands::{CommandHandler, ReplicaofResult};
+use super::commands::{check_command_namespace, CommandHandler, ReplicaofResult};
 use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
@@ -185,6 +185,13 @@ async fn handle_connection(
 
                 match value.to_command() {
                     Some(cmd) => {
+                        // Per-command namespace authorization check
+                        if let Some(ref token) = auth_token {
+                            if let Err(err_resp) = check_command_namespace(&cmd, &auth, token) {
+                                responses.push(err_resp);
+                                continue;
+                            }
+                        }
                         let resp = handler.handle(&cmd);
                         responses.push(resp);
                     }
@@ -225,8 +232,10 @@ fn handle_auth(
 
     let token = String::from_utf8_lossy(&cmd.args[0]).to_string();
 
-    // Check if this token exists at all (with wildcard access)
-    if auth.is_authorized(&token, "*") || auth.list_tokens().iter().any(|(t, _)| t == &token) {
+    // Check if this token exists at all (valid token).
+    // For AUTH, we just verify the token is valid - per-command namespace
+    // checks happen on each subsequent command.
+    if auth.token_exists(&token) {
         *authenticated = true;
         *auth_token = Some(token);
         RespValue::SimpleString("OK".to_string())
