@@ -350,10 +350,7 @@ pub fn load_latest_snapshot(
     info!("loading snapshot from {}", snapshot_path.display());
     let entries = read_snapshot(&snapshot_path)?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis() as u64;
+    let now = now_ms();
 
     let mut loaded = 0;
     let mut expired = 0;
@@ -391,13 +388,7 @@ pub fn collect_entries(engine: &crate::store::engine::KvEngine) -> Vec<SnapshotE
             key,
             value,
             memory_type: meta.memory_type,
-            expires_at: meta.ttl_remaining_ms.map(|ttl| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time went backwards")
-                    .as_millis() as u64
-                    + ttl
-            }),
+            expires_at: meta.ttl_remaining_ms.map(|ttl| now_ms() + ttl),
         })
         .collect()
 }
@@ -419,12 +410,9 @@ pub fn snapshot_with_threshold(
     compression_threshold: usize,
 ) -> Result<PathBuf, String> {
     let entries = collect_entries(engine);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis() as u64;
+    let now_ms_val = now_ms();
 
-    let path = write_snapshot(db_path, &entries, now_ms, compression_threshold)?;
+    let path = write_snapshot(db_path, &entries, now_ms_val, compression_threshold)?;
     let pruned = prune_snapshots(db_path, keep_snapshots);
     if pruned > 0 {
         debug!("pruned {pruned} old snapshot(s)");
