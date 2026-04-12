@@ -136,6 +136,8 @@ pub fn write_snapshot(
 
     f.flush()
         .map_err(|e| format!("flush snapshot: {e}"))?;
+    f.sync_all()
+        .map_err(|e| format!("fsync snapshot: {e}"))?;
     drop(f);
 
     // Atomic rename
