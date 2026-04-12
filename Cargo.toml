@@ -1,0 +1,28 @@
+[package]
+name = "basalt"
+version = "0.1.0"
+edition = "2024"
+description = "Ultra-high performance KV store for AI memory"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+papaya = "0.2"
+fxhash = "0.2"
+bytes = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.9"
+
+[[bench]]
+name = "basalt_bench"
+harness = false
