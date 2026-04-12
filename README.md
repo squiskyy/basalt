@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="resources/basalt_logo_scaled.jpg" alt="Basalt" width="600">
+  <img src="resources/basalt_logo_scaled.png" alt="Basalt" width="600">
 </div>
 
 # Basalt
