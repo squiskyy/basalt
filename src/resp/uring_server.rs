@@ -91,7 +91,10 @@ pub fn run(
         .user_data(accept_token as u64);
 
     unsafe {
-        sq.push(&accept_e).expect("SQ full for accept");
+        if let Err(e) = sq.push(&accept_e) {
+            tracing::warn!("io_uring SQ full on initial accept, queuing to backlog: {e:?}");
+            backlog.push_back(accept_e);
+        }
     }
     sq.sync();
     submitter.submit().map_err(RespError::Submit)?;
@@ -119,7 +122,8 @@ pub fn run(
                             .build()
                             .user_data(token_idx as u64);
                         unsafe {
-                            if sq.push(&ae).is_err() {
+                            if let Err(e) = sq.push(&ae) {
+                                tracing::warn!("io_uring SQ full on accept re-arm, queuing to backlog: {e:?}");
                                 backlog.push_back(ae);
                             }
                         }
