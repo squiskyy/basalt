@@ -316,6 +316,13 @@ impl Shard {
         }
         removed
     }
+
+    /// Remove all entries from this shard, clearing the entire map.
+    /// Used during full resync to ensure stale phantom keys are removed.
+    pub fn clear(&self) {
+        self.map.pin().clear();
+        self.count.store(0, Ordering::Relaxed);
+    }
 }
 
 impl Default for Shard {
