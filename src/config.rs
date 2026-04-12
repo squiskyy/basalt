@@ -26,6 +26,10 @@ pub struct ServerConfig {
     pub resp_port: u16,
     /// Number of shards in the KV engine.
     pub shard_count: usize,
+    /// Directory for persistence snapshots. None = no persistence.
+    pub db_path: Option<String>,
+    /// How often to auto-snapshot to disk (milliseconds). 0 = disabled.
+    pub snapshot_interval_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +48,8 @@ impl Default for ServerConfig {
             resp_host: "127.0.0.1".into(),
             resp_port: 6380,
             shard_count: 64,
+            db_path: None,
+            snapshot_interval_ms: 60_000,
         }
     }
 }
@@ -79,6 +85,10 @@ struct ServerFile {
     resp_port: Option<u16>,
     #[serde(default)]
     shard_count: Option<usize>,
+    #[serde(default)]
+    db_path: Option<String>,
+    #[serde(default)]
+    snapshot_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -103,6 +113,11 @@ impl Config {
             resp_host: file.server.resp_host.unwrap_or(server_defaults.resp_host),
             resp_port: file.server.resp_port.unwrap_or(server_defaults.resp_port),
             shard_count: file.server.shard_count.unwrap_or(server_defaults.shard_count),
+            db_path: file.server.db_path,
+            snapshot_interval_ms: file
+                .server
+                .snapshot_interval_ms
+                .unwrap_or(server_defaults.snapshot_interval_ms),
         };
 
         let auth = AuthConfig {
@@ -122,16 +137,38 @@ impl Config {
         resp_host: Option<String>,
         resp_port: Option<u16>,
         shard_count: Option<usize>,
+        db_path: Option<String>,
+        snapshot_interval_ms: Option<u64>,
         auth_tokens: Vec<String>,
         auth_tokens_file: Option<String>,
     ) {
-        if let Some(v) = http_host { self.server.http_host = v; }
-        if let Some(v) = http_port { self.server.http_port = v; }
-        if let Some(v) = resp_host { self.server.resp_host = v; }
-        if let Some(v) = resp_port { self.server.resp_port = v; }
-        if let Some(v) = shard_count { self.server.shard_count = v; }
-        if !auth_tokens.is_empty() { self.auth.tokens = auth_tokens; }
-        if let Some(v) = auth_tokens_file { self.auth.tokens_file = Some(v); }
+        if let Some(v) = http_host {
+            self.server.http_host = v;
+        }
+        if let Some(v) = http_port {
+            self.server.http_port = v;
+        }
+        if let Some(v) = resp_host {
+            self.server.resp_host = v;
+        }
+        if let Some(v) = resp_port {
+            self.server.resp_port = v;
+        }
+        if let Some(v) = shard_count {
+            self.server.shard_count = v;
+        }
+        if let Some(v) = db_path {
+            self.server.db_path = Some(v);
+        }
+        if let Some(v) = snapshot_interval_ms {
+            self.server.snapshot_interval_ms = v;
+        }
+        if !auth_tokens.is_empty() {
+            self.auth.tokens = auth_tokens;
+        }
+        if let Some(v) = auth_tokens_file {
+            self.auth.tokens_file = Some(v);
+        }
     }
 
     /// Load auth tokens from the tokens file + CLI tokens.
@@ -256,6 +293,8 @@ mod tests {
         assert_eq!(config.server.http_port, 7380);
         assert_eq!(config.server.resp_port, 6380);
         assert_eq!(config.server.shard_count, 64);
+        assert!(config.server.db_path.is_none());
+        assert_eq!(config.server.snapshot_interval_ms, 60_000);
         assert!(config.auth.tokens_file.is_none());
         assert!(config.auth.tokens.is_empty());
     }
@@ -267,6 +306,8 @@ mod tests {
 http_port = 8080
 resp_port = 6379
 shard_count = 128
+db_path = "/var/lib/basalt"
+snapshot_interval_ms = 30000
 
 [auth]
 tokens_file = "/etc/basalt/tokens.txt"
@@ -281,7 +322,12 @@ tokens_file = "/etc/basalt/tokens.txt"
         assert_eq!(config.server.resp_port, 6379);
         assert_eq!(config.server.shard_count, 128);
         assert_eq!(config.server.http_host, "127.0.0.1"); // default
-        assert_eq!(config.auth.tokens_file, Some("/etc/basalt/tokens.txt".to_string()));
+        assert_eq!(config.server.db_path, Some("/var/lib/basalt".to_string()));
+        assert_eq!(config.server.snapshot_interval_ms, 30_000);
+        assert_eq!(
+            config.auth.tokens_file,
+            Some("/etc/basalt/tokens.txt".to_string())
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -300,6 +346,8 @@ http_port = 9999
         let config = Config::from_file(&path).unwrap();
         assert_eq!(config.server.http_port, 9999);
         assert_eq!(config.server.resp_port, 6380); // default
+        assert!(config.server.db_path.is_none()); // default
+        assert_eq!(config.server.snapshot_interval_ms, 60_000); // default
         assert!(config.auth.tokens_file.is_none()); // default
 
         std::fs::remove_dir_all(&dir).ok();
@@ -314,6 +362,8 @@ http_port = 9999
             None,
             None,
             Some(32),
+            Some("/data/basalt".to_string()),
+            Some(10_000u64),
             vec!["bsk-test:*".to_string()],
             Some("/path/to/tokens".to_string()),
         );
@@ -321,6 +371,8 @@ http_port = 9999
         assert_eq!(config.server.http_port, 9000);
         assert_eq!(config.server.resp_host, "127.0.0.1"); // unchanged
         assert_eq!(config.server.shard_count, 32);
+        assert_eq!(config.server.db_path, Some("/data/basalt".to_string()));
+        assert_eq!(config.server.snapshot_interval_ms, 10_000);
         assert_eq!(config.auth.tokens, vec!["bsk-test:*"]);
         assert_eq!(config.auth.tokens_file, Some("/path/to/tokens".to_string()));
     }
@@ -333,7 +385,10 @@ http_port = 9999
         );
         assert_eq!(
             parse_token_spec("bsk-agent1:agent-1,shared"),
-            Some(("bsk-agent1".to_string(), vec!["agent-1".to_string(), "shared".to_string()]))
+            Some((
+                "bsk-agent1".to_string(),
+                vec!["agent-1".to_string(), "shared".to_string()]
+            ))
         );
         assert_eq!(parse_token_spec("no-colon"), None);
         assert_eq!(parse_token_spec("token:"), None); // empty namespaces
@@ -357,8 +412,17 @@ http_port = 9999
         let tokens = load_tokens_file(&path).unwrap();
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0], ("bsk-admin".to_string(), vec!["*".to_string()]));
-        assert_eq!(tokens[1], ("bsk-agent1".to_string(), vec!["agent-1".to_string(), "shared".to_string()]));
-        assert_eq!(tokens[2], ("bsk-agent2".to_string(), vec!["agent-2".to_string()]));
+        assert_eq!(
+            tokens[1],
+            (
+                "bsk-agent1".to_string(),
+                vec!["agent-1".to_string(), "shared".to_string()]
+            )
+        );
+        assert_eq!(
+            tokens[2],
+            ("bsk-agent2".to_string(), vec!["agent-2".to_string()])
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

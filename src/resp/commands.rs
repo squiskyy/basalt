@@ -8,11 +8,12 @@ use super::parser::{Command, RespValue};
 /// Handles RESP commands by dispatching to the KvEngine.
 pub struct CommandHandler {
     engine: Arc<KvEngine>,
+    db_path: Option<String>,
 }
 
 impl CommandHandler {
-    pub fn new(engine: Arc<KvEngine>) -> Self {
-        CommandHandler { engine }
+    pub fn new(engine: Arc<KvEngine>, db_path: Option<String>) -> Self {
+        CommandHandler { engine, db_path }
     }
 
     /// Dispatch a command and return a RESP value response.
@@ -32,6 +33,7 @@ impl CommandHandler {
             "MGETT" => self.handle_mgett(cmd),
             "MSCAN" => self.handle_mscan(cmd),
             "MTYPE" => self.handle_mtype(cmd),
+            "SNAP" => self.handle_snap(cmd),
             // AUTH is handled separately in the connection handler
             "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
@@ -307,6 +309,26 @@ impl CommandHandler {
             None => RespValue::SimpleString("none".to_string()),
         }
     }
+
+    fn handle_snap(&self, _cmd: &Command) -> RespValue {
+        // SNAP — trigger a manual snapshot to disk
+        match &self.db_path {
+            Some(db_path) => {
+                let path = std::path::Path::new(db_path);
+                match crate::store::persistence::snapshot(path, &self.engine, 3) {
+                    Ok(snapshot_path) => {
+                        let entries = crate::store::persistence::collect_entries(&self.engine).len();
+                        RespValue::BulkString(Some(
+                            format!("OK snapshot saved: {} ({} entries)", snapshot_path.display(), entries)
+                                .into_bytes(),
+                        ))
+                    }
+                    Err(e) => RespValue::Error(format!("ERR snapshot failed: {e}")),
+                }
+            }
+            None => RespValue::Error("ERR no db_path configured; persistence is disabled".to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,7 +336,7 @@ mod tests {
     use super::*;
 
     fn make_handler() -> CommandHandler {
-        CommandHandler::new(Arc::new(KvEngine::new(4)))
+        CommandHandler::new(Arc::new(KvEngine::new(4)), None)
     }
 
     #[test]

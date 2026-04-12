@@ -21,11 +21,12 @@ pub async fn run(
     port: u16,
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    db_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((host, port)).await?;
     tracing::info!("RESP server listening on {host}:{port}");
 
-    let handler = Arc::new(CommandHandler::new(engine));
+    let handler = Arc::new(CommandHandler::new(engine, db_path));
     let auth_enabled = auth.is_enabled();
 
     loop {

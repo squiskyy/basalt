@@ -16,12 +16,21 @@ resp_port = 6380
 # Must be a power of 2. Default: 64
 shard_count = 64
 
+# Directory for persistence snapshots
+# When set, snapshots are written to this directory.
+# On startup, the latest snapshot is loaded automatically.
+# db_path = "/var/lib/basalt"
+
+# How often to auto-snapshot (milliseconds). Default: 60000 (60s)
+# Set to 0 to disable auto-snapshots (manual only via POST /snapshot or SNAP command).
+# snapshot_interval_ms = 60000
+
 [auth]
 # Path to a tokens file (one token per line)
 # Format: <token> <namespace1> [namespace2 ...]
 # Use * for wildcard (all namespaces)
 # Lines starting with # are comments, blank lines ignored.
-tokens_file = "/etc/basalt/tokens.txt"
+# tokens_file = "/etc/basalt/tokens.txt"
 
 # You can also set tokens directly in CLI args:
 #   basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared"

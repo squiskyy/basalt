@@ -16,21 +16,27 @@ use super::models::{
     InfoResponse, ListQuery, ListResponse, SimpleResponse, StoreRequest, StoreResponse,
 };
 
-/// Shared application state wrapping the KV engine and auth store.
+/// Shared application state wrapping the KV engine, auth store, and optional db_path.
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<KvEngine>,
     pub auth: Arc<AuthStore>,
+    pub db_path: Option<String>,
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
-pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>) -> Router {
-    let state = AppState { engine, auth };
+pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>) -> Router {
+    let state = AppState {
+        engine,
+        auth,
+        db_path,
+    };
 
     // Public routes (no auth)
     let public = Router::new()
         .route("/health", get(health))
-        .route("/info", get(info));
+        .route("/info", get(info))
+        .route("/snapshot", post(trigger_snapshot));
 
     // Protected routes (auth middleware)
     let protected = Router::new()
@@ -255,4 +261,48 @@ async fn batch_get(
         },
     };
     (StatusCode::OK, axum::Json(resp))
+}
+
+// --- Snapshot handler ---
+
+async fn trigger_snapshot(State(state): State<AppState>) -> impl IntoResponse {
+    match &state.db_path {
+        Some(db_path) => {
+            let path = std::path::Path::new(db_path);
+            match crate::store::persistence::snapshot(path, &state.engine, 3) {
+                Ok(snapshot_path) => {
+                    let entries = crate::store::persistence::collect_entries(&state.engine).len();
+                    let resp = SnapshotResponse {
+                        ok: true,
+                        path: snapshot_path.to_string_lossy().to_string(),
+                        entries,
+                    };
+                    (StatusCode::OK, axum::Json(resp)).into_response()
+                }
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(SimpleResponse {
+                        ok: false,
+                        deleted: None,
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+        None => (
+            StatusCode::PRECONDITION_FAILED,
+            axum::Json(SimpleResponse {
+                ok: false,
+                deleted: None,
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct SnapshotResponse {
+    ok: bool,
+    path: String,
+    entries: usize,
 }

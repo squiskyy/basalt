@@ -337,12 +337,46 @@ AUTH bsk-wrong       → -ERR invalid token
 PING (no auth)       → -NOAUTH Authentication required
 ```
 
+## Persistence
+
+Basalt supports optional disk persistence via snapshots. When `db_path` is configured, the engine writes binary snapshots to disk and restores them on startup.
+
+### Config
+
+```toml
+[server]
+db_path = "/var/lib/basalt"          # directory for snapshots
+snapshot_interval_ms = 60000          # auto-snapshot every 60s (default), 0 = disabled
+```
+
+Or via CLI:
+```bash
+basalt --db-path /var/lib/basalt --snapshot-interval 30000
+```
+
+### Manual snapshots
+
+Trigger a snapshot on demand:
+
+- **HTTP**: `POST /snapshot` → `{"ok":true,"path":"...","entries":42}`
+- **RESP**: `SNAP` → `$72\r\nOK snapshot saved: /var/lib/basalt/snapshot-1712951000.bin (42 entries)\r\n`
+
+Returns `412` (HTTP) or `-ERR no db_path configured` (RESP) if persistence is disabled.
+
+### How it works
+
+- **Format**: Custom binary — magic header + version + length-prefixed entries (key, value, memory_type, expires_at)
+- **Atomic writes**: Snapshot goes to a `.tmp` file, then renamed to final path (no partial reads)
+- **Auto-pruning**: Keeps the last 3 snapshots, removes older ones automatically
+- **Startup**: Loads the latest snapshot from `db_path`, skips expired entries
+- **Episodic memories**: TTL is preserved in snapshots — expired entries are skipped on load
+
 ## Roadmap
 
 - [x] **SIMD RESP parsing** — memchr-powered CRLF scanning (AVX2/SSE2 on x86_64, NEON on aarch64)
 - [x] **Batch endpoints** — POST /store/{ns}/batch and /store/{ns}/batch/get
 - [x] **Auth** — bearer tokens with namespace scoping (HTTP + RESP AUTH command)
-- [ ] Persistence — async mmap snapshots
+- [x] **Persistence** — binary snapshots with auto-interval, manual trigger, startup restore
 - [ ] Vector search — HNSW index for semantic memory embeddings
 - [ ] io_uring RESP server — zero-syscall I/O for Linux (feature flag ready, `--features io-uring`)
 - [ ] Replication — primary-replica async replication
