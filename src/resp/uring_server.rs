@@ -6,16 +6,19 @@
 ///
 /// Architecture:
 /// - Multishot Accept: one SQE returns all new connections
-/// - Per-connection state machine: Accept → Read → Process → Write → Read
+/// - Per-connection state machine: Accept -> Read -> Process -> Write -> Read
 /// - Pre-allocated buffer pool with per-connection read buffers
 /// - Batched write serialization (same pipelining as tokio server)
 ///
 /// Safety: All buffer pointers passed to io_uring are heap-allocated and
 /// pinned via Box. Connections are stored in a slab that is pre-allocated
-/// to avoid reallocation while operations are in flight.
+/// to MAX_CONNECTIONS to avoid reallocation. Write buffers are stored
+/// in a separate HashMap so that slab reallocations cannot invalidate
+/// pointers to in-flight write data.
 ///
 /// Gated behind `--features io-uring`. Requires Linux kernel 5.19+.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
@@ -32,8 +35,10 @@ use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
 const RING_SIZE: u32 = 1024;
 const READ_BUF_SIZE: usize = 8192;
-/// Max connections — slab is pre-allocated to avoid reallocation.
-const MAX_CONNECTIONS: usize = 4096;
+/// Max connections - slab is pre-allocated to avoid reallocation.
+/// Connections beyond this limit are rejected to prevent slab reallocation
+/// which would invalidate pointers referenced by in-flight io_uring ops.
+const MAX_CONNECTIONS: usize = 1024;
 
 /// Token types for tracking in-flight io_uring operations.
 #[derive(Clone, Debug)]
@@ -43,14 +48,11 @@ enum Token {
     Write { fd: i32, conn_id: usize },
 }
 
-/// Per-connection state.
+/// Per-connection state. Write buffers are stored separately in a HashMap
+/// to guarantee stable addresses even if the slab reallocates.
 struct Connection {
     /// Accumulated incoming RESP data.
     read_buf: Vec<u8>,
-    /// Response data being written (kept alive until write completes).
-    write_buf: Option<Vec<u8>>,
-    /// Bytes of write_buf already sent.
-    write_progress: usize,
     /// Auth state.
     authenticated: bool,
     auth_token: Option<String>,
@@ -77,9 +79,16 @@ pub fn run(
     let mut tokens: slab::Slab<Token> = slab::Slab::with_capacity(MAX_CONNECTIONS * 2);
     let mut backlog: VecDeque<squeue::Entry> = VecDeque::with_capacity(256);
 
-    // Separate map for read staging buffers — Box<Vec<u8>> gives us stable pointers.
-    let mut read_bufs: std::collections::HashMap<usize, Box<[u8; READ_BUF_SIZE]>> =
-        std::collections::HashMap::with_capacity(MAX_CONNECTIONS);
+    // Separate map for read staging buffers - Box ensures stable pointers.
+    let mut read_bufs: HashMap<usize, Box<[u8; READ_BUF_SIZE]>> =
+        HashMap::with_capacity(MAX_CONNECTIONS);
+
+    // Separate map for write buffers - ensures stable pointers for in-flight
+    // io_uring write operations, independent of slab reallocation.
+    // This prevents use-after-free if the slab ever reallocates despite
+    // pre-allocation (defence in depth).
+    let mut write_bufs: HashMap<usize, Vec<u8>> = HashMap::with_capacity(MAX_CONNECTIONS);
+    let mut write_progress: HashMap<usize, usize> = HashMap::with_capacity(MAX_CONNECTIONS);
 
     let handler = Arc::new(CommandHandler::new(engine, db_path));
     let auth_enabled = auth.is_enabled();
@@ -139,6 +148,8 @@ pub fn run(
                             &mut connections,
                             &mut tokens,
                             &mut read_bufs,
+                            &mut write_bufs,
+                            &mut write_progress,
                         );
                     }
                     Some(Token::Write { fd, conn_id }) => {
@@ -150,6 +161,8 @@ pub fn run(
                             &mut connections,
                             &mut tokens,
                             &mut read_bufs,
+                            &mut write_bufs,
+                            &mut write_progress,
                         );
                     }
                     None => {}
@@ -162,10 +175,21 @@ pub fn run(
                     let fd = result;
                     set_nonblocking(fd);
 
+                    // Reject connections beyond MAX_CONNECTIONS to prevent
+                    // slab reallocation which would cause use-after-free for
+                    // in-flight io_uring operations.
+                    if connections.len() >= MAX_CONNECTIONS {
+                        tracing::warn!(
+                            "rejecting connection fd={fd}: at MAX_CONNECTIONS ({MAX_CONNECTIONS})"
+                        );
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        continue;
+                    }
+
                     let conn_id = connections.insert(Connection {
                         read_buf: Vec::with_capacity(READ_BUF_SIZE),
-                        write_buf: None,
-                        write_progress: 0,
                         authenticated: !auth_enabled,
                         auth_token: None,
                     });
@@ -174,6 +198,10 @@ pub fn run(
                     let read_buf = Box::new([0u8; READ_BUF_SIZE]);
                     let read_ptr = read_buf.as_ptr() as *mut u8;
                     read_bufs.insert(conn_id, read_buf);
+
+                    // Initialize write state in separate HashMaps
+                    write_bufs.insert(conn_id, Vec::new());
+                    write_progress.insert(conn_id, 0);
 
                     let read_token = tokens.insert(Token::Read { fd, conn_id });
 
@@ -200,6 +228,8 @@ pub fn run(
                             &mut connections,
                             &mut tokens,
                             &mut read_bufs,
+                            &mut write_bufs,
+                            &mut write_progress,
                         );
                         continue;
                     }
@@ -229,7 +259,7 @@ pub fn run(
                     }
 
                     if values.is_empty() {
-                        // No complete command yet — read more
+                        // No complete command yet - read more
                         if let Some(rbuf) = read_bufs.get(&conn_id) {
                             let ptr = rbuf.as_ptr() as *mut u8;
                             tokens[token_idx] = Token::Read { fd, conn_id };
@@ -289,11 +319,13 @@ pub fn run(
                     if !responses.is_empty() {
                         let out = serialize_pipeline(&responses);
                         let out_len = out.len();
-                        conn.write_buf = Some(out);
-                        conn.write_progress = 0;
+                        // Store write buffer in the separate HashMap for stable address
+                        write_bufs.insert(conn_id, out);
+                        write_progress.insert(conn_id, 0);
 
                         tokens[token_idx] = Token::Write { fd, conn_id };
-                        let ptr = conn.write_buf.as_ref().unwrap().as_ptr();
+                        // Get pointer from the separate write_bufs HashMap
+                        let ptr = write_bufs.get(&conn_id).unwrap().as_ptr();
                         let write_e = opcode::Send::new(types::Fd(fd), ptr, out_len as _)
                             .build()
                             .user_data(token_idx as u64);
@@ -306,7 +338,7 @@ pub fn run(
                             }
                         }
                     } else {
-                        // No response — read more
+                        // No response - read more
                         if let Some(rbuf) = read_bufs.get(&conn_id) {
                             let ptr = rbuf.as_ptr() as *mut u8;
                             tokens[token_idx] = Token::Read { fd, conn_id };
@@ -327,27 +359,26 @@ pub fn run(
 
                 Some(Token::Write { fd, conn_id }) => {
                     let written = result as usize;
-                    let conn = match connections.get_mut(conn_id) {
-                        Some(c) => c,
-                        None => {
-                            tokens.remove(token_idx);
-                            continue;
-                        }
-                    };
+                    let conn_exists = connections.contains(conn_id);
+                    if !conn_exists {
+                        tokens.remove(token_idx);
+                        continue;
+                    }
 
-                    conn.write_progress += written;
-                    let total = conn.write_buf.as_ref().map_or(0, |b| b.len());
+                    let progress = write_progress.get(&conn_id).copied().unwrap_or(0) + written;
+                    write_progress.insert(conn_id, progress);
+                    let total = write_bufs.get(&conn_id).map_or(0, |b| b.len());
 
-                    if conn.write_progress < total {
-                        // Partial write — send remaining bytes
+                    if progress < total {
+                        // Partial write - send remaining bytes using stable write_buf pointer
                         let ptr = unsafe {
-                            conn.write_buf
-                                .as_ref()
+                            write_bufs
+                                .get(&conn_id)
                                 .unwrap()
                                 .as_ptr()
-                                .add(conn.write_progress)
+                                .add(progress)
                         };
-                        let remaining = total - conn.write_progress;
+                        let remaining = total - progress;
                         let write_e = opcode::Send::new(types::Fd(fd), ptr, remaining as _)
                             .build()
                             .user_data(token_idx as u64);
@@ -360,9 +391,9 @@ pub fn run(
                             }
                         }
                     } else {
-                        // Write complete — submit another read
-                        conn.write_buf = None;
-                        conn.write_progress = 0;
+                        // Write complete - clear write buffer and submit another read
+                        write_bufs.insert(conn_id, Vec::new());
+                        write_progress.insert(conn_id, 0);
                         if let Some(rbuf) = read_bufs.get(&conn_id) {
                             let ptr = rbuf.as_ptr() as *mut u8;
                             tokens[token_idx] = Token::Read { fd, conn_id };
@@ -428,7 +459,9 @@ fn close_conn(
     token_idx: usize,
     connections: &mut slab::Slab<Connection>,
     tokens: &mut slab::Slab<Token>,
-    read_bufs: &mut std::collections::HashMap<usize, Box<[u8; READ_BUF_SIZE]>>,
+    read_bufs: &mut HashMap<usize, Box<[u8; READ_BUF_SIZE]>>,
+    write_bufs: &mut HashMap<usize, Vec<u8>>,
+    write_progress: &mut HashMap<usize, usize>,
 ) {
     if connections.contains(conn_id) {
         connections.remove(conn_id);
@@ -437,6 +470,8 @@ fn close_conn(
         tokens.remove(token_idx);
     }
     read_bufs.remove(&conn_id);
+    write_bufs.remove(&conn_id);
+    write_progress.remove(&conn_id);
     unsafe {
         libc::close(fd);
     }
