@@ -1,6 +1,6 @@
 # Basalt configuration file
 #
-# Place at ~/.config/basalt/basalt.toml or pass via --config path
+# Place at /etc/basalt/basalt.toml or pass via --config path
 # CLI flags override values set here.
 
 [server]
@@ -25,6 +25,30 @@ shard_count = 64
 # Set to 0 to disable auto-snapshots (manual only via POST /snapshot or SNAP command).
 # snapshot_interval_ms = 60000
 
+# How often to sweep expired entries (milliseconds). Default: 30000 (30s)
+# Set to 0 to disable background sweeping (expired entries still cleaned on read).
+# sweep_interval_ms = 30000
+
+# Maximum entries per shard. Default: 1000000
+# When a shard is at capacity, new keys are rejected.
+# Updates to existing keys always succeed.
+# max_entries = 1000000
+
+# Minimum value size (bytes) to LZ4-compress in snapshots. Default: 1024
+# Set to 0 to disable snapshot compression.
+# snapshot_compression_threshold = 1024
+
+# Minimum value size (bytes) to LZ4-compress values in memory at runtime. Default: 1024
+# Set to 0 to disable runtime compression.
+# compression_threshold = 1024
+
+# WAL size for replication (number of entries to keep). Default: 10000
+# Larger values give replicas more time to catch up after disconnects.
+# wal_size = 10000
+
+# Use io_uring for the RESP server (Linux only, requires --features io-uring)
+# io_uring = false
+
 [auth]
 # Path to a tokens file (one token per line)
 # Format: <token> <namespace1> [namespace2 ...]
@@ -32,6 +56,6 @@ shard_count = 64
 # Lines starting with # are comments, blank lines ignored.
 # tokens_file = "/etc/basalt/tokens.txt"
 
-# You can also set tokens directly in CLI args:
+# You can also set tokens directly via CLI args:
 #   basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared"
 # CLI tokens override file tokens with the same value.
