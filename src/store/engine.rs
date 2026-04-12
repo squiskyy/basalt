@@ -214,7 +214,7 @@ impl KvEngine {
     pub fn count_prefix(&self, prefix: &str) -> usize {
         let mut count = 0;
         for shard in &self.shards {
-            count += shard.scan_prefix(prefix).len();
+            count += shard.count_prefix(prefix);
         }
         count
     }
@@ -423,6 +423,25 @@ mod tests {
 
         let result = engine.get("big_key").unwrap();
         assert_eq!(result, large_value);
+    }
+
+    #[test]
+    fn test_engine_count_prefix() {
+        let engine = KvEngine::new(4);
+        engine.set("ns:a", b"1".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set("ns:b", b"2".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set("other:c", b"3".to_vec(), None, MemoryType::Semantic).unwrap();
+        assert_eq!(engine.count_prefix("ns:"), 2);
+        assert_eq!(engine.count_prefix("other:"), 1);
+        assert_eq!(engine.count_prefix("missing:"), 0);
+    }
+
+    #[test]
+    fn test_engine_count_prefix_skips_expired() {
+        let engine = KvEngine::new(4);
+        engine.set("ns:live", b"1".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set("ns:exp", b"2".to_vec(), Some(0), MemoryType::Episodic).unwrap();
+        assert_eq!(engine.count_prefix("ns:"), 1);
     }
 
     #[test]

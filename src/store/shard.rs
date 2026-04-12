@@ -207,6 +207,19 @@ impl Shard {
         removed
     }
 
+    /// Return all keys that start with `prefix`, without decompressing values
+    /// or building Entry structs. Useful when only keys are needed (e.g. delete,
+    /// count) to avoid the cost of decompression.
+    /// Skips expired entries.
+    pub fn keys_prefix(&self, prefix: &str) -> Vec<String> {
+        let now = now_ms();
+        let pin = self.map.pin();
+        pin.iter()
+            .filter(|(k, v)| k.starts_with(prefix) && !v.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Scan all entries whose keys start with `prefix`, returning (key, entry) pairs.
     /// Skips expired entries (lazily removing them).
     /// Returned entries have their values decompressed.
@@ -235,6 +248,17 @@ impl Shard {
             }
         }
         results
+    }
+
+    /// Count entries whose keys start with `prefix`, skipping expired ones.
+    /// Unlike `scan_prefix`, this does not decompress values or allocate a
+    /// result vector, making it much cheaper when you only need the count.
+    pub fn count_prefix(&self, prefix: &str) -> usize {
+        let now = now_ms();
+        let pin = self.map.pin();
+        pin.iter()
+            .filter(|(k, v)| k.starts_with(prefix) && !v.is_expired(now))
+            .count()
     }
 
     /// Reap all expired entries from this shard.
@@ -267,13 +291,7 @@ impl Shard {
     /// Remove all entries whose keys start with `prefix`.
     /// Returns the number of entries removed.
     pub fn delete_prefix(&self, prefix: &str) -> usize {
-        let keys_to_remove: Vec<String> = {
-            let pin = self.map.pin();
-            pin.iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
+        let keys_to_remove = self.keys_prefix(prefix);
         let removed = keys_to_remove.len();
         for key in &keys_to_remove {
             self.delete(key);
@@ -512,6 +530,32 @@ mod tests {
                 assert!(!entry.compressed);
             }
         }
+    }
+
+    #[test]
+    fn test_shard_count_prefix() {
+        let shard = Shard::new();
+        for (k, v) in [
+            ("ns:a", b"1".to_vec()),
+            ("ns:b", b"2".to_vec()),
+            ("other:c", b"3".to_vec()),
+        ] {
+            shard
+                .set(k.into(), make_entry(v, None, MemoryType::Semantic))
+                .unwrap();
+        }
+        assert_eq!(shard.count_prefix("ns:"), 2);
+        assert_eq!(shard.count_prefix("other:"), 1);
+        assert_eq!(shard.count_prefix("missing:"), 0);
+    }
+
+    #[test]
+    fn test_shard_count_prefix_skips_expired() {
+        let shard = Shard::new();
+        shard.set("ns:live".into(), make_entry(b"1".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard.set("ns:exp".into(), make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
+        // expired entry should not be counted
+        assert_eq!(shard.count_prefix("ns:"), 1);
     }
 
     #[test]
