@@ -559,6 +559,31 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_keys_prefix() {
+        let shard = Shard::with_max_entries_and_threshold(100, 10);
+        // Insert a large compressible value to verify keys_prefix avoids decompression
+        let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
+        shard.set("ns:big".into(), make_entry(big_val, None, MemoryType::Semantic)).unwrap();
+        shard.set("ns:small".into(), make_entry(b"tiny".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard.set("other:x".into(), make_entry(b"nope".to_vec(), None, MemoryType::Semantic)).unwrap();
+
+        let keys = shard.keys_prefix("ns:");
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"ns:big".to_string()));
+        assert!(keys.contains(&"ns:small".to_string()));
+        assert!(!keys.contains(&"other:x".to_string()));
+    }
+
+    #[test]
+    fn test_shard_keys_prefix_skips_expired() {
+        let shard = Shard::new();
+        shard.set("ns:live".into(), make_entry(b"1".to_vec(), None, MemoryType::Semantic)).unwrap();
+        shard.set("ns:exp".into(), make_entry(b"2".to_vec(), Some(1), MemoryType::Episodic)).unwrap();
+        let keys = shard.keys_prefix("ns:");
+        assert_eq!(keys, vec!["ns:live".to_string()]);
+    }
+
+    #[test]
     fn test_shard_set_force_with_compression() {
         let shard = Shard::with_max_entries_and_threshold(100, 10);
 
