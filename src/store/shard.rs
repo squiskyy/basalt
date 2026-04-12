@@ -109,6 +109,27 @@ impl Shard {
         results
     }
 
+    /// Reap all expired entries from this shard.
+    ///
+    /// Uses the two-pass pattern (same as delete_prefix): first collect expired
+    /// keys, then delete them, to avoid modifying the map during iteration.
+    /// Returns the number of entries reaped.
+    pub fn reap_expired(&self) -> usize {
+        let now = now_ms();
+        let expired_keys: Vec<String> = {
+            let pin = self.map.pin();
+            pin.iter()
+                .filter(|(_, v)| v.is_expired(now))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        let reaped = expired_keys.len();
+        for key in &expired_keys {
+            self.delete(key);
+        }
+        reaped
+    }
+
     /// Approximate number of entries in this shard (may include some expired
     /// entries that haven't been lazily cleaned yet).
     pub fn len(&self) -> usize {
@@ -202,5 +223,60 @@ mod tests {
         }
         let results = shard.scan_prefix("ns:");
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_shard_reap_expired() {
+        let shard = Shard::new();
+        // Insert some entries: two expired, one still live
+        shard.set(
+            "exp1".into(),
+            Entry {
+                value: b"expired1".to_vec(),
+                expires_at: Some(1), // already expired
+                memory_type: MemoryType::Episodic,
+            },
+        );
+        shard.set(
+            "exp2".into(),
+            Entry {
+                value: b"expired2".to_vec(),
+                expires_at: Some(1),
+                memory_type: MemoryType::Episodic,
+            },
+        );
+        shard.set(
+            "live".into(),
+            Entry {
+                value: b"alive".to_vec(),
+                expires_at: None,
+                memory_type: MemoryType::Semantic,
+            },
+        );
+        // Before reap: count includes expired entries
+        assert_eq!(shard.len(), 3);
+
+        let reaped = shard.reap_expired();
+        assert_eq!(reaped, 2);
+        assert_eq!(shard.len(), 1);
+        assert!(shard.get("live").is_some());
+        assert!(shard.get("exp1").is_none());
+        assert!(shard.get("exp2").is_none());
+    }
+
+    #[test]
+    fn test_shard_reap_expired_none_expired() {
+        let shard = Shard::new();
+        shard.set(
+            "key1".into(),
+            Entry {
+                value: b"val".to_vec(),
+                expires_at: None,
+                memory_type: MemoryType::Semantic,
+            },
+        );
+        let reaped = shard.reap_expired();
+        assert_eq!(reaped, 0);
+        assert_eq!(shard.len(), 1);
     }
 }

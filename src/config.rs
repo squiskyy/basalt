@@ -33,6 +33,8 @@ pub struct ServerConfig {
     pub db_path: Option<String>,
     /// How often to auto-snapshot to disk (milliseconds). 0 = disabled.
     pub snapshot_interval_ms: u64,
+    /// How often to sweep expired entries (milliseconds). 0 = disabled.
+    pub sweep_interval_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ impl Default for ServerConfig {
             io_uring: false,
             db_path: None,
             snapshot_interval_ms: 60_000,
+            sweep_interval_ms: 30_000,
         }
     }
 }
@@ -97,6 +100,8 @@ struct ServerFile {
     db_path: Option<String>,
     #[serde(default)]
     snapshot_interval_ms: Option<u64>,
+    #[serde(default)]
+    sweep_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -128,6 +133,10 @@ impl Config {
                 .server
                 .snapshot_interval_ms
                 .unwrap_or(server_defaults.snapshot_interval_ms),
+            sweep_interval_ms: file
+                .server
+                .sweep_interval_ms
+                .unwrap_or(server_defaults.sweep_interval_ms),
         };
 
         let auth = AuthConfig {
@@ -150,6 +159,7 @@ impl Config {
         #[cfg(feature = "io-uring")] io_uring: Option<bool>,
         db_path: Option<String>,
         snapshot_interval_ms: Option<u64>,
+        sweep_interval_ms: Option<u64>,
         auth_tokens: Vec<String>,
         auth_tokens_file: Option<String>,
     ) {
@@ -177,6 +187,9 @@ impl Config {
         }
         if let Some(v) = snapshot_interval_ms {
             self.server.snapshot_interval_ms = v;
+        }
+        if let Some(v) = sweep_interval_ms {
+            self.server.sweep_interval_ms = v;
         }
         if !auth_tokens.is_empty() {
             self.auth.tokens = auth_tokens;
@@ -381,6 +394,7 @@ http_port = 9999
             None, // io_uring
             Some("/data/basalt".to_string()),
             Some(10_000u64),
+            Some(5_000u64), // sweep_interval_ms
             vec!["bsk-test:*".to_string()],
             Some("/path/to/tokens".to_string()),
         );
@@ -390,6 +404,7 @@ http_port = 9999
         assert_eq!(config.server.shard_count, 32);
         assert_eq!(config.server.db_path, Some("/data/basalt".to_string()));
         assert_eq!(config.server.snapshot_interval_ms, 10_000);
+        assert_eq!(config.server.sweep_interval_ms, 5_000);
         assert_eq!(config.auth.tokens, vec!["bsk-test:*"]);
         assert_eq!(config.auth.tokens_file, Some("/path/to/tokens".to_string()));
     }

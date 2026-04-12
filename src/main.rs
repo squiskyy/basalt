@@ -48,6 +48,10 @@ struct Args {
     #[arg(long, value_name = "MS")]
     snapshot_interval: Option<u64>,
 
+    /// Expired-entry sweep interval in milliseconds (overrides config file, 0 = disabled)
+    #[arg(long, value_name = "MS")]
+    sweep_interval: Option<u64>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -98,6 +102,7 @@ async fn main() {
         args.io_uring.then_some(true),
         args.db_path,
         args.snapshot_interval,
+        args.sweep_interval,
         args.auth,
         args.auth_file,
     );
@@ -158,9 +163,38 @@ async fn main() {
                 snap_engine,
                 snap_interval,
                 3, // keep last 3 snapshots
-                shutdown_rx,
+                shutdown_rx.clone(),
             ));
         }
+    }
+
+    // Start expired-entry sweep loop if configured
+    if cfg.server.sweep_interval_ms > 0 {
+        let sweep_engine = engine.clone();
+        let sweep_interval = cfg.server.sweep_interval_ms;
+        let mut sweep_shutdown = shutdown_rx.clone();
+        info!(
+            "expired-entry sweep enabled: every {}ms",
+            sweep_interval
+        );
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(sweep_interval)) => {
+                        let reaped = sweep_engine.reap_all_expired().await;
+                        if reaped > 0 {
+                            tracing::debug!("sweep: reaped {reaped} expired entries");
+                        }
+                    }
+                    _ = sweep_shutdown.changed() => {
+                        tracing::info!("expired-entry sweep shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        info!("expired-entry sweep: disabled (interval = 0)");
     }
 
     // Start both servers concurrently

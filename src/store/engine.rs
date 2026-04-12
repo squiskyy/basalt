@@ -134,6 +134,19 @@ impl KvEngine {
         count
     }
 
+    /// Reap all expired entries across all shards.
+    ///
+    /// Staggers across shards by yielding (tokio::task::yield_now) between
+    /// shards to avoid latency spikes. Returns the total number of reaped entries.
+    pub async fn reap_all_expired(&self) -> usize {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard.reap_expired();
+            tokio::task::yield_now().await;
+        }
+        total
+    }
+
     /// Return the number of shards.
     pub fn shard_count(&self) -> usize {
         self.shards.len()
@@ -165,5 +178,23 @@ mod tests {
     fn test_engine_default() {
         let engine = KvEngine::default();
         assert_eq!(engine.shard_count(), 16);
+    }
+
+    #[tokio::test]
+    async fn test_engine_reap_all_expired() {
+        let engine = KvEngine::new(4);
+        // Insert entries: some expired (TTL=0 means expires_at=now, so is_expired is true),
+        // some live (no TTL)
+        engine.set("expired1", b"val1".to_vec(), Some(0), MemoryType::Episodic);
+        engine.set("expired2", b"val2".to_vec(), Some(0), MemoryType::Episodic);
+        engine.set("live1", b"val3".to_vec(), None, MemoryType::Semantic);
+        engine.set("live2", b"val4".to_vec(), None, MemoryType::Semantic);
+
+        let reaped = engine.reap_all_expired().await;
+        assert_eq!(reaped, 2);
+        assert!(engine.get("live1").is_some());
+        assert!(engine.get("live2").is_some());
+        assert!(engine.get("expired1").is_none());
+        assert!(engine.get("expired2").is_none());
     }
 }
