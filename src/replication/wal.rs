@@ -1,5 +1,6 @@
 use crate::store::memory_type::MemoryType;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Operation type in the WAL.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +51,9 @@ pub struct Wal {
     /// Circular buffer of entries.
     entries: std::sync::Mutex<WalInner>,
     max_size: usize,
+    /// Notify channel signalled after each append, so streaming
+    /// replicas can wake up instead of busy-polling.
+    notify: Arc<tokio::sync::Notify>,
 }
 
 struct WalInner {
@@ -67,7 +71,14 @@ impl Wal {
                 next_seq: 1,
             }),
             max_size: usize::max(max_size, 1),
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Return a handle to the notify channel used to signal new appends.
+    /// The primary streaming loop can await this instead of busy-polling.
+    pub fn notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.notify)
     }
 
     /// Append a new entry, returning its sequence number.
@@ -79,6 +90,9 @@ impl Wal {
             inner.buf.pop_front();
         }
         inner.buf.push_back((seq, entry));
+        drop(inner);
+        // Wake up any streaming replicas waiting for new entries.
+        self.notify.notify_waiters();
         seq
     }
 

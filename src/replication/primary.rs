@@ -91,6 +91,10 @@ pub async fn send_full_resync(
     let mut last_seq = current_seq;
     let mut read_buf = [0u8; 256];
 
+    // Obtain a handle to the WAL notify channel so we can await
+    // new entries instead of busy-polling every 1 ms.
+    let wal_notify = repl_state.wal().notify();
+
     loop {
         // Check for new WAL entries
         let entries = repl_state.wal().entries_from(last_seq + 1);
@@ -115,23 +119,32 @@ pub async fn send_full_resync(
             }
         }
 
-        // Small sleep to avoid busy-polling
-        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-
-        // Check if the replica has disconnected
-        match reader.read(&mut read_buf).await {
-            Ok(0) => {
-                // Replica disconnected
-                tracing::info!("replica disconnected (EOF)");
-                break;
+        // Wait for either a WAL notification or a 100ms safety timeout,
+        // while also checking if the replica has disconnected.
+        tokio::select! {
+            _ = wal_notify.notified() => {
+                // New WAL entry was appended; loop back to drain entries.
             }
-            Ok(_) => {
-                // Replica sent data — for now we ignore it
-                // (a replica might send REPLICAOF or PING)
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                // Safety fallback timeout to avoid missing notifications
+                // due to Notify's single-permit semantics under edge cases.
             }
-            Err(e) => {
-                tracing::debug!("replica read error: {e}");
-                break;
+            result = reader.read(&mut read_buf) => {
+                match result {
+                    Ok(0) => {
+                        // Replica disconnected
+                        tracing::info!("replica disconnected (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        // Replica sent data -- for now we ignore it
+                        // (a replica might send REPLICAOF or PING)
+                    }
+                    Err(e) => {
+                        tracing::debug!("replica read error: {e}");
+                        break;
+                    }
+                }
             }
         }
     }
