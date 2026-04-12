@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -9,23 +10,30 @@ use axum::Router;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 
+use super::auth::{auth_middleware, AuthStore};
 use super::models::{
     BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, HealthResponse,
     InfoResponse, ListQuery, ListResponse, SimpleResponse, StoreRequest, StoreResponse,
 };
 
-/// Shared application state wrapping the KV engine.
+/// Shared application state wrapping the KV engine and auth store.
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<KvEngine>,
+    pub auth: Arc<AuthStore>,
 }
 
-/// Build the axum Router with all routes and shared state.
-pub fn app(engine: Arc<KvEngine>) -> Router {
-    let state = AppState { engine };
-    Router::new()
+/// Build the axum Router with all routes, auth middleware, and shared state.
+pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>) -> Router {
+    let state = AppState { engine, auth };
+
+    // Public routes (no auth)
+    let public = Router::new()
         .route("/health", get(health))
-        .route("/info", get(info))
+        .route("/info", get(info));
+
+    // Protected routes (auth middleware)
+    let protected = Router::new()
         .route("/store/{namespace}", post(store_memory))
         .route("/store/{namespace}", get(list_memories))
         .route("/store/{namespace}", delete(delete_namespace))
@@ -33,6 +41,11 @@ pub fn app(engine: Arc<KvEngine>) -> Router {
         .route("/store/{namespace}/batch/get", post(batch_get))
         .route("/store/{namespace}/{key}", get(get_memory))
         .route("/store/{namespace}/{key}", delete(delete_memory))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    Router::new()
+        .merge(public)
+        .merge(protected)
         .with_state(state)
 }
 

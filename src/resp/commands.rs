@@ -32,6 +32,8 @@ impl CommandHandler {
             "MGETT" => self.handle_mgett(cmd),
             "MSCAN" => self.handle_mscan(cmd),
             "MTYPE" => self.handle_mtype(cmd),
+            // AUTH is handled separately in the connection handler
+            "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
         }
     }

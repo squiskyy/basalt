@@ -242,13 +242,56 @@ Options:
 
 Each agent gets its own namespace (`/store/agent-42/`). The sharded engine distributes keys across 64 independent HashMaps — no global lock, no contention between agents. 400 concurrent HTTP connections is trivial for Tokio's async runtime.
 
+## Authentication
+
+Basalt supports optional bearer token authentication scoped to namespaces. When no tokens are configured, all requests are allowed (auth disabled).
+
+### Starting with auth
+
+```bash
+# Wildcard token (admin access to all namespaces)
+basalt --auth "bsk-admin:*"
+
+# Scoped tokens (specific namespaces only)
+basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared" --auth "bsk-agent2:agent-2"
+```
+
+### HTTP
+
+All `/store/*` endpoints require `Authorization: Bearer <token>` when auth is enabled. `/health` and `/info` remain unauthenticated.
+
+```bash
+# Works — admin has access to everything
+curl -H "Authorization: Bearer bsk-admin" http://localhost:7380/store/agent-1/mem:1
+
+# Works — agent1 has access to agent-1 namespace
+curl -H "Authorization: Bearer bsk-agent1" -X POST http://localhost:7380/store/agent-1 \
+  -d '{"key":"obs:1","value":"saw something","type":"episodic"}'
+
+# 403 — agent1 cannot access agent-2 namespace
+curl -H "Authorization: Bearer bsk-agent1" http://localhost:7380/store/agent-2/mem:1
+
+# 401 — no token at all
+curl http://localhost:7380/store/agent-1/mem:1
+```
+
+### RESP
+
+Redis-compatible `AUTH` command. If auth is enabled, you must authenticate before any other command.
+
+```
+AUTH bsk-admin       → +OK
+AUTH bsk-wrong       → -ERR invalid token
+PING (no auth)       → -NOAUTH Authentication required
+```
+
 ## Roadmap
 
 - [x] **SIMD RESP parsing** — memchr-powered CRLF scanning (AVX2/SSE2 on x86_64, NEON on aarch64)
 - [x] **Batch endpoints** — POST /store/{ns}/batch and /store/{ns}/batch/get
+- [x] **Auth** — bearer tokens with namespace scoping (HTTP + RESP AUTH command)
 - [ ] Persistence — async mmap snapshots
 - [ ] Vector search — HNSW index for semantic memory embeddings
-- [ ] Auth — bearer tokens, namespace-level permissions
 - [ ] io_uring RESP server — zero-syscall I/O for Linux (feature flag ready, `--features io-uring`)
 - [ ] Replication — primary-replica async replication
 - [ ] Compression — LZ4/zstd for values > 1KB

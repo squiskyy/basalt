@@ -29,6 +29,25 @@ struct Args {
     /// Number of shards (rounded to next power of 2)
     #[arg(long, default_value_t = 64)]
     shards: usize,
+
+    /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all namespaces).
+    /// Can be specified multiple times. No tokens = auth disabled.
+    #[arg(long, value_name = "TOKEN")]
+    auth: Vec<String>,
+}
+
+/// Parse an auth token spec: "bsk-abc123:*" or "bsk-agent1:agent-1,shared"
+fn parse_token_spec(spec: &str) -> Option<(String, Vec<String>)> {
+    let (token, namespaces_str) = spec.split_once(':')?;
+    let namespaces = namespaces_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if namespaces.is_empty() {
+        return None;
+    }
+    Some((token.to_string(), namespaces))
 }
 
 #[tokio::main]
@@ -49,21 +68,44 @@ async fn main() {
         shard_count: args.shards,
     };
 
+    // Build auth store from CLI args
+    let auth_store = if args.auth.is_empty() {
+        http::auth::AuthStore::new()
+    } else {
+        let tokens: Vec<(String, Vec<String>)> = args
+            .auth
+            .iter()
+            .filter_map(|spec| parse_token_spec(spec))
+            .collect();
+        if tokens.is_empty() && !args.auth.is_empty() {
+            tracing::warn!("auth tokens specified but none parsed correctly — expected format: token:ns1,ns2 or token:*");
+        }
+        http::auth::AuthStore::from_list(tokens)
+    };
+
     let engine = Arc::new(store::engine::KvEngine::new(config.shard_count));
+    let auth = Arc::new(auth_store);
 
     info!("basalt v{} — memory that moves fast", env!("CARGO_PKG_VERSION"));
     info!("shards: {}", config.shard_count);
+    if auth.is_enabled() {
+        info!("auth: enabled ({} tokens)", auth.list_tokens().len());
+    } else {
+        info!("auth: disabled (no tokens configured)");
+    }
     info!("HTTP:  {}:{}", config.http_host, config.http_port);
     info!("RESP:  {}:{}", config.resp_host, config.resp_port);
 
     // Start both servers concurrently
     let http_engine = engine.clone();
+    let http_auth = auth.clone();
     let resp_engine = engine.clone();
+    let resp_auth = auth.clone();
     let http_config = config.clone();
     let resp_config = config.clone();
 
     let http_server = tokio::spawn(async move {
-        let app = http::server::app(http_engine);
+        let app = http::server::app(http_engine, http_auth);
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         info!("HTTP server listening on {}", addr);
@@ -75,6 +117,7 @@ async fn main() {
             &resp_config.resp_host,
             resp_config.resp_port,
             resp_engine,
+            resp_auth,
         )
         .await
         {
