@@ -39,8 +39,7 @@ pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>,
     // Public routes (no auth)
     let public = Router::new()
         .route("/health", get(health))
-        .route("/info", get(info))
-        .route("/snapshot", post(trigger_snapshot));
+        .route("/info", get(info));
 
     // Protected routes (auth middleware)
     let protected = Router::new()
@@ -52,6 +51,7 @@ pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>,
         .route("/store/{namespace}/batch/get", post(batch_get))
         .route("/store/{namespace}/{key}", get(get_memory))
         .route("/store/{namespace}/{key}", delete(delete_memory))
+        .route("/snapshot", post(trigger_snapshot))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     Router::new()
