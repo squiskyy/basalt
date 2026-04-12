@@ -276,7 +276,7 @@ Episodic memories auto-expire because old observations become stale. Semantic an
                     └─────────────┘
 ```
 
-- **Sharding**: Keys hashed to shards via fxhash (fast, good distribution)
+- **Sharding**: Keys hashed to shards via ahash with per-instance random seed (fast, DoS-resistant distribution)
 - **papaya**: Lock-free concurrent SwissTable — reads scale linearly with cores
 - **TTL**: Per-entry expiry with lazy eviction (checked on read)
 - **Dual protocol**: Same engine, two frontends — no data duplication

@@ -2,9 +2,9 @@ use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, Shard, ShardFullError};
 use crate::store::vector::{HnswIndex, VectorSearchResult, current_version, increment_version};
 use crate::time::now_ms;
-use fxhash::FxHasher;
+use ahash::RandomState;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Mutex;
 
 /// Metadata returned alongside a value when using `get_with_meta`.
@@ -17,8 +17,10 @@ pub struct EntryMeta {
 
 /// The core sharded KV engine.
 ///
-/// Keys are hashed with fxhash and routed to a shard using a bitmask.
-/// The shard count is always a power of 2 for efficient bitmask routing.
+/// Keys are hashed with ahash (randomized per instance) and routed to a shard
+/// using a bitmask. The shard count is always a power of 2 for efficient
+/// bitmask routing. The random seed prevents attackers from crafting keys
+/// that all route to the same shard (hash flooding / DoS).
 pub struct KvEngine {
     shards: Vec<Shard>,
     shard_mask: usize,
@@ -27,6 +29,10 @@ pub struct KvEngine {
     /// Per-namespace HNSW vector indices, protected by a Mutex.
     /// Key: namespace (prefix before the first `:` in a key, or the full key).
     vector_indexes: Mutex<HashMap<String, HnswIndex>>,
+    /// Randomized hash builder for shard routing. Each KvEngine instance
+    /// gets a unique random seed so that hash collisions cannot be
+    /// predicted by an attacker.
+    hash_state: RandomState,
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -62,6 +68,7 @@ impl KvEngine {
             max_entries,
             compression_threshold: 1024,
             vector_indexes: Mutex::new(HashMap::new()),
+            hash_state: RandomState::new(),
         }
     }
 
@@ -84,13 +91,14 @@ impl KvEngine {
             max_entries,
             compression_threshold,
             vector_indexes: Mutex::new(HashMap::new()),
+            hash_state: RandomState::new(),
         }
     }
 
-    /// Route a key to its shard index using fxhash.
+    /// Route a key to its shard index using ahash with a per-instance random seed.
     #[inline]
     fn shard_index(&self, key: &str) -> usize {
-        let mut h = FxHasher::default();
+        let mut h = self.hash_state.build_hasher();
         key.hash(&mut h);
         h.finish() as usize & self.shard_mask
     }
