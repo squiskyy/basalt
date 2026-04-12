@@ -264,9 +264,10 @@ async fn main() {
             let host = resp_config.resp_host.clone();
             let port = resp_config.resp_port;
             let db_path = resp_config.db_path.clone();
+            let uring_repl_state = repl_state.clone();
             // io_uring runs in its own thread (blocking), separate from tokio
             std::thread::spawn(move || {
-                if let Err(e) = resp::uring_server::run(&host, port, resp_engine, resp_auth, db_path) {
+                if let Err(e) = resp::uring_server::run(&host, port, resp_engine, resp_auth, db_path, uring_repl_state) {
                     eprintln!("io_uring RESP server error: {e}");
                 }
             });

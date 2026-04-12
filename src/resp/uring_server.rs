@@ -27,9 +27,10 @@ use std::sync::Arc;
 use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::http::auth::AuthStore;
+use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
 
-use super::commands::{check_command_namespace, CommandHandler};
+use super::commands::{check_command_namespace, CommandHandler, ReplicaofResult};
 use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline, RespValue};
 
@@ -56,6 +57,8 @@ struct Connection {
     /// Auth state.
     authenticated: bool,
     auth_token: Option<String>,
+    /// Whether this connection is currently in replica mode.
+    is_replica: bool,
 }
 
 /// Run the io_uring RESP2 server. Blocks the calling thread.
@@ -65,6 +68,7 @@ pub fn run(
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
     db_path: Option<String>,
+    repl_state: Arc<ReplicationState>,
 ) -> Result<(), RespError> {
     let listener = TcpListener::bind((host, port)).map_err(RespError::Bind)?;
     let listener_fd = listener.as_raw_fd();
@@ -90,7 +94,11 @@ pub fn run(
     let mut write_bufs: HashMap<usize, Vec<u8>> = HashMap::with_capacity(MAX_CONNECTIONS);
     let mut write_progress: HashMap<usize, usize> = HashMap::with_capacity(MAX_CONNECTIONS);
 
-    let handler = Arc::new(CommandHandler::new(engine, db_path));
+    let handler = Arc::new(CommandHandler::with_replication(
+        engine.clone(),
+        db_path,
+        repl_state.clone(),
+    ));
     let auth_enabled = auth.is_enabled();
 
     // Submit multishot accept
@@ -192,6 +200,7 @@ pub fn run(
                         read_buf: Vec::with_capacity(READ_BUF_SIZE),
                         authenticated: !auth_enabled,
                         auth_token: None,
+                        is_replica: false,
                     });
 
                     // Allocate a stable read buffer (Box ensures stable address)
@@ -290,6 +299,36 @@ pub fn run(
                                     &mut conn.auth_token,
                                 );
                                 responses.push(resp);
+                                continue;
+                            }
+
+                            // Handle REPLICAOF command at connection level
+                            if cmd.name == "REPLICAOF" {
+                                let result = handler.handle_replicaof(&cmd);
+                                match result {
+                                    ReplicaofResult::NoOne => {
+                                        // Stop replicating, become primary again
+                                        repl_state.stop_replica_stream();
+                                        repl_state.set_role(ReplicationRole::Primary);
+                                        conn.is_replica = false;
+                                        tracing::info!("REPLICAOF NO ONE - now primary (io_uring)");
+                                        responses.push(RespValue::SimpleString("OK".to_string()));
+                                    }
+                                    ReplicaofResult::Replicate { host, port } => {
+                                        // io_uring mode cannot spawn async replication tasks
+                                        // since it runs in its own thread outside tokio.
+                                        // Return a clear error message.
+                                        tracing::warn!(
+                                            "REPLICAOF {host}:{port} rejected in io_uring mode"
+                                        );
+                                        responses.push(RespValue::Error(
+                                            "ERR REPLICAOF not supported in io_uring mode; use the tokio RESP server for replication".to_string(),
+                                        ));
+                                    }
+                                    ReplicaofResult::Error(msg) => {
+                                        responses.push(RespValue::Error(msg));
+                                    }
+                                }
                                 continue;
                             }
                         }
