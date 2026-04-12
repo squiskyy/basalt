@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="resources/basalt_logo_scaled.jpg" alt="Basalt" width="400">
+</div>
+
 # Basalt
 
 Ultra-high performance key-value store purpose-built for AI agent memory.
