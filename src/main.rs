@@ -242,7 +242,7 @@ async fn main() {
     info!("replication: primary mode, WAL size: {} entries", cfg.server.wal_size);
 
     let http_server = tokio::spawn(async move {
-        let app = http::server::app(http_engine, http_auth, http_config.db_path.clone());
+        let app = http::server::app(http_engine, http_auth, http_config.db_path.clone(), http_config.snapshot_compression_threshold);
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         info!("HTTP server listening on {}", addr);

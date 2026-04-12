@@ -24,14 +24,16 @@ pub struct AppState {
     pub engine: Arc<KvEngine>,
     pub auth: Arc<AuthStore>,
     pub db_path: Option<String>,
+    pub compression_threshold: usize,
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
-pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>) -> Router {
+pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>, compression_threshold: usize) -> Router {
     let state = AppState {
         engine,
         auth,
         db_path,
+        compression_threshold,
     };
 
     // Public routes (no auth)
@@ -330,7 +332,7 @@ async fn trigger_snapshot(State(state): State<AppState>) -> impl IntoResponse {
     match &state.db_path {
         Some(db_path) => {
             let path = std::path::Path::new(db_path);
-            match crate::store::persistence::snapshot(path, &state.engine, 3) {
+            match crate::store::persistence::snapshot_with_threshold(path, &state.engine, 3, state.compression_threshold) {
                 Ok(snapshot_path) => {
                     let entries = crate::store::persistence::collect_entries(&state.engine).len();
                     let resp = SnapshotResponse {
