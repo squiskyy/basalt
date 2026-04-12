@@ -30,7 +30,7 @@ async fn start_server(
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
 
-    let router = app(engine, auth, db_path, 1024);
+    let router = app(engine, auth, db_path, 1024, None);
     let handle = tokio::spawn(async move {
         serve(listener, router).await.unwrap();
     });

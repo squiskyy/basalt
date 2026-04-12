@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
@@ -26,10 +27,13 @@ pub async fn run(
     db_path: Option<String>,
 ) -> Result<(), RespError> {
     let repl_state = Arc::new(ReplicationState::new_primary(engine.clone(), 10_000));
-    run_with_replication(host, port, engine, auth, db_path, repl_state).await
+    let (_tx, rx) = watch::channel(false);
+    run_with_replication(host, port, engine, auth, db_path, repl_state, rx).await
 }
 
 /// Run the RESP2 TCP server with replication support.
+/// Accepts a shutdown receiver; when the shutdown signal fires, the accept
+/// loop exits and the server returns gracefully.
 pub async fn run_with_replication(
     host: &str,
     port: u16,
@@ -37,6 +41,7 @@ pub async fn run_with_replication(
     auth: Arc<AuthStore>,
     db_path: Option<String>,
     repl_state: Arc<ReplicationState>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), RespError> {
     let listener = TcpListener::bind((host, port)).await.map_err(RespError::Bind)?;
     tracing::info!("RESP server listening on {host}:{port}");
@@ -45,17 +50,25 @@ pub async fn run_with_replication(
     let auth_enabled = auth.is_enabled();
 
     loop {
-        let (socket, addr) = listener.accept().await.map_err(RespError::Accept)?;
-        let handler = Arc::clone(&handler);
-        let auth = Arc::clone(&auth);
-        let auth_enabled = auth_enabled;
-        let repl_state = repl_state.clone();
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, handler, auth, auth_enabled, repl_state, engine).await {
-                tracing::debug!("connection {addr} error: {e}");
+        tokio::select! {
+            result = listener.accept() => {
+                let (socket, addr) = result.map_err(RespError::Accept)?;
+                let handler = Arc::clone(&handler);
+                let auth = Arc::clone(&auth);
+                let auth_enabled = auth_enabled;
+                let repl_state = repl_state.clone();
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(socket, handler, auth, auth_enabled, repl_state, engine).await {
+                        tracing::debug!("connection {addr} error: {e}");
+                    }
+                });
             }
-        });
+            _ = shutdown_rx.changed() => {
+                tracing::info!("RESP server shutting down gracefully");
+                return Ok(());
+            }
+        }
     }
 }
 

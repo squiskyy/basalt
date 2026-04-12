@@ -155,7 +155,7 @@ async fn main() {
         }
     }
 
-    info!("basalt v{} — memory that moves fast", env!("CARGO_PKG_VERSION"));
+    info!("basalt v{} - memory that moves fast", env!("CARGO_PKG_VERSION"));
     info!("shards: {}", cfg.server.shard_count);
     info!("compression threshold: {} bytes", cfg.server.compression_threshold);
     if auth.is_enabled() {
@@ -242,14 +242,22 @@ async fn main() {
     info!("replication: primary mode, WAL size: {} entries", cfg.server.wal_size);
 
     let http_repl_state = repl_state.clone();
+    let http_shutdown_rx = shutdown_rx.clone();
     let http_server = tokio::spawn(async move {
         let app = http::server::app(http_engine, http_auth, http_config.db_path.clone(), http_config.snapshot_compression_threshold, Some(http_repl_state));
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
         info!("HTTP server listening on {}", addr);
-        axum::serve(listener, app).await.unwrap();
+        let mut http_shutdown = http_shutdown_rx.clone();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                http_shutdown.changed().await.ok();
+            })
+            .await
+            .unwrap();
     });
 
+    let mut resp_shutdown_rx = shutdown_rx.clone();
     let resp_server = tokio::spawn(async move {
         #[cfg(feature = "io-uring")]
         if resp_config.io_uring {
@@ -262,8 +270,8 @@ async fn main() {
                     eprintln!("io_uring RESP server error: {e}");
                 }
             });
-            // Keep the tokio task alive
-            std::future::pending::<()>().await;
+            // Keep the tokio task alive until shutdown signal
+            resp_shutdown_rx.changed().await.ok();
         } else {
             if let Err(e) = resp::server::run_with_replication(
                 &resp_config.resp_host,
@@ -272,6 +280,7 @@ async fn main() {
                 resp_auth,
                 resp_config.db_path.clone(),
                 repl_state.clone(),
+                resp_shutdown_rx,
             )
             .await
             {
@@ -280,25 +289,61 @@ async fn main() {
         }
 
         #[cfg(not(feature = "io-uring"))]
-        if let Err(e) = resp::server::run_with_replication(
-            &resp_config.resp_host,
-            resp_config.resp_port,
-            resp_engine,
-            resp_auth,
-            resp_config.db_path.clone(),
-            repl_state.clone(),
-        )
-        .await
         {
-            eprintln!("RESP server error: {e}");
+            let mut rx = resp_shutdown_rx;
+            if let Err(e) = resp::server::run_with_replication(
+                &resp_config.resp_host,
+                resp_config.resp_port,
+                resp_engine,
+                resp_auth,
+                resp_config.db_path.clone(),
+                repl_state.clone(),
+                rx,
+            )
+            .await
+            {
+                eprintln!("RESP server error: {e}");
+            }
         }
     });
 
+    // Handle graceful shutdown via SIGINT/SIGTERM.
+    // Both the HTTP and RESP servers observe the shutdown watch channel,
+    // so sending true on the channel will signal them both to stop.
+    let shutdown_tx_clone = shutdown_tx.clone();
+    let ctrl_c = tokio::signal::ctrl_c();
+    let terminate = async {
+        #[cfg(unix)]
+        {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ctrl_c => {
+                tracing::info!("received Ctrl+C, initiating graceful shutdown");
+            }
+            _ = terminate => {
+                tracing::info!("received SIGTERM, initiating graceful shutdown");
+            }
+        }
+        let _ = shutdown_tx_clone.send(true);
+    });
+
+    // Wait for either server to finish (they will stop once shutdown is signaled).
     tokio::select! {
-        _ = http_server => info!("HTTP server stopped"),
-        _ = resp_server => info!("RESP server stopped"),
+        _ = http_server => tracing::info!("HTTP server stopped"),
+        _ = resp_server => tracing::info!("RESP server stopped"),
     }
 
-    // Signal shutdown to snapshot loop
+    // Ensure the shutdown signal is sent to the snapshot/sweep loops too.
     let _ = shutdown_tx.send(true);
 }
