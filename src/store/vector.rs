@@ -2,10 +2,12 @@
 ///
 /// Provides HNSW-based approximate nearest neighbor search using `instant-distance`.
 /// The index is lazily built: it's rebuilt on demand when a search is requested
-/// and the shard version has changed since the last build.
+/// and the namespace version has changed since the last build.
 ///
 /// The index is per-namespace, stored at the engine level, keyed by namespace name.
-use std::sync::atomic::{AtomicU64, Ordering};
+/// Version counters are per-namespace (tracked in KvEngine) to avoid unnecessary
+/// rebuilds of unrelated namespace indexes.
+use std::collections::HashMap;
 
 use instant_distance::{HnswMap, Point, Search};
 
@@ -30,7 +32,7 @@ impl EmbeddingPoint {
 impl Point for EmbeddingPoint {
     fn distance(&self, other: &Self) -> f32 {
         // Cosine distance = 1 - cosine_similarity
-        // cosine_similarity = (a · b) / (||a|| * ||b||)
+        // cosine_similarity = (a . b) / (||a|| * ||b||)
         let dot: f32 = self
             .values
             .iter()
@@ -65,13 +67,16 @@ pub struct VectorSearchResult {
 
 /// Per-namespace HNSW index wrapper.
 ///
-/// Tracks a version counter that is compared against the shard version
-/// to determine if the index needs rebuilding.
+/// Tracks a version counter that is compared against the namespace version
+/// to determine if the index needs rebuilding. Also caches the values map
+/// so we avoid rebuilding it on every search when the index is fresh.
 pub struct HnswIndex {
     /// The HNSW map: points -> keys as values.
     index: Option<HnswMap<EmbeddingPoint, String>>,
-    /// The version of the shard data when the index was last built.
+    /// The version of the namespace data when the index was last built.
     index_version: u64,
+    /// Cached values map for returning search results. Rebuilt alongside the index.
+    cached_values: HashMap<String, Vec<u8>>,
 }
 
 impl HnswIndex {
@@ -80,47 +85,56 @@ impl HnswIndex {
         HnswIndex {
             index: None,
             index_version: 0,
+            cached_values: HashMap::new(),
         }
     }
 
     /// Rebuild the HNSW index from a list of (key, embedding, value) tuples.
     ///
-    /// Entries without embeddings are skipped.
-    pub fn rebuild(&mut self, entries: &[(String, Vec<f32>, Vec<u8>)], shard_version: u64) {
+    /// Entries without embeddings are skipped. Also caches the values map
+    /// for fast search result lookups without re-scanning the namespace.
+    pub fn rebuild(&mut self, entries: &[(String, Vec<f32>, Vec<u8>)], namespace_version: u64) {
         let points: Vec<EmbeddingPoint> = entries
             .iter()
             .map(|(_, emb, _)| EmbeddingPoint::new(emb.clone()))
             .collect();
         let values: Vec<String> = entries.iter().map(|(k, _, _)| k.clone()).collect();
 
+        // Cache the values map for search results
+        self.cached_values = entries
+            .iter()
+            .map(|(k, _, v)| (k.clone(), v.clone()))
+            .collect();
+
         if points.is_empty() {
             self.index = None;
-            self.index_version = shard_version;
+            self.index_version = namespace_version;
             return;
         }
 
-        let map: HnswMap<EmbeddingPoint, String> = instant_distance::Hnsw::<EmbeddingPoint>::builder()
-            .ef_construction(150)
-            .ef_search(100)
-            .build(points, values);
+        let map: HnswMap<EmbeddingPoint, String> =
+            instant_distance::Hnsw::<EmbeddingPoint>::builder()
+                .ef_construction(150)
+                .ef_search(100)
+                .build(points, values);
 
         self.index = Some(map);
-        self.index_version = shard_version;
+        self.index_version = namespace_version;
     }
 
-    /// Check if the index needs to be rebuilt for the given shard version.
-    pub fn is_stale(&self, shard_version: u64) -> bool {
-        self.index_version != shard_version
+    /// Check if the index needs to be rebuilt for the given namespace version.
+    pub fn is_stale(&self, namespace_version: u64) -> bool {
+        self.index_version != namespace_version
     }
 
     /// Search for the top-K nearest neighbors of the given embedding.
     ///
     /// Returns results sorted by distance (closest first).
+    /// Uses the cached values map from the last rebuild.
     pub fn search(
         &self,
         embedding: &[f32],
         top_k: usize,
-        values: &std::collections::HashMap<String, Vec<u8>>,
     ) -> Vec<VectorSearchResult> {
         let index = match &self.index {
             Some(idx) => idx,
@@ -135,7 +149,7 @@ impl HnswIndex {
             .take(top_k)
             .filter_map(|item| {
                 let key = item.value.clone();
-                let value = values.get(&key)?;
+                let value = self.cached_values.get(&key)?;
                 Some(VectorSearchResult {
                     key,
                     distance: item.distance,
@@ -154,19 +168,9 @@ impl Default for HnswIndex {
     }
 }
 
-/// Global version counter for tracking changes to entries with embeddings.
-/// Each shard increments this on set/delete operations involving embeddings.
-static GLOBAL_VERSION: AtomicU64 = AtomicU64::new(1);
-
-/// Get the current global version.
-pub fn current_version() -> u64 {
-    GLOBAL_VERSION.load(Ordering::Relaxed)
-}
-
-/// Increment the global version counter (call when embeddings are added/removed).
-pub fn increment_version() -> u64 {
-    GLOBAL_VERSION.fetch_add(1, Ordering::Relaxed) + 1
-}
+// Per-namespace version counters are now tracked in KvEngine
+// (see src/store/engine.rs) instead of a single global counter.
+// This avoids unnecessary rebuilds of unrelated namespace indexes.
 
 #[cfg(test)]
 mod tests {
@@ -221,14 +225,8 @@ mod tests {
         assert!(!index.is_stale(1));
         assert!(index.is_stale(2));
 
-        // Build a values map
-        let values: std::collections::HashMap<String, Vec<u8>> = entries
-            .into_iter()
-            .map(|(k, _, v)| (k, v))
-            .collect();
-
-        // Search for something close to key1
-        let results = index.search(&[1.0, 0.0, 0.0], 3, &values);
+        // Search for something close to key1 (values are cached in the index now)
+        let results = index.search(&[1.0, 0.0, 0.0], 3);
         assert!(!results.is_empty(), "should find results");
         assert_eq!(results[0].key, "key1", "closest result should be key1");
     }
@@ -238,8 +236,7 @@ mod tests {
         let mut index = HnswIndex::new();
         index.rebuild(&[], 1);
 
-        let values = std::collections::HashMap::new();
-        let results = index.search(&[1.0, 0.0], 10, &values);
+        let results = index.search(&[1.0, 0.0], 10);
         assert!(results.is_empty(), "empty index should return no results");
     }
 }

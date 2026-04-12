@@ -1,10 +1,11 @@
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, Shard, ShardFullError};
-use crate::store::vector::{HnswIndex, VectorSearchResult, current_version, increment_version};
+use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Metadata returned alongside a value when using `get_with_meta`.
@@ -39,10 +40,19 @@ pub struct KvEngine {
     /// Per-namespace HNSW vector indices, protected by a Mutex.
     /// Key: namespace (prefix before the first `:` in a key, or the full key).
     vector_indexes: Mutex<HashMap<String, HnswIndex>>,
+    /// Per-namespace version counters for tracking changes to entries with embeddings.
+    /// Only the namespace that was modified has its version incremented,
+    /// avoiding unnecessary rebuilds of unrelated namespace indexes.
+    namespace_versions: Mutex<HashMap<String, AtomicU64>>,
     /// Randomized hash builder for shard routing. Each KvEngine instance
     /// gets a unique random seed so that hash collisions cannot be
     /// predicted by an attacker.
     hash_state: RandomState,
+}
+
+/// Extract the namespace from a key (the part before the first `:`, or the full key).
+fn namespace_of_key(key: &str) -> &str {
+    key.split(':').next().unwrap_or(key)
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -78,6 +88,7 @@ impl KvEngine {
             max_entries,
             compression_threshold: 1024,
             vector_indexes: Mutex::new(HashMap::new()),
+            namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
         }
     }
@@ -101,6 +112,7 @@ impl KvEngine {
             max_entries,
             compression_threshold,
             vector_indexes: Mutex::new(HashMap::new()),
+            namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
         }
     }
@@ -111,6 +123,27 @@ impl KvEngine {
         let mut h = self.hash_state.build_hasher();
         key.hash(&mut h);
         h.finish() as usize & self.shard_mask
+    }
+
+    /// Increment the version counter for a specific namespace.
+    /// This is called when data in that namespace is modified (set/delete).
+    fn increment_namespace_version(&self, namespace: &str) -> u64 {
+        let mut versions = self.namespace_versions.lock().unwrap();
+        versions
+            .entry(namespace.to_string())
+            .or_insert_with(|| AtomicU64::new(1))
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    }
+
+    /// Get the current version for a specific namespace.
+    /// Returns 0 if the namespace has never been modified.
+    fn namespace_version(&self, namespace: &str) -> u64 {
+        let versions = self.namespace_versions.lock().unwrap();
+        versions
+            .get(namespace)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Set a key with explicit TTL (in ms from now) and memory type.
@@ -126,8 +159,8 @@ impl KvEngine {
         };
         let idx = self.shard_index(key);
         self.shards[idx].set(key.to_string(), entry)?;
-        // Increment version on any set (could affect vector index)
-        increment_version();
+        // Increment version only for the namespace that was modified
+        self.increment_namespace_version(namespace_of_key(key));
         Ok(())
     }
 
@@ -145,8 +178,8 @@ impl KvEngine {
         };
         let idx = self.shard_index(key);
         self.shards[idx].set(key.to_string(), entry)?;
-        // Increment version (any set could affect vector index)
-        increment_version();
+        // Increment version only for the namespace that was modified
+        self.increment_namespace_version(namespace_of_key(key));
         Ok(())
     }
 
@@ -207,7 +240,7 @@ impl KvEngine {
         let idx = self.shard_index(key);
         let deleted = self.shards[idx].delete(key);
         if deleted {
-            increment_version();
+            self.increment_namespace_version(namespace_of_key(key));
         }
         deleted
     }
@@ -260,7 +293,9 @@ impl KvEngine {
             total += shard.delete_prefix(prefix);
         }
         if total > 0 {
-            increment_version();
+            // Increment version for the namespace that was modified
+            let namespace = prefix.trim_end_matches(':');
+            self.increment_namespace_version(namespace);
         }
         total
     }
@@ -302,6 +337,19 @@ impl KvEngine {
         self.compression_threshold
     }
 
+    /// Clear all data from the engine, removing every entry from every shard
+    /// and resetting all vector indexes and namespace versions.
+    /// Used during full resync to ensure stale phantom keys are removed.
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            shard.clear();
+        }
+        let mut indexes = self.vector_indexes.lock().unwrap();
+        indexes.clear();
+        let mut versions = self.namespace_versions.lock().unwrap();
+        versions.clear();
+    }
+
     /// Search for entries with embeddings similar to the query embedding within a namespace.
     ///
     /// The namespace is the prefix used in key storage (e.g., "myns" for keys "myns:key1").
@@ -315,9 +363,9 @@ impl KvEngine {
     ) -> Vec<VectorSearchResult> {
         let prefix = format!("{}:", namespace);
 
-        // Read version and check/build index inside the lock to avoid race
+        // Read the per-namespace version and check/build index inside the lock
         let mut indexes = self.vector_indexes.lock().unwrap();
-        let version = current_version();
+        let version = self.namespace_version(namespace);
 
         let needs_rebuild = match indexes.get(namespace) {
             Some(idx) => idx.is_stale(version),
@@ -327,13 +375,10 @@ impl KvEngine {
         if needs_rebuild {
             // Collect entries with embeddings for this namespace
             let entries: Vec<(String, Vec<f32>, Vec<u8>)> = {
-                let all = self.scan_prefix(&prefix);
+                let all = self.scan_prefix_with_embeddings(&prefix);
                 all.into_iter()
-                    .filter_map(|(key, value, _meta)| {
-                        // Get the full entry to access embedding
-                        let idx = self.shard_index(&key);
-                        let entry = self.shards[idx].get_entry(&key)?;
-                        let emb = entry.embedding?;
+                    .filter_map(|(key, value, meta)| {
+                        let emb = meta.embedding?;
                         let display_key = key.strip_prefix(&prefix)?.to_string();
                         Some((display_key, emb, value))
                     })
@@ -346,32 +391,18 @@ impl KvEngine {
                 return Vec::new();
             }
 
-            // Build a values map for search results
-            let values: HashMap<String, Vec<u8>> = entries
-                .iter()
-                .map(|(k, _, v)| (k.clone(), v.clone()))
-                .collect();
-
             // Rebuild the index (still holding the lock)
             let index = indexes.entry(namespace.to_string()).or_insert_with(HnswIndex::new);
             index.rebuild(&entries, version);
 
-            // Search using the rebuilt index
-            return index.search(embedding, top_k, &values);
+            // Search using the rebuilt index (values are cached inside the index)
+            return index.search(embedding, top_k);
         }
 
         // Index is up-to-date, just search (still holding the lock)
+        // Values are cached in the index, no need to rebuild the values map
         if let Some(index) = indexes.get(namespace) {
-            // Build values map from current data
-            let all = self.scan_prefix(&prefix);
-            let values: HashMap<String, Vec<u8>> = all
-                .into_iter()
-                .filter_map(|(key, value, _meta)| {
-                    let display_key = key.strip_prefix(&prefix)?.to_string();
-                    Some((display_key, value))
-                })
-                .collect();
-            index.search(embedding, top_k, &values)
+            index.search(embedding, top_k)
         } else {
             Vec::new()
         }
@@ -513,5 +544,42 @@ mod tests {
                 assert_eq!(value, b"tiny");
             }
         }
+    }
+
+    #[test]
+    fn test_namespace_version_independent() {
+        // Verify that modifying one namespace does not increment the version of another
+        let engine = KvEngine::new(4);
+        engine.set_with_embedding("ns1:a", b"1".to_vec(), None, MemoryType::Semantic, Some(vec![1.0, 0.0])).unwrap();
+        // Version for ns1 should be > 0
+        let ns1_v1 = engine.namespace_version("ns1");
+        assert!(ns1_v1 > 0, "ns1 version should be > 0 after set");
+        // Version for ns2 should be 0 (never modified)
+        let ns2_v0 = engine.namespace_version("ns2");
+        assert_eq!(ns2_v0, 0, "ns2 version should be 0 (never modified)");
+        // Modify ns1 again
+        engine.set_with_embedding("ns1:b", b"2".to_vec(), None, MemoryType::Semantic, Some(vec![0.0, 1.0])).unwrap();
+        let ns1_v2 = engine.namespace_version("ns1");
+        assert!(ns1_v2 > ns1_v1, "ns1 version should have incremented");
+        // ns2 still 0
+        assert_eq!(engine.namespace_version("ns2"), 0, "ns2 version should still be 0");
+    }
+
+    #[test]
+    fn test_clear_removes_all_data() {
+        let engine = KvEngine::new(4);
+        engine.set("key1", b"val1".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set("key2", b"val2".to_vec(), None, MemoryType::Semantic).unwrap();
+        engine.set_with_embedding("ns:emb1", b"val3".to_vec(), None, MemoryType::Semantic, Some(vec![1.0, 0.0])).unwrap();
+
+        assert!(engine.get("key1").is_some());
+        assert!(engine.get("key2").is_some());
+        assert!(engine.get("ns:emb1").is_some());
+
+        engine.clear();
+
+        assert!(engine.get("key1").is_none());
+        assert!(engine.get("key2").is_none());
+        assert!(engine.get("ns:emb1").is_none());
     }
 }
