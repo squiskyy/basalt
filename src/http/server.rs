@@ -25,15 +25,17 @@ pub struct AppState {
     pub auth: Arc<AuthStore>,
     pub db_path: Option<String>,
     pub compression_threshold: usize,
+    pub repl_state: Option<Arc<crate::replication::ReplicationState>>,
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
-pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>, compression_threshold: usize) -> Router {
+pub fn app(engine: Arc<KvEngine>, auth: Arc<AuthStore>, db_path: Option<String>, compression_threshold: usize, repl_state: Option<Arc<crate::replication::ReplicationState>>) -> Router {
     let state = AppState {
         engine,
         auth,
         db_path,
         compression_threshold,
+        repl_state,
     };
 
     // Public routes (no auth)
@@ -220,6 +222,11 @@ async fn delete_namespace(
 ) -> impl IntoResponse {
     let prefix = format!("{}:", namespace);
     let count = state.engine.delete_prefix(&prefix);
+
+    // Record the namespace deletion in WAL for replication
+    if let Some(ref repl) = state.repl_state {
+        repl.record_delete_prefix(prefix.as_bytes());
+    }
 
     (
         StatusCode::OK,

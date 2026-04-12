@@ -314,15 +314,14 @@ impl KvEngine {
         top_k: usize,
     ) -> Vec<VectorSearchResult> {
         let prefix = format!("{}:", namespace);
+
+        // Read version and check/build index inside the lock to avoid race
+        let mut indexes = self.vector_indexes.lock().unwrap();
         let version = current_version();
 
-        // Check if we need to rebuild the index
-        let needs_rebuild = {
-            let indexes = self.vector_indexes.lock().unwrap();
-            match indexes.get(namespace) {
-                Some(idx) => idx.is_stale(version),
-                None => true,
-            }
+        let needs_rebuild = match indexes.get(namespace) {
+            Some(idx) => idx.is_stale(version),
+            None => true,
         };
 
         if needs_rebuild {
@@ -342,8 +341,7 @@ impl KvEngine {
             };
 
             if entries.is_empty() {
-                // No embeddings in this namespace — clear the index
-                let mut indexes = self.vector_indexes.lock().unwrap();
+                // No embeddings in this namespace - clear the index
                 indexes.remove(namespace);
                 return Vec::new();
             }
@@ -354,8 +352,7 @@ impl KvEngine {
                 .map(|(k, _, v)| (k.clone(), v.clone()))
                 .collect();
 
-            // Rebuild the index
-            let mut indexes = self.vector_indexes.lock().unwrap();
+            // Rebuild the index (still holding the lock)
             let index = indexes.entry(namespace.to_string()).or_insert_with(HnswIndex::new);
             index.rebuild(&entries, version);
 
@@ -363,8 +360,7 @@ impl KvEngine {
             return index.search(embedding, top_k, &values);
         }
 
-        // Index is up-to-date, just search
-        let indexes = self.vector_indexes.lock().unwrap();
+        // Index is up-to-date, just search (still holding the lock)
         if let Some(index) = indexes.get(namespace) {
             // Build values map from current data
             let all = self.scan_prefix(&prefix);
