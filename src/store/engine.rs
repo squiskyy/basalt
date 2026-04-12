@@ -49,9 +49,67 @@ pub struct KvEngine {
     hash_state: RandomState,
 }
 
-/// Extract the namespace from a key (the part before the first `:`, or the full key).
+/// A key structured as `namespace:key`, enforcing the convention at the type level.
+///
+/// Instead of passing raw strings and relying on callers to format `"{}:{}"` or
+/// parse with `split_once(':')`, this newtype makes the namespace/key split
+/// structural. The internal storage format is always `namespace:key`, but
+/// construction and decomposition go through validated methods.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NamespacedKey {
+    namespace: String,
+    key: String,
+}
+
+impl NamespacedKey {
+    /// Create a new namespaced key from separate namespace and key parts.
+    pub fn new(namespace: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            key: key.into(),
+        }
+    }
+
+    /// Parse a namespaced key from its internal `namespace:key` format.
+    /// Returns `None` if the string contains no `:` separator.
+    pub fn from_internal(internal: &str) -> Option<Self> {
+        let (namespace, key) = internal.split_once(':')?;
+        Some(Self {
+            namespace: namespace.to_string(),
+            key: key.to_string(),
+        })
+    }
+
+    /// Return the internal storage representation (`namespace:key`).
+    pub fn to_internal(&self) -> String {
+        format!("{}:{}", self.namespace, self.key)
+    }
+
+    /// Return the namespace portion (before the `:`).
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    /// Return the key portion (after the `:`).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Return the namespace-prefix used for prefix scans (`namespace:`).
+    pub fn prefix(&self) -> String {
+        format!("{}:", self.namespace)
+    }
+}
+
+/// Extract the namespace from an internal-format key string.
+/// Returns the part before the first `:`, or the full key if no `:` is present.
+/// For constructing namespaced keys from separate parts, use `NamespacedKey::new()`.
+/// For parsing internal keys into structured parts, use `NamespacedKey::from_internal()`.
 fn namespace_of_key(key: &str) -> &str {
-    key.split(':').next().unwrap_or(key)
+    match key.split_once(':') {
+        Some((ns, _)) => ns,
+        None => key,
+    }
 }
 
 /// Compute the next power of 2 >= n. Returns at least 1.
@@ -321,7 +379,7 @@ impl KvEngine {
         }
         if total > 0 {
             // Increment version for the namespace that was modified
-            let namespace = prefix.trim_end_matches(':');
+            let namespace = prefix.strip_suffix(':').unwrap_or(prefix);
             self.increment_namespace_version(namespace);
         }
         total
@@ -686,5 +744,63 @@ mod tests {
         assert!(engine.get("key1").is_none());
         assert!(engine.get("key2").is_none());
         assert!(engine.get("ns:emb1").is_none());
+    }
+
+    #[test]
+    fn test_namespaced_key_new() {
+        let nk = NamespacedKey::new("myns", "mykey");
+        assert_eq!(nk.namespace(), "myns");
+        assert_eq!(nk.key(), "mykey");
+        assert_eq!(nk.to_internal(), "myns:mykey");
+        assert_eq!(nk.prefix(), "myns:");
+    }
+
+    #[test]
+    fn test_namespaced_key_from_internal() {
+        let nk = NamespacedKey::from_internal("myns:mykey").unwrap();
+        assert_eq!(nk.namespace(), "myns");
+        assert_eq!(nk.key(), "mykey");
+        assert_eq!(nk.to_internal(), "myns:mykey");
+
+        // Key with multiple colons - only splits on first
+        let nk2 = NamespacedKey::from_internal("ns:key:with:colons").unwrap();
+        assert_eq!(nk2.namespace(), "ns");
+        assert_eq!(nk2.key(), "key:with:colons");
+        assert_eq!(nk2.to_internal(), "ns:key:with:colons");
+
+        // No colon returns None
+        assert!(NamespacedKey::from_internal("nokey").is_none());
+
+        // Empty namespace
+        let nk3 = NamespacedKey::from_internal(":key").unwrap();
+        assert_eq!(nk3.namespace(), "");
+        assert_eq!(nk3.key(), "key");
+    }
+
+    #[test]
+    fn test_namespaced_key_roundtrip() {
+        let nk = NamespacedKey::new("session", "abc123");
+        let internal = nk.to_internal();
+        let parsed = NamespacedKey::from_internal(&internal).unwrap();
+        assert_eq!(parsed, nk);
+    }
+
+    #[test]
+    fn test_namespaced_key_equality() {
+        let a = NamespacedKey::new("ns", "key");
+        let b = NamespacedKey::new("ns", "key");
+        let c = NamespacedKey::new("ns", "other");
+        let d = NamespacedKey::new("other", "key");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn test_namespace_of_key() {
+        assert_eq!(namespace_of_key("ns:key"), "ns");
+        assert_eq!(namespace_of_key("ns:key:sub"), "ns");
+        assert_eq!(namespace_of_key("nocolon"), "nocolon");
+        assert_eq!(namespace_of_key(":emptyprefix"), "");
     }
 }

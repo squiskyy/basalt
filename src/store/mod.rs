@@ -4,7 +4,7 @@ pub mod persistence;
 pub mod shard;
 pub mod vector;
 
-pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine};
+pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine, NamespacedKey};
 pub use memory_type::MemoryType;
 pub use persistence::{
     SnapshotEntry, collect_entries, load_latest_snapshot, snapshot, snapshot_with_threshold,

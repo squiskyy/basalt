@@ -10,6 +10,7 @@ use axum::routing::{delete, get, post};
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
+use crate::store::NamespacedKey;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
@@ -95,7 +96,8 @@ async fn store_memory(
     Path(namespace): Path<String>,
     axum::Json(body): axum::Json<StoreRequest>,
 ) -> impl IntoResponse {
-    let internal_key = format!("{}:{}", namespace, body.key);
+    let nk = NamespacedKey::new(&namespace, &body.key);
+    let internal_key = nk.to_internal();
     let memory_type = body.r#type.unwrap_or(MemoryType::Semantic);
     let value_bytes = body.value.into_bytes();
 
@@ -140,7 +142,7 @@ async fn list_memories(
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
-    let prefix = format!("{}:", namespace);
+    let prefix = NamespacedKey::new(&namespace, "").prefix();
     let entries = state.engine.scan_prefix(&prefix);
 
     let prefix_stripped = &prefix;
@@ -183,7 +185,7 @@ async fn get_memory(
     State(state): State<AppState>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let internal_key = format!("{}:{}", namespace, key);
+    let internal_key = NamespacedKey::new(&namespace, &key).to_internal();
 
     match state.engine.get_with_meta(&internal_key) {
         Some((value, meta)) => {
@@ -210,7 +212,7 @@ async fn delete_memory(
     State(state): State<AppState>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let internal_key = format!("{}:{}", namespace, key);
+    let internal_key = NamespacedKey::new(&namespace, &key).to_internal();
     let deleted = state.engine.delete(&internal_key);
 
     if deleted {
@@ -236,7 +238,7 @@ async fn delete_namespace(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
 ) -> impl IntoResponse {
-    let prefix = format!("{}:", namespace);
+    let prefix = NamespacedKey::new(&namespace, "").prefix();
     let count = state.engine.delete_prefix(&prefix);
 
     // Record the namespace deletion in WAL for replication
@@ -262,7 +264,7 @@ async fn batch_store(
 ) -> impl IntoResponse {
     let mut stored = 0usize;
     for item in &body.memories {
-        let internal_key = format!("{}:{}", namespace, item.key);
+        let internal_key = NamespacedKey::new(&namespace, &item.key).to_internal();
         let memory_type = item.r#type.unwrap_or(MemoryType::Semantic);
         let value_bytes = item.value.as_bytes();
         let result = if item.embedding.is_some() {
@@ -311,7 +313,7 @@ async fn batch_get(
     let mut missing = Vec::new();
 
     for key in &body.keys {
-        let internal_key = format!("{}:{}", namespace, key);
+        let internal_key = NamespacedKey::new(&namespace, key).to_internal();
         match state.engine.get_with_meta(&internal_key) {
             Some((value, meta)) => {
                 memories.push(StoreResponse {

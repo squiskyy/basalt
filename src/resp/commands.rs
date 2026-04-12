@@ -8,6 +8,7 @@ use super::parser::{Command, RespValue};
 
 /// Extract the namespace from a key in "namespace:key" format.
 /// Returns the namespace portion (before the first ':'), or the full key if no ':' is present.
+/// For constructing namespaced keys, prefer `NamespacedKey::new()`.
 pub fn extract_namespace(key: &str) -> &str {
     match key.find(':') {
         Some(pos) => &key[..pos],
