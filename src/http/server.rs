@@ -7,17 +7,17 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 
+use crate::metrics::Metrics;
 use crate::store::NamespacedKey;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
-use crate::metrics::Metrics;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
-    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse,
-    InfoResponse, ListQuery, ListResponse, SearchRequest, SearchResponse, SearchResult,
-    SimpleResponse, StoreRequest, StoreResponse,
+    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, InfoResponse,
+    ListQuery, ListResponse, SearchRequest, SearchResponse, SearchResult, SimpleResponse,
+    StoreRequest, StoreResponse,
 };
 use super::ready::{ReadyResponse, ReadyState};
 
@@ -122,7 +122,10 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.metrics.render();
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
 }
@@ -315,7 +318,8 @@ async fn batch_store(
     Path(namespace): Path<String>,
     axum::Json(body): axum::Json<BatchStoreRequest>,
 ) -> impl IntoResponse {
-    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "batch_write", &namespace);
+    let _timer =
+        crate::metrics::RequestTimer::new(state.metrics.clone(), "batch_write", &namespace);
     let mut stored = 0usize;
     for item in &body.memories {
         let internal_key = NamespacedKey::new(&namespace, &item.key).to_internal();
