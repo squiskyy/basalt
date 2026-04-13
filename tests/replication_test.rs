@@ -429,3 +429,182 @@ fn test_record_set_some_ttl_stores_value() {
         "record_set with Some(10000) must store ttl_ms=10000"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Failover / lease / epoch unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_node_id_is_generated() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+    // node_id should be a 16-char hex string
+    let node_id = state.node_id();
+    assert_eq!(node_id.len(), 16, "node_id should be 16 hex chars");
+    assert!(
+        node_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "node_id should be hex"
+    );
+}
+
+#[test]
+fn test_node_id_is_unique() {
+    let engine1 = Arc::new(KvEngine::new(4));
+    let engine2 = Arc::new(KvEngine::new(4));
+    let state1 = ReplicationState::new_primary(engine1, 100);
+    let state2 = ReplicationState::new_primary(engine2, 100);
+    assert_ne!(
+        state1.node_id(),
+        state2.node_id(),
+        "each node should get a unique ID"
+    );
+}
+
+#[test]
+fn test_epoch_starts_at_zero() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+    assert_eq!(state.current_epoch(), 0);
+}
+
+#[test]
+fn test_epoch_increment() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+    let new_epoch = state.increment_epoch();
+    assert_eq!(new_epoch, 1);
+    assert_eq!(state.current_epoch(), 1);
+    let new_epoch2 = state.increment_epoch();
+    assert_eq!(new_epoch2, 2);
+    assert_eq!(state.current_epoch(), 2);
+}
+
+#[test]
+fn test_epoch_set() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+    state.set_epoch(5);
+    assert_eq!(state.current_epoch(), 5);
+}
+
+#[test]
+fn test_lease_tracking() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // Initially, no lease received
+    assert_eq!(state.last_lease_ms(), 0);
+    assert_eq!(state.primary_epoch(), 0);
+
+    // Set lease state
+    state.set_last_lease_ms(1000);
+    state.set_primary_epoch(3);
+
+    assert_eq!(state.last_lease_ms(), 1000);
+    assert_eq!(state.primary_epoch(), 3);
+}
+
+#[test]
+fn test_lease_expiry_detection() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // No lease received yet - should NOT be expired
+    assert!(!state.is_lease_expired(20000, 15000));
+
+    // Lease received at t=10000, now=20000, timeout=15000 -> expired (10000ms > 15000ms... wait, 10000ms elapsed < 15000ms)
+    state.set_last_lease_ms(10000);
+    assert!(!state.is_lease_expired(20000, 15000)); // 10000ms elapsed < 15000ms
+
+    // Lease received at t=10000, now=26000, timeout=15000 -> expired (16000ms > 15000ms)
+    assert!(state.is_lease_expired(26000, 15000)); // 16000ms elapsed > 15000ms
+
+    // Lease received at t=10000, now=25000, timeout=15000 -> NOT expired (15000ms elapsed == timeout, should NOT be expired)
+    assert!(!state.is_lease_expired(25000, 15000)); // exactly at timeout, not expired
+}
+
+#[test]
+fn test_promote_to_primary() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // Set up as replica with primary epoch 2
+    state.set_primary_epoch(2);
+    state.set_role(ReplicationRole::Replica {
+        primary_host: "localhost".to_string(),
+        primary_port: 6380,
+    });
+    state.set_last_lease_ms(10000);
+
+    // Promote to primary
+    let new_epoch = state.promote_to_primary();
+    assert_eq!(new_epoch, 3); // primary_epoch + 1
+    assert_eq!(state.current_epoch(), 3);
+    assert_eq!(state.role(), ReplicationRole::Primary);
+    assert_eq!(state.last_lease_ms(), 0); // lease cleared
+}
+
+#[test]
+fn test_demote_to_replica() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // Start as primary with epoch 0
+    assert_eq!(state.role(), ReplicationRole::Primary);
+    assert_eq!(state.current_epoch(), 0);
+
+    // Demote to replica following a new primary with epoch 3
+    state.demote_to_replica("10.0.0.2".to_string(), 6380, 3);
+    assert_eq!(state.current_epoch(), 3);
+    assert_eq!(
+        state.role(),
+        ReplicationRole::Replica {
+            primary_host: "10.0.0.2".to_string(),
+            primary_port: 6380,
+        }
+    );
+}
+
+#[test]
+fn test_failover_config() {
+    use basalt::replication::FailoverConfig;
+
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // Default config should be disabled
+    let config = state.failover_config();
+    assert!(!config.enabled);
+    assert_eq!(config.timeout_ms, 15_000);
+    assert!(config.peers.is_empty());
+
+    // Set new config
+    state.set_failover_config(FailoverConfig::new(
+        true,
+        5000,
+        vec!["10.0.0.2:6380".to_string()],
+    ));
+    let config = state.failover_config();
+    assert!(config.enabled);
+    assert_eq!(config.timeout_ms, 5000);
+    assert_eq!(config.peers, vec!["10.0.0.2:6380"]);
+}
+
+#[test]
+fn test_info_string_includes_failover_fields() {
+    let engine = Arc::new(KvEngine::new(4));
+    let state = ReplicationState::new_primary(engine, 100);
+
+    // Primary info should include node_id and epoch
+    let info = state.info_string();
+    assert!(info.contains("node_id:"));
+    assert!(info.contains("epoch:0"));
+    assert!(info.contains("failover:disabled"));
+
+    // Set failover enabled
+    use basalt::replication::FailoverConfig;
+    state.set_failover_config(FailoverConfig::new(true, 5000, vec![]));
+    let info = state.info_string();
+    assert!(info.contains("failover:enabled"));
+    assert!(info.contains("failover_timeout_ms:5000"));
+}

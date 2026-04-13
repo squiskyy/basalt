@@ -35,9 +35,14 @@ pub async fn send_full_resync(
 ) -> Result<(), String> {
     let (mut reader, mut writer) = stream.split();
 
-    // 1. Send +FULLRESYNC <seq>\r\n
+    // 1. Send +FULLRESYNC <epoch> <seq> <node_id>\r\n
+    let current_epoch = repl_state.current_epoch();
     let current_seq = repl_state.wal().current_seq();
-    let full_resync = format!("+FULLRESYNC {}\r\n", current_seq);
+    let node_id = repl_state.node_id();
+    let full_resync = format!(
+        "+FULLRESYNC {} {} {}\r\n",
+        current_epoch, current_seq, node_id
+    );
     writer
         .write_all(full_resync.as_bytes())
         .await
@@ -110,6 +115,13 @@ pub async fn send_full_resync(
     // Obtain a handle to the WAL notify channel so we can await
     // new entries instead of busy-polling every 1 ms.
     let wal_notify = repl_state.wal().notify();
+
+    // Lease heartbeat: send LEASE to replica every 5 seconds.
+    // This allows the replica to detect primary failure and trigger failover.
+    let lease_interval = tokio::time::Duration::from_secs(5);
+    let mut lease_timer = tokio::time::interval(lease_interval);
+    // Skip the first immediate tick
+    lease_timer.tick().await;
 
     loop {
         // Check if the replica has fallen behind the WAL's oldest entry.
@@ -186,11 +198,27 @@ pub async fn send_full_resync(
             }
         }
 
-        // Wait for either a WAL notification or a 100ms safety timeout,
+        // Wait for either a WAL notification, a lease timer, or a 100ms safety timeout,
         // while also checking if the replica has disconnected.
         tokio::select! {
             _ = wal_notify.notified() => {
                 // New WAL entry was appended; loop back to drain entries.
+            }
+            _ = lease_timer.tick() => {
+                // Send LEASE heartbeat to the replica
+                let epoch = repl_state.current_epoch();
+                let offset = repl_state.replication_offset();
+                let lease_msg = format!("+LEASE {} {}\r\n", epoch, offset);
+                if let Err(e) = writer.write_all(lease_msg.as_bytes()).await {
+                    tracing::debug!("failed to send lease heartbeat: {e}");
+                    repl_state.dec_connected_replicas();
+                    return Err(format!("failed to send lease heartbeat: {e}"));
+                }
+                if let Err(e) = writer.flush().await {
+                    tracing::debug!("failed to flush lease heartbeat: {e}");
+                    repl_state.dec_connected_replicas();
+                    return Err(format!("failed to flush lease heartbeat: {e}"));
+                }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                 // Safety fallback timeout to avoid missing notifications

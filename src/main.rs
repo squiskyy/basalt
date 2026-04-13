@@ -79,6 +79,21 @@ struct Args {
     #[arg(long, value_name = "POLICY")]
     eviction: Option<String>,
 
+    /// Enable automatic failover when primary lease expires.
+    /// Replicas will self-promote to primary if the primary becomes unreachable.
+    #[arg(long)]
+    failover: bool,
+
+    /// Failover timeout in milliseconds - how long without a lease heartbeat
+    /// before considering the primary dead (default: 15000).
+    #[arg(long, value_name = "MS")]
+    failover_timeout: Option<u64>,
+
+    /// Known replica peer addresses for failover reconfiguration (comma-separated host:port).
+    /// When the primary connection is lost, replicas try these peers to find a new primary.
+    #[arg(long, value_name = "PEERS")]
+    replica_peers: Option<String>,
+
     /// Path to TLS certificate file (PEM format) for RESP protocol encryption.
     /// Requires a TLS feature flag (tls-rustls or tls-native-tls).
     /// Must be used together with --tls-key.
@@ -147,6 +162,14 @@ async fn main() {
         args.compression_threshold,
         args.wal_size,
         args.eviction,
+        args.failover,
+        args.failover_timeout,
+        args.replica_peers.map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        }),
         args.tls_cert,
         args.tls_key,
     );
@@ -328,10 +351,50 @@ async fn main() {
         engine.clone(),
         cfg.server.wal_size,
     ));
+    repl_state.set_failover_config(replication::FailoverConfig::new(
+        cfg.server.failover,
+        cfg.server.failover_timeout_ms,
+        cfg.server.replica_peers.clone(),
+    ));
     info!(
-        "replication: primary mode, WAL size: {} entries",
-        cfg.server.wal_size
+        "replication: primary mode, WAL size: {} entries, failover: {}",
+        cfg.server.wal_size,
+        if cfg.server.failover {
+            "enabled"
+        } else {
+            "disabled"
+        },
     );
+    if cfg.server.failover {
+        info!(
+            "failover timeout: {}ms, peers: {:?}",
+            cfg.server.failover_timeout_ms, cfg.server.replica_peers
+        );
+    }
+
+    // Start failover monitor if failover is enabled
+    if cfg.server.failover {
+        let failover_repl_state = repl_state.clone();
+        let failover_ready_state = ready_state.clone();
+        let failover_engine = engine.clone();
+        let failover_shutdown = shutdown_rx.clone();
+        let failover_config = replication::FailoverConfig::new(
+            cfg.server.failover,
+            cfg.server.failover_timeout_ms,
+            cfg.server.replica_peers.clone(),
+        );
+        info!(
+            "failover monitor: starting (timeout: {}ms)",
+            cfg.server.failover_timeout_ms
+        );
+        tokio::spawn(replication::failover_monitor(
+            failover_repl_state,
+            failover_config,
+            failover_ready_state,
+            failover_engine,
+            failover_shutdown,
+        ));
+    }
 
     let http_repl_state = repl_state.clone();
     let http_shutdown_rx = shutdown_rx.clone();

@@ -45,6 +45,12 @@ pub struct ServerConfig {
     /// Eviction policy when a shard hits max_entries capacity.
     /// "reject" = reject writes (default), "ttl-first" = sweep expired then reject, "lru" = evict least-recently-used
     pub eviction: String,
+    /// Enable automatic failover when primary lease expires.
+    pub failover: bool,
+    /// How long (ms) without a lease heartbeat before considering the primary dead.
+    pub failover_timeout_ms: u64,
+    /// Known peer addresses for failover reconfiguration (host:port, comma-separated).
+    pub replica_peers: Vec<String>,
     /// Path to TLS certificate file (PEM format). Requires a TLS feature flag.
     pub tls_cert: Option<String>,
     /// Path to TLS private key file (PEM format). Requires a TLS feature flag.
@@ -69,6 +75,9 @@ impl Default for ServerConfig {
             compression_threshold: 1024,
             wal_size: 10_000,
             eviction: "reject".to_string(),
+            failover: false,
+            failover_timeout_ms: 15_000,
+            replica_peers: Vec::new(),
             tls_cert: None,
             tls_key: None,
         }
@@ -124,6 +133,12 @@ struct ServerFile {
     wal_size: Option<usize>,
     #[serde(default)]
     eviction: Option<String>,
+    #[serde(default)]
+    failover: Option<bool>,
+    #[serde(default)]
+    failover_timeout_ms: Option<u64>,
+    #[serde(default)]
+    replica_peers: Option<Vec<String>>,
     #[serde(default)]
     tls_cert: Option<String>,
     #[serde(default)]
@@ -183,6 +198,12 @@ impl Config {
                 .server
                 .eviction
                 .unwrap_or_else(|| server_defaults.eviction.clone()),
+            failover: file.server.failover.unwrap_or(false),
+            failover_timeout_ms: file
+                .server
+                .failover_timeout_ms
+                .unwrap_or(server_defaults.failover_timeout_ms),
+            replica_peers: file.server.replica_peers.unwrap_or_default(),
             tls_cert: file.server.tls_cert,
             tls_key: file.server.tls_key,
         };
@@ -216,6 +237,9 @@ impl Config {
         compression_threshold: Option<usize>,
         wal_size: Option<usize>,
         eviction: Option<String>,
+        failover: bool,
+        failover_timeout: Option<u64>,
+        replica_peers: Option<Vec<String>>,
         tls_cert: Option<String>,
         tls_key: Option<String>,
     ) {
@@ -267,6 +291,13 @@ impl Config {
         }
         if let Some(v) = eviction {
             self.server.eviction = v;
+        }
+        self.server.failover = failover;
+        if let Some(v) = failover_timeout {
+            self.server.failover_timeout_ms = v;
+        }
+        if let Some(v) = replica_peers {
+            self.server.replica_peers = v;
         }
         if let Some(v) = tls_cert {
             self.server.tls_cert = Some(v);
@@ -481,6 +512,9 @@ http_port = 9999
             None,          // compression_threshold
             None,          // wal_size
             None,          // eviction
+            false,         // failover
+            None,          // failover_timeout
+            None,          // replica_peers
             None,          // tls_cert
             None,          // tls_key
         );

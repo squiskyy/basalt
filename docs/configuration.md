@@ -111,6 +111,9 @@ All server settings are available as CLI flags. These override config file value
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--wal-size` | usize | `10000` | WAL buffer size (number of entries) |
+| `--failover` | bool | `false` | Enable automatic failover on primary lease expiry |
+| `--failover-timeout` | u64 | `15000` | Timeout in ms without lease before considering primary dead |
+| `--replica-peers` | string | - | Comma-separated list of peer `host:port` addresses |
 
 ### Authentication
 

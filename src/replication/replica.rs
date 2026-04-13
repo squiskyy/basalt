@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use crate::replication::wal;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use memchr;
 
 /// Connect to a primary and perform full resync + stream.
 /// This runs until the connection is lost, the shutdown signal fires,
@@ -35,9 +36,13 @@ pub async fn replicate_from_primary(
 
     let (mut reader, _writer) = stream.split();
 
-    // Read +FULLRESYNC <seq>\r\n
-    let current_seq = read_full_resync(&mut reader).await?;
-    tracing::info!("received FULLRESYNC with seq {current_seq}");
+    // Read +FULLRESYNC <epoch> <seq> <node_id>\r\n
+    let (primary_epoch, current_seq, _primary_node_id) = read_full_resync(&mut reader).await?;
+    tracing::info!("received FULLRESYNC with epoch {primary_epoch}, seq {current_seq}");
+
+    // Update our tracking of the primary's epoch
+    repl_state.set_primary_epoch(primary_epoch);
+    repl_state.set_last_lease_ms(crate::time::now_ms());
 
     // Clear all existing data before applying the full resync snapshot
     // to ensure stale phantom keys from a previous state are removed.
@@ -88,10 +93,33 @@ pub async fn replicate_from_primary(
                     }
                     Ok(n) => {
                         buf.extend_from_slice(&tmp[..n]);
-                        // Try to parse and apply WAL entries
+                        // Process all messages in the buffer
                         loop {
-                            // We expect BulkString WAL entries
-                            // Try to parse one RESP value
+                            // Check for inline protocol messages first (LEASE)
+                            // +LEASE <epoch> <offset>\r\n
+                            if buf.starts_with(b"+LEASE ") {
+                                if let Some(crlf_pos) = find_crlf(&buf) {
+                                    let line = &buf[..crlf_pos];
+                                    let line_str = String::from_utf8_lossy(line);
+                                    if let Some(rest) = line_str.strip_prefix("+LEASE ") {
+                                        let parts: Vec<&str> = rest.split_whitespace().collect();
+                                        if parts.len() >= 2
+                                            && let Ok(epoch) = parts[0].parse::<u64>()
+                                            && let Ok(offset) = parts[1].parse::<u64>()
+                                        {
+                                            repl_state.set_primary_epoch(epoch);
+                                            repl_state.set_last_lease_ms(crate::time::now_ms());
+                                            tracing::debug!("received LEASE epoch={epoch} offset={offset}");
+                                        }
+                                    }
+                                    buf.drain(..crlf_pos + 2); // consume including \r\n
+                                    continue; // process next message
+                                }
+                                // Incomplete LEASE line, need more data
+                                break;
+                            }
+
+                            // Try to parse RESP values (WAL entries)
                             let (values, consumed) = crate::resp::parser::parse_pipeline(&buf);
                             if values.is_empty() || consumed == 0 {
                                 break;
@@ -126,8 +154,11 @@ pub async fn replicate_from_primary(
     }
 }
 
-/// Read the +FULLRESYNC <seq> line from primary.
-async fn read_full_resync(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<u64, String> {
+/// Read the +FULLRESYNC <epoch> <seq> <node_id> line from primary.
+/// Returns (epoch, seq, node_id).
+async fn read_full_resync(
+    reader: &mut (impl AsyncReadExt + Unpin),
+) -> Result<(u64, u64, String), String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -137,11 +168,28 @@ async fn read_full_resync(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<u6
                 line.push(byte[0]);
                 if line.ends_with(b"\r\n") {
                     let line_str = String::from_utf8_lossy(&line[..line.len() - 2]);
-                    if let Some(seq_str) = line_str.strip_prefix("+FULLRESYNC ") {
-                        return seq_str
-                            .trim()
-                            .parse::<u64>()
-                            .map_err(|e| format!("invalid FULLRESYNC seq: {e}"));
+                    if let Some(rest) = line_str.strip_prefix("+FULLRESYNC ") {
+                        let parts: Vec<&str> = rest.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let epoch = parts[0]
+                                .trim()
+                                .parse::<u64>()
+                                .map_err(|e| format!("invalid FULLRESYNC epoch: {e}"))?;
+                            let seq = parts[1]
+                                .trim()
+                                .parse::<u64>()
+                                .map_err(|e| format!("invalid FULLRESYNC seq: {e}"))?;
+                            let node_id = if parts.len() >= 3 {
+                                parts[2].to_string()
+                            } else {
+                                String::new()
+                            };
+                            return Ok((epoch, seq, node_id));
+                        } else {
+                            return Err(format!(
+                                "expected +FULLRESYNC <epoch> <seq> [<node_id>], got: {line_str}"
+                            ));
+                        }
                     } else {
                         return Err(format!("expected +FULLRESYNC, got: {line_str}"));
                     }
@@ -350,4 +398,19 @@ fn apply_wal_entry(engine: &Arc<KvEngine>, entry: &wal::WalEntry) {
             engine.delete_prefix(&String::from_utf8_lossy(&entry.key));
         }
     }
+}
+
+/// Find the position of the first \r\n in the buffer.
+/// Returns the byte offset of the \r (before the \n).
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    let mut start = 0;
+    while start < buf.len() {
+        let pos = memchr::memchr(b'\r', &buf[start..])?;
+        let abs = start + pos;
+        if abs + 1 < buf.len() && buf[abs + 1] == b'\n' {
+            return Some(abs);
+        }
+        start = abs + 1;
+    }
+    None
 }
