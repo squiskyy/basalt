@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use basalt::replication::ReplicationState;
 use basalt::resp::uring_server;
+use basalt::store::share::ShareStore;
 
 use common::{
     encode_resp_command, make_engine, make_no_auth, make_scoped_auth, make_wildcard_auth,
@@ -55,6 +56,7 @@ async fn read_resp_response(stream: &mut TcpStream) -> String {
 fn start_uring_server(
     engine: Arc<basalt::store::engine::KvEngine>,
     auth: Arc<basalt::http::auth::AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
 ) -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -66,7 +68,7 @@ fn start_uring_server(
     thread::Builder::new()
         .name("io-uring-resp-test".into())
         .spawn(move || {
-            let _ = uring_server::run("127.0.0.1", port, engine, auth, db_path, repl_state);
+            let _ = uring_server::run("127.0.0.1", port, engine, auth, share, db_path, repl_state);
         })
         .unwrap();
 
@@ -77,17 +79,32 @@ fn start_uring_server(
 
 /// Convenience: start an io_uring RESP server with no auth.
 fn start_default_uring_server() -> u16 {
-    start_uring_server(make_engine(), make_no_auth(), None)
+    start_uring_server(
+        make_engine(),
+        make_no_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
 }
 
 /// Start an io_uring RESP server with wildcard auth enabled.
 fn start_auth_uring_server() -> u16 {
-    start_uring_server(make_engine(), make_wildcard_auth(), None)
+    start_uring_server(
+        make_engine(),
+        make_wildcard_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
 }
 
 /// Start an io_uring RESP server with scoped auth tokens.
 fn start_scoped_auth_uring_server() -> u16 {
-    start_uring_server(make_engine(), make_scoped_auth(), None)
+    start_uring_server(
+        make_engine(),
+        make_scoped_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
 }
 
 /// Connect to the RESP server and return the TcpStream.
