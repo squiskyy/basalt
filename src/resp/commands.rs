@@ -68,9 +68,8 @@ pub fn check_command_namespace(
                 Some(ns) => ns,
                 None => {
                     return Err(RespValue::Error(
-                        "ERR key must include namespace prefix (format: namespace:key)"
-                            .to_string(),
-                    ))
+                        "ERR key must include namespace prefix (format: namespace:key)".to_string(),
+                    ));
                 }
             };
             if !auth.is_authorized(token, ns) {
@@ -92,9 +91,8 @@ pub fn check_command_namespace(
                 Some(ns) => ns,
                 None => {
                     return Err(RespValue::Error(
-                        "ERR key must include namespace prefix (format: namespace:key)"
-                            .to_string(),
-                    ))
+                        "ERR key must include namespace prefix (format: namespace:key)".to_string(),
+                    ));
                 }
             };
             if !auth.is_authorized(token, ns) {
@@ -114,9 +112,8 @@ pub fn check_command_namespace(
             Some(ns) => ns,
             None => {
                 return Err(RespValue::Error(
-                    "ERR key must include namespace prefix (format: namespace:key)"
-                        .to_string(),
-                ))
+                    "ERR key must include namespace prefix (format: namespace:key)".to_string(),
+                ));
             }
         };
         if !auth.is_authorized(token, ns) {

@@ -276,7 +276,11 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut version = [0u8; 1];
     f.read_exact(&mut version)
         .map_err(|e| format!("read version: {e}"))?;
-    if version[0] != VERSION_4 && version[0] != VERSION_3 && version[0] != VERSION_2 && version[0] != VERSION_1 {
+    if version[0] != VERSION_4
+        && version[0] != VERSION_3
+        && version[0] != VERSION_2
+        && version[0] != VERSION_1
+    {
         return Err(format!(
             "unsupported snapshot version {} in {} (expected {}, {}, {}, or {})",
             version[0],
@@ -293,7 +297,11 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let is_v3_or_v4 = ver == VERSION_3 || ver == VERSION_4;
 
     // For v4, we track all bytes read for footer CRC validation
-    let mut footer_hasher = if is_v4 { Some(crc32fast::Hasher::new()) } else { None };
+    let mut footer_hasher = if is_v4 {
+        Some(crc32fast::Hasher::new())
+    } else {
+        None
+    };
 
     if is_v4 {
         // Update footer hasher with magic + version
@@ -320,14 +328,18 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut len_bytes = [0u8; 4];
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read key_len at entry {i}: {e}"))?;
-        if is_v4 { entry_buf.extend_from_slice(&len_bytes); }
+        if is_v4 {
+            entry_buf.extend_from_slice(&len_bytes);
+        }
         let key_len = u32::from_le_bytes(len_bytes) as usize;
 
         // key
         let mut key_bytes = vec![0u8; key_len];
         f.read_exact(&mut key_bytes)
             .map_err(|e| format!("read key at entry {i}: {e}"))?;
-        if is_v4 { entry_buf.extend_from_slice(&key_bytes); }
+        if is_v4 {
+            entry_buf.extend_from_slice(&key_bytes);
+        }
         let key = String::from_utf8(key_bytes)
             .map_err(|e| format!("invalid key UTF-8 at entry {i}: {e}"))?;
 
@@ -338,21 +350,27 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut flags_byte = [0u8; 1];
             f.read_exact(&mut flags_byte)
                 .map_err(|e| format!("read flags at entry {i}: {e}"))?;
-            if is_v4 { entry_buf.extend_from_slice(&flags_byte); }
+            if is_v4 {
+                entry_buf.extend_from_slice(&flags_byte);
+            }
             flags_byte[0]
         };
 
         // val_len
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read val_len at entry {i}: {e}"))?;
-        if is_v4 { entry_buf.extend_from_slice(&len_bytes); }
+        if is_v4 {
+            entry_buf.extend_from_slice(&len_bytes);
+        }
         let val_len = u32::from_le_bytes(len_bytes) as usize;
 
         // value (compressed if flag set)
         let mut stored_value = vec![0u8; val_len];
         f.read_exact(&mut stored_value)
             .map_err(|e| format!("read value at entry {i}: {e}"))?;
-        if is_v4 { entry_buf.extend_from_slice(&stored_value); }
+        if is_v4 {
+            entry_buf.extend_from_slice(&stored_value);
+        }
 
         let value = if (flags & FLAG_COMPRESSED) != 0 {
             lz4_flex::decompress_size_prepended(&stored_value)
@@ -365,7 +383,9 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut mt_byte = [0u8; 1];
         f.read_exact(&mut mt_byte)
             .map_err(|e| format!("read memory_type at entry {i}: {e}"))?;
-        if is_v4 { entry_buf.extend_from_slice(&mt_byte); }
+        if is_v4 {
+            entry_buf.extend_from_slice(&mt_byte);
+        }
         let memory_type = MemoryType::from_u8(mt_byte[0]).ok_or_else(|| {
             format!(
                 "invalid memory_type {} at entry {i} in {}",
@@ -381,14 +401,18 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut emb_flag_byte = [0u8; 1];
             f.read_exact(&mut emb_flag_byte)
                 .map_err(|e| format!("read embedding_flag at entry {i}: {e}"))?;
-            if is_v4 { entry_buf.extend_from_slice(&emb_flag_byte); }
+            if is_v4 {
+                entry_buf.extend_from_slice(&emb_flag_byte);
+            }
             let emb_flag = emb_flag_byte[0];
 
             // expires_at
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
-            if is_v4 { entry_buf.extend_from_slice(&exp_bytes); }
+            if is_v4 {
+                entry_buf.extend_from_slice(&exp_bytes);
+            }
             let expires_at_raw = u64::from_le_bytes(exp_bytes);
             let expires_at = if expires_at_raw == 0 {
                 None
@@ -401,12 +425,16 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 let mut dim_bytes = [0u8; 4];
                 f.read_exact(&mut dim_bytes)
                     .map_err(|e| format!("read embedding dim at entry {i}: {e}"))?;
-                if is_v4 { entry_buf.extend_from_slice(&dim_bytes); }
+                if is_v4 {
+                    entry_buf.extend_from_slice(&dim_bytes);
+                }
                 let dim = u32::from_le_bytes(dim_bytes) as usize;
                 let mut emb_data = vec![0u8; dim * 4];
                 f.read_exact(&mut emb_data)
                     .map_err(|e| format!("read embedding data at entry {i}: {e}"))?;
-                if is_v4 { entry_buf.extend_from_slice(&emb_data); }
+                if is_v4 {
+                    entry_buf.extend_from_slice(&emb_data);
+                }
                 let mut embedding = Vec::with_capacity(dim);
                 for j in 0..dim {
                     let offset = j * 4;
@@ -441,7 +469,9 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
-            if is_v4 { entry_buf.extend_from_slice(&exp_bytes); }
+            if is_v4 {
+                entry_buf.extend_from_slice(&exp_bytes);
+            }
 
             let expires_at_raw = u64::from_le_bytes(exp_bytes);
             let expires_at = if expires_at_raw == 0 {
@@ -494,7 +524,10 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     if is_v4 {
         let mut footer_crc_bytes = [0u8; 4];
         if let Err(e) = f.read_exact(&mut footer_crc_bytes) {
-            warn!("snapshot footer CRC32 missing or unreadable in {}: {e}", path.display());
+            warn!(
+                "snapshot footer CRC32 missing or unreadable in {}: {e}",
+                path.display()
+            );
         } else {
             let stored_footer_crc = u32::from_le_bytes(footer_crc_bytes);
             let footer_hasher = footer_hasher.take().unwrap();
@@ -1451,15 +1484,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let entries = vec![
-            SnapshotEntry {
-                key: "test:1".to_string(),
-                value: b"test value".to_vec(),
-                memory_type: MemoryType::Semantic,
-                expires_at: None,
-                embedding: None,
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "test:1".to_string(),
+            value: b"test value".to_vec(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+        }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
         let mut raw = fs::read(&path).unwrap();
@@ -1483,15 +1514,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let entries = vec![
-            SnapshotEntry {
-                key: "test:1".to_string(),
-                value: b"test value".to_vec(),
-                memory_type: MemoryType::Semantic,
-                expires_at: None,
-                embedding: None,
-            },
-        ];
+        let entries = vec![SnapshotEntry {
+            key: "test:1".to_string(),
+            value: b"test value".to_vec(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+        }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
         let mut raw = fs::read(&path).unwrap();
