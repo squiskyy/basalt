@@ -1,8 +1,8 @@
 pub mod commands;
 pub mod error;
 pub mod parser;
-pub mod session;
 pub mod server;
+pub mod session;
 
 #[cfg(feature = "io-uring")]
 pub mod uring_server;

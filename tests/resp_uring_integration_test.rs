@@ -1,16 +1,23 @@
-//! RESP integration tests for Basalt.
+//! io_uring RESP integration tests for Basalt.
 //!
-//! These tests start the RESP server on a random port, connect via
-//! tokio::net::TcpStream, and exercise the full command set by writing
-//! RESP-encoded commands and reading/parsing the responses.
+//! These tests mirror the tokio-based RESP integration tests but use the
+//! io_uring server backend. The io_uring server runs in a blocking std
+//! thread (not tokio), while test clients use tokio::net::TcpStream for
+//! async I/O.
+//!
+//! Gated behind `#![cfg(feature = "io-uring")]` since io_uring requires
+//! Linux kernel 5.19+.
+
+#![cfg(feature = "io-uring")]
 
 mod common;
 
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use basalt::http::auth::AuthStore;
-use basalt::resp::server::run as resp_run;
-use basalt::store::engine::KvEngine;
+use basalt::replication::ReplicationState;
+use basalt::resp::uring_server;
 
 use common::{
     encode_resp_command, make_engine, make_no_auth, make_scoped_auth, make_wildcard_auth,
@@ -44,42 +51,43 @@ async fn read_resp_response(stream: &mut TcpStream) -> String {
     }
 }
 
-/// Start the RESP server on a random port. Returns (port, JoinHandle).
-async fn start_resp_server(
-    engine: Arc<KvEngine>,
-    auth: Arc<AuthStore>,
+/// Start the io_uring RESP server on a random port. Returns the port.
+fn start_uring_server(
+    engine: Arc<basalt::store::engine::KvEngine>,
+    auth: Arc<basalt::http::auth::AuthStore>,
     db_path: Option<String>,
-) -> (u16, tokio::task::JoinHandle<()>) {
-    // We need to find the actual port. Bind a listener ourselves, get the
-    // port, then pass it to the server.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    thread::sleep(Duration::from_millis(10));
 
-    let handle = tokio::spawn(async move {
-        // We can't easily reuse the listener from `run`, so we'll start the
-        // server by calling `run` with the port. But `run` binds its own
-        // listener. So we drop ours and let `run` bind the same port.
-        drop(listener);
-        // Small delay to ensure the port is released
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        // If run fails (e.g., port conflict), that's a test failure
-        let _ = resp_run("127.0.0.1", port, engine, auth, db_path).await;
-    });
+    let repl_state = Arc::new(ReplicationState::new_primary(engine.clone(), 10_000));
+    thread::Builder::new()
+        .name("io-uring-resp-test".into())
+        .spawn(move || {
+            let _ = uring_server::run("127.0.0.1", port, engine, auth, db_path, repl_state);
+        })
+        .unwrap();
 
-    // Give the server time to bind
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    (port, handle)
+    // Wait for server to bind
+    thread::sleep(Duration::from_millis(200));
+    port
 }
 
-/// Convenience: start a RESP server with no auth, returning (port, handle).
-async fn start_default_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_no_auth(), None).await
+/// Convenience: start an io_uring RESP server with no auth.
+fn start_default_uring_server() -> u16 {
+    start_uring_server(make_engine(), make_no_auth(), None)
 }
 
-/// Start a RESP server with auth enabled, returning (port, handle).
-async fn start_auth_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_wildcard_auth(), None).await
+/// Start an io_uring RESP server with wildcard auth enabled.
+fn start_auth_uring_server() -> u16 {
+    start_uring_server(make_engine(), make_wildcard_auth(), None)
+}
+
+/// Start an io_uring RESP server with scoped auth tokens.
+fn start_scoped_auth_uring_server() -> u16 {
+    start_uring_server(make_engine(), make_scoped_auth(), None)
 }
 
 /// Connect to the RESP server and return the TcpStream.
@@ -102,8 +110,8 @@ async fn send_and_read(stream: &mut TcpStream, name: &str, args: &[&str]) -> Str
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_ping_returns_pong() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_ping_returns_pong() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "PING", &[]).await;
@@ -115,8 +123,8 @@ async fn test_ping_returns_pong() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_set_returns_ok() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_set_returns_ok() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "SET", &["mykey", "myval"]).await;
@@ -128,8 +136,8 @@ async fn test_set_returns_ok() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_get_returns_bulk_string() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_get_returns_bulk_string() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     // SET first
@@ -145,8 +153,8 @@ async fn test_get_returns_bulk_string() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_get_nonexistent_returns_null() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_get_nonexistent_returns_null() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "GET", &["nonexistent"]).await;
@@ -158,8 +166,8 @@ async fn test_get_nonexistent_returns_null() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_del_returns_count() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_del_returns_count() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     // SET a key first
@@ -179,8 +187,8 @@ async fn test_del_returns_count() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_mset_mget() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_mset_mget() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     // MSET
@@ -189,7 +197,6 @@ async fn test_mset_mget() {
 
     // MGET should return an array of two bulk strings
     let resp = send_and_read(&mut stream, "MGET", &["k1", "k2"]).await;
-    // *2\r\n$2\r\nv1\r\n$2\r\nv2\r\n
     assert_eq!(resp, "*2\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
 }
 
@@ -198,17 +205,15 @@ async fn test_mset_mget() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_info_returns_bulk_string() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_info_returns_bulk_string() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "INFO", &[]).await;
-    // Should start with $ (bulk string) and contain "basalt_version"
     assert!(
         resp.starts_with('$'),
         "INFO response should be a bulk string, got: {resp}"
     );
-    // Decode the bulk string to check content
     assert!(
         resp.contains("basalt_version"),
         "INFO should contain basalt_version, got: {resp}"
@@ -221,8 +226,8 @@ async fn test_info_returns_bulk_string() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_auth_flow() {
-    let (port, _handle) = start_auth_resp_server().await;
+async fn test_uring_auth_flow() {
+    let port = start_auth_uring_server();
     let mut stream = connect(port).await;
 
     // Without auth, any command (except AUTH) should return NOAUTH error
@@ -246,8 +251,8 @@ async fn test_auth_flow() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_auth_wrong_token() {
-    let (port, _handle) = start_auth_resp_server().await;
+async fn test_uring_auth_wrong_token() {
+    let port = start_auth_uring_server();
     let mut stream = connect(port).await;
 
     // AUTH with an invalid token
@@ -266,14 +271,9 @@ async fn test_auth_wrong_token() {
 // j. AUTH with scoped token: per-command namespace enforcement
 // ---------------------------------------------------------------------------
 
-/// Start a RESP server with a scoped (non-wildcard) auth token.
-async fn start_scoped_auth_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_scoped_auth(), None).await
-}
-
 #[tokio::test]
-async fn test_auth_scoped_token_can_access_own_namespace() {
-    let (port, _handle) = start_scoped_auth_resp_server().await;
+async fn test_uring_scoped_token_can_access_own_namespace() {
+    let port = start_scoped_auth_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "AUTH", &["bsk-scoped"]).await;
@@ -292,8 +292,8 @@ async fn test_auth_scoped_token_can_access_own_namespace() {
 }
 
 #[tokio::test]
-async fn test_auth_scoped_token_cannot_access_other_namespace() {
-    let (port, _handle) = start_scoped_auth_resp_server().await;
+async fn test_uring_scoped_token_cannot_access_other_namespace() {
+    let port = start_scoped_auth_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "AUTH", &["bsk-scoped"]).await;
@@ -315,8 +315,8 @@ async fn test_auth_scoped_token_cannot_access_other_namespace() {
 }
 
 #[tokio::test]
-async fn test_auth_wildcard_token_can_access_any_namespace() {
-    let (port, _handle) = start_scoped_auth_resp_server().await;
+async fn test_uring_wildcard_token_can_access_any_namespace() {
+    let port = start_scoped_auth_uring_server();
     let mut stream = connect(port).await;
 
     let resp = send_and_read(&mut stream, "AUTH", &["bsk-wildcard"]).await;
@@ -341,8 +341,8 @@ async fn test_auth_wildcard_token_can_access_any_namespace() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_pipelining() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_pipelining() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     // Pipeline: PING, SET foo bar, GET foo
@@ -354,8 +354,7 @@ async fn test_pipelining() {
     stream.write_all(&pipeline).await.unwrap();
     stream.flush().await.unwrap();
 
-    // Read all responses — they should come back as a batch
-    // We need to read enough bytes to get all 3 responses
+    // Read all responses
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -382,7 +381,6 @@ async fn test_pipelining() {
         if count == 3 {
             break;
         }
-        // If we haven't parsed 3 yet, read more
     }
 
     let response = String::from_utf8_lossy(&buf).to_string();
@@ -401,26 +399,25 @@ async fn test_pipelining() {
         "Pipeline should contain $3\\r\\nbar\\r\\n, got: {response}"
     );
 
-    // Verify exact ordering: +PONG\r\n+OK\r\n$3\r\nbar\r\n
+    // Verify exact ordering
     assert_eq!(response, "+PONG\r\n+OK\r\n$3\r\nbar\r\n");
 }
 
 // ---------------------------------------------------------------------------
-// k. MSETT and MGETT commands
+// l. MSETT and MGETT commands
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_msett_mgett() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_msett_mgett() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
     // MSETT key value type [PX ms]
     let resp = send_and_read(&mut stream, "MSETT", &["mem1", "data1", "episodic"]).await;
     assert_eq!(resp, "+OK\r\n");
 
-    // MGETT key → returns array [value, type, ttl]
+    // MGETT key -> returns array [value, type, ttl]
     let resp = send_and_read(&mut stream, "MGETT", &["mem1"]).await;
-    // Should be a 3-element array: bulk strings for value, type, and ttl
     assert!(
         resp.starts_with("*3\r\n"),
         "MGETT should return *3 array, got: {resp}"
@@ -463,64 +460,22 @@ async fn test_msett_mgett() {
 }
 
 // ---------------------------------------------------------------------------
-// l. MSCAN prefix command
+// m. REPLICAOF host port is rejected in io_uring mode
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_mscan() {
-    let (port, _handle) = start_default_resp_server().await;
+async fn test_uring_replicaof_rejected() {
+    let port = start_default_uring_server();
     let mut stream = connect(port).await;
 
-    // Insert some keys with a common prefix
-    let _ = send_and_read(&mut stream, "SET", &["user:1", "alice"]).await;
-    let _ = send_and_read(&mut stream, "SET", &["user:2", "bob"]).await;
-    let _ = send_and_read(&mut stream, "SET", &["other:x", "charlie"]).await;
-
-    // MSCAN with prefix "user:"
-    let resp = send_and_read(&mut stream, "MSCAN", &["user:"]).await;
-    // Should return an array of entries, each being [key, value, type, ttl]
-    // Since SET uses Semantic type with no TTL
+    // REPLICAOF host port should return an error about not supported
+    let resp = send_and_read(&mut stream, "REPLICAOF", &["127.0.0.1", "6380"]).await;
     assert!(
-        resp.starts_with('*'),
-        "MSCAN should return an array, got: {resp}"
-    );
-
-    // The array should have 2 entries (user:1 and user:2)
-    // Parse the array count
-    let crlf_pos = resp.find("\r\n").unwrap();
-    let count_str = &resp[1..crlf_pos];
-    let count: usize = count_str.parse().unwrap();
-    assert_eq!(
-        count, 2,
-        "MSCAN should return 2 entries for prefix 'user:', got: {resp}"
-    );
-
-    // Verify the response contains our data
-    assert!(
-        resp.contains("user:1"),
-        "MSCAN should contain user:1, got: {resp}"
+        resp.starts_with("-ERR"),
+        "REPLICAOF host port should return error in io_uring mode, got: {resp}"
     );
     assert!(
-        resp.contains("user:2"),
-        "MSCAN should contain user:2, got: {resp}"
-    );
-    assert!(
-        resp.contains("alice"),
-        "MSCAN should contain alice, got: {resp}"
-    );
-    assert!(
-        resp.contains("bob"),
-        "MSCAN should contain bob, got: {resp}"
-    );
-    assert!(
-        !resp.contains("charlie"),
-        "MSCAN should NOT contain charlie, got: {resp}"
-    );
-
-    // MSCAN with a prefix that matches nothing returns empty array
-    let resp = send_and_read(&mut stream, "MSCAN", &["nonexistent:"]).await;
-    assert_eq!(
-        resp, "*0\r\n",
-        "MSCAN with no matches should return *0\\r\\n, got: {resp}"
+        resp.contains("not supported in io_uring mode"),
+        "Error should mention io_uring mode, got: {resp}"
     );
 }
