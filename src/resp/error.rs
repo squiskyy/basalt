@@ -14,4 +14,6 @@ pub enum RespError {
     Write(#[source] std::io::Error),
     #[error("io_uring submit error: {0}")]
     Submit(#[source] std::io::Error),
+    #[error("TLS error: {0}")]
+    Tls(String),
 }

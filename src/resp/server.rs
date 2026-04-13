@@ -14,6 +14,9 @@ use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline};
 use super::session::{ClientSession, SessionAction};
 
+#[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+use super::tls::{TlsAcceptor, TlsStream};
+
 /// Run the RESP2 TCP server.
 ///
 /// Binds to `host:port`, accepts connections, and spawns a task per connection.
@@ -46,12 +49,48 @@ pub async fn run_with_replication(
     share: Arc<ShareStore>,
     db_path: Option<String>,
     repl_state: Arc<ReplicationState>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), RespError> {
+    run_with_replication_and_tls(
+        host,
+        port,
+        engine,
+        auth,
+        share,
+        db_path,
+        repl_state,
+        shutdown_rx,
+        None,
+    )
+    .await
+}
+
+/// Run the RESP2 TCP server with replication and optional TLS support.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_replication_and_tls(
+    host: &str,
+    port: u16,
+    engine: Arc<KvEngine>,
+    auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
+    db_path: Option<String>,
+    repl_state: Arc<ReplicationState>,
     mut shutdown_rx: watch::Receiver<bool>,
+    #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))] tls_acceptor: Option<
+        TlsAcceptor,
+    >,
+    #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))] tls_acceptor: Option<()>,
 ) -> Result<(), RespError> {
     let listener = TcpListener::bind((host, port))
         .await
         .map_err(RespError::Bind)?;
-    tracing::info!("RESP server listening on {host}:{port}");
+
+    let tls_enabled = tls_acceptor.is_some();
+    if tls_enabled {
+        tracing::info!("RESP server listening on {host}:{port} (TLS enabled)");
+    } else {
+        tracing::info!("RESP server listening on {host}:{port} (plaintext)");
+    }
 
     let handler = Arc::new(CommandHandler::with_replication(
         engine.clone(),
@@ -71,8 +110,37 @@ pub async fn run_with_replication(
                 let share = share.clone();
                 let repl_state = repl_state.clone();
                 let engine = engine.clone();
+
+                #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+                let tls_acceptor = tls_acceptor.clone();
+
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine).await {
+                    #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+                    if let Some(ref acceptor) = tls_acceptor {
+                        match acceptor.accept(socket).await {
+                            Ok(tls_stream) => {
+                                if let Err(e) = handle_connection_tls(
+                                    tls_stream, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                                ).await {
+                                    tracing::debug!("TLS connection {addr} error: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("TLS handshake failed for {addr}: {e}");
+                            }
+                        }
+                    } else {
+                        if let Err(e) = handle_connection(
+                            socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                        ).await {
+                            tracing::debug!("connection {addr} error: {e}");
+                        }
+                    }
+
+                    #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
+                    if let Err(e) = handle_connection(
+                        socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                    ).await {
                         tracing::debug!("connection {addr} error: {e}");
                     }
                 });
@@ -190,6 +258,113 @@ async fn handle_connection(
         }
 
         // Keep read_buf from growing unbounded - trim if it got large but is now empty
+        if read_buf.is_empty() && read_buf.capacity() > 65536 {
+            read_buf = Vec::with_capacity(8192);
+        }
+    }
+}
+
+/// Handle a TLS-wrapped RESP connection.
+/// Same logic as handle_connection but operates on TlsStream instead of split TcpStream.
+#[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection_tls(
+    stream: TlsStream,
+    handler: Arc<CommandHandler>,
+    share_handler: Arc<ShareHandler>,
+    auth: Arc<AuthStore>,
+    auth_enabled: bool,
+    share: Arc<ShareStore>,
+    repl_state: Arc<ReplicationState>,
+    engine: Arc<KvEngine>,
+) -> Result<(), RespError> {
+    // TlsStream implements AsyncRead + AsyncWrite, but we can't split it
+    // like TcpStream. Instead, we use a single-stream approach with
+    // a shared buffer and careful read/write interleaving.
+    // For simplicity and correctness, we wrap in a split-like approach
+    // using tokio::io::split which requires Unpin.
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let mut read_buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+
+    let mut session = ClientSession::new(auth.clone(), share.clone(), auth_enabled);
+
+    loop {
+        let n = reader.read(&mut tmp).await.map_err(RespError::Read)?;
+        if n == 0 {
+            return Ok(());
+        }
+        read_buf.extend_from_slice(&tmp[..n]);
+
+        loop {
+            let (values, consumed) = parse_pipeline(&read_buf);
+            if values.is_empty() {
+                break;
+            }
+
+            read_buf.drain(..consumed);
+
+            let result = session.process_command_batch(&values, &handler, &share_handler);
+
+            let responses_already_flushed = match result.action {
+                SessionAction::ReplicaofNoOne => {
+                    repl_state.stop_replica_stream();
+                    repl_state.set_role(ReplicationRole::Primary);
+                    tracing::info!("REPLICAOF NO ONE - now primary");
+                    false
+                }
+                SessionAction::ReplicaofReplicate { host, port } => {
+                    repl_state.stop_replica_stream();
+                    repl_state.set_role(ReplicationRole::Replica {
+                        primary_host: host.clone(),
+                        primary_port: port,
+                    });
+                    tracing::info!("REPLICAOF {host}:{port} - becoming replica");
+
+                    let out = serialize_pipeline(&result.responses);
+                    if let Err(e) = writer.write_all(&out).await {
+                        tracing::error!("failed to write REPLICAOF response: {e}");
+                        return Err(RespError::Write(e));
+                    }
+                    writer.flush().await.map_err(RespError::Write)?;
+
+                    let repl_engine = engine.clone();
+                    let repl_repl_state = repl_state.clone();
+                    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                    repl_state.set_replica_shutdown(Some(shutdown_tx));
+
+                    tokio::spawn(async move {
+                        match crate::replication::replica::replicate_from_primary(
+                            &host,
+                            port,
+                            &repl_engine,
+                            &repl_repl_state,
+                            shutdown_rx,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!("replication from {host}:{port} ended cleanly");
+                            }
+                            Err(e) => {
+                                tracing::error!("replication error from {host}:{port}: {e}");
+                            }
+                        }
+                    });
+
+                    true
+                }
+                SessionAction::None => false,
+            };
+
+            if !responses_already_flushed && !result.responses.is_empty() {
+                let out = serialize_pipeline(&result.responses);
+                writer.write_all(&out).await.map_err(RespError::Write)?;
+                writer.flush().await.map_err(RespError::Write)?;
+            }
+        }
+
         if read_buf.is_empty() && read_buf.capacity() > 65536 {
             read_buf = Vec::with_capacity(8192);
         }

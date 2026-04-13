@@ -79,6 +79,18 @@ struct Args {
     #[arg(long, value_name = "POLICY")]
     eviction: Option<String>,
 
+    /// Path to TLS certificate file (PEM format) for RESP protocol encryption.
+    /// Requires a TLS feature flag (tls-rustls or tls-native-tls).
+    /// Must be used together with --tls-key.
+    #[arg(long, value_name = "FILE")]
+    tls_cert: Option<String>,
+
+    /// Path to TLS private key file (PEM format) for RESP protocol encryption.
+    /// Requires a TLS feature flag (tls-rustls or tls-native-tls).
+    /// Must be used together with --tls-cert.
+    #[arg(long, value_name = "FILE")]
+    tls_key: Option<String>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -135,6 +147,8 @@ async fn main() {
         args.compression_threshold,
         args.wal_size,
         args.eviction,
+        args.tls_cert,
+        args.tls_key,
     );
 
     // Resolve auth tokens from file + CLI
@@ -212,6 +226,40 @@ async fn main() {
     }
     info!("HTTP:  {}:{}", cfg.server.http_host, cfg.server.http_port);
     info!("RESP:  {}:{}", cfg.server.resp_host, cfg.server.resp_port);
+
+    // Build TLS acceptor if cert/key are configured
+    #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+    let tls_acceptor = match resp::tls::build_acceptor(
+        cfg.server.tls_cert.as_deref(),
+        cfg.server.tls_key.as_deref(),
+    ) {
+        Ok(acceptor) => {
+            if acceptor.is_some() {
+                info!(
+                    "RESP TLS: enabled (cert: {})",
+                    cfg.server.tls_cert.as_deref().unwrap_or("-")
+                );
+            } else {
+                info!("RESP TLS: disabled (no cert/key configured)");
+            }
+            acceptor
+        }
+        Err(e) => {
+            eprintln!("error: failed to configure TLS: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
+    if cfg.server.tls_cert.is_some() || cfg.server.tls_key.is_some() {
+        eprintln!(
+            "error: TLS cert/key configured but TLS support not compiled in. Enable feature 'tls-rustls' or 'tls-native-tls'."
+        );
+        std::process::exit(1);
+    }
+    #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
+    info!("RESP TLS: disabled (not compiled in)");
+
     #[cfg(feature = "io-uring")]
     if cfg.server.io_uring {
         info!("RESP backend: io_uring (raw)");
@@ -315,6 +363,14 @@ async fn main() {
     let resp_server = tokio::spawn(async move {
         #[cfg(feature = "io-uring")]
         if resp_config.io_uring {
+            if cfg!(any(feature = "tls-rustls", feature = "tls-native-tls"))
+                && (resp_config.tls_cert.is_some() || resp_config.tls_key.is_some())
+            {
+                eprintln!(
+                    "error: TLS is not supported with io_uring RESP backend. Use the tokio backend for TLS."
+                );
+                std::process::exit(1);
+            }
             let host = resp_config.resp_host.clone();
             let port = resp_config.resp_port;
             let db_path = resp_config.db_path.clone();
@@ -336,7 +392,11 @@ async fn main() {
             // Keep the tokio task alive until shutdown signal
             resp_shutdown_rx.changed().await.ok();
         } else {
-            if let Err(e) = resp::server::run_with_replication(
+            #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+            let tls_acc = tls_acceptor.clone();
+            #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
+            let tls_acc = None;
+            if let Err(e) = resp::server::run_with_replication_and_tls(
                 &resp_config.resp_host,
                 resp_config.resp_port,
                 resp_engine,
@@ -345,6 +405,7 @@ async fn main() {
                 resp_config.db_path.clone(),
                 repl_state.clone(),
                 resp_shutdown_rx,
+                tls_acc,
             )
             .await
             {
@@ -355,7 +416,11 @@ async fn main() {
         #[cfg(not(feature = "io-uring"))]
         {
             let rx = resp_shutdown_rx;
-            if let Err(e) = resp::server::run_with_replication(
+            #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
+            let tls_acc = tls_acceptor.clone();
+            #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
+            let tls_acc = None;
+            if let Err(e) = resp::server::run_with_replication_and_tls(
                 &resp_config.resp_host,
                 resp_config.resp_port,
                 resp_engine,
@@ -364,6 +429,7 @@ async fn main() {
                 resp_config.db_path.clone(),
                 repl_state.clone(),
                 rx,
+                tls_acc,
             )
             .await
             {

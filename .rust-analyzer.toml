@@ -8,7 +8,7 @@ cargo.buildScripts.enable = true
 rustc.source = "discover"
 
 # Enable all cargo features for analysis (including io-uring)
-cargo.features = ["io-uring"]
+cargo.features = ["io-uring", "tls-rustls"]
 
 # Check with all features on save
-cargo.checkOnSave.features = ["io-uring"]
+cargo.checkOnSave.features = ["io-uring", "tls-rustls"]

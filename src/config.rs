@@ -45,6 +45,10 @@ pub struct ServerConfig {
     /// Eviction policy when a shard hits max_entries capacity.
     /// "reject" = reject writes (default), "ttl-first" = sweep expired then reject, "lru" = evict least-recently-used
     pub eviction: String,
+    /// Path to TLS certificate file (PEM format). Requires a TLS feature flag.
+    pub tls_cert: Option<String>,
+    /// Path to TLS private key file (PEM format). Requires a TLS feature flag.
+    pub tls_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +69,8 @@ impl Default for ServerConfig {
             compression_threshold: 1024,
             wal_size: 10_000,
             eviction: "reject".to_string(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -118,6 +124,10 @@ struct ServerFile {
     wal_size: Option<usize>,
     #[serde(default)]
     eviction: Option<String>,
+    #[serde(default)]
+    tls_cert: Option<String>,
+    #[serde(default)]
+    tls_key: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -173,6 +183,8 @@ impl Config {
                 .server
                 .eviction
                 .unwrap_or_else(|| server_defaults.eviction.clone()),
+            tls_cert: file.server.tls_cert,
+            tls_key: file.server.tls_key,
         };
 
         let auth = AuthConfig {
@@ -204,6 +216,8 @@ impl Config {
         compression_threshold: Option<usize>,
         wal_size: Option<usize>,
         eviction: Option<String>,
+        tls_cert: Option<String>,
+        tls_key: Option<String>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -253,6 +267,12 @@ impl Config {
         }
         if let Some(v) = eviction {
             self.server.eviction = v;
+        }
+        if let Some(v) = tls_cert {
+            self.server.tls_cert = Some(v);
+        }
+        if let Some(v) = tls_key {
+            self.server.tls_key = Some(v);
         }
     }
 
@@ -461,6 +481,8 @@ http_port = 9999
             None,          // compression_threshold
             None,          // wal_size
             None,          // eviction
+            None,          // tls_cert
+            None,          // tls_key
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);

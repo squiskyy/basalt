@@ -9,6 +9,8 @@ license = "MIT"
 default = []
 io-uring = ["dep:io-uring", "dep:slab", "dep:libc"]
 metrics = ["dep:prometheus"]
+tls-rustls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls-native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -31,12 +33,17 @@ io-uring = { version = "0.7", optional = true }
 slab = { version = "0.4", optional = true }
 libc = { version = "0.2", optional = true }
 prometheus = { version = "0.13", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
+native-tls = { version = "0.2", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json"] }
 rand = "0.9"
 tempfile = "3"
+rcgen = { version = "0.13", features = ["crypto"] }
 
 [[bench]]
 name = "basalt_bench"
