@@ -1,10 +1,10 @@
 /// Persistence module for Basalt KV store.
 ///
-/// Binary snapshot format (version 3):
-///   - Magic bytes: b"BASALT\x00" (8 bytes)
-///   - Version: u8 (1 byte, currently 3)
+/// Binary snapshot format (version 4, current):
+///   - Magic bytes: b"BASALT\x00" (7 bytes)
+///   - Version: u8 (1 byte, currently 4)
 ///   - Entry count: u64 (8 bytes, little-endian)
-///   - For each entry (version 3):
+///   - For each entry:
 ///     - key_len: u32 (4 bytes, LE)
 ///     - key: [u8; key_len]
 ///     - flags: u8 (1 byte, bit 0 = LZ4 compressed, bits 1-7 reserved)
@@ -16,6 +16,14 @@
 ///     - If embedding_flag == 1:
 ///       - dim: u32 (4 bytes, LE, number of f32 dimensions)
 ///       - embedding: [u8; dim * 4] (each f32 as 4 LE bytes)
+///     - entry_crc: u32 (4 bytes, LE, CRC32 of all entry bytes from key_len
+///       through end of embedding data)
+///   - footer_crc: u32 (4 bytes, LE, CRC32 of all bytes from MAGIC through
+///     the last entry_crc)
+///
+/// Version 3 format (backward compatible on read):
+///   Same as v4 but without entry_crc and footer_crc. Reading v3 snapshots
+///   will log a warning about missing checksums.
 ///
 /// Version 2 format (backward compatible on read):
 ///   Same as v3 but without the embedding_flag byte and embedding data.
@@ -42,9 +50,12 @@ use tracing::{debug, error, info, warn};
 const MAGIC: &[u8; 7] = b"BASALT\x00";
 
 /// Current snapshot format version.
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
-/// Version 3 (current: supports embedding vectors).
+/// Version 4 (current: supports embedding vectors with CRC32 checksums).
+const VERSION_4: u8 = 4;
+
+/// Version 3 (supports embedding vectors, no checksums).
 const VERSION_3: u8 = 3;
 
 /// Version 2 (no embedding vectors, but has flags byte).
@@ -104,21 +115,40 @@ pub fn write_snapshot(
         )
     })?;
 
+    // We track all bytes written for the footer CRC32
+    let mut footer_hasher = crc32fast::Hasher::new();
+
     // Header
     f.write_all(MAGIC)
         .map_err(|e| format!("write magic: {e}"))?;
-    f.write_all(&[VERSION])
+    footer_hasher.update(MAGIC);
+
+    let version_byte = [VERSION];
+    f.write_all(&version_byte)
         .map_err(|e| format!("write version: {e}"))?;
-    f.write_all(&(entries.len() as u64).to_le_bytes())
+    footer_hasher.update(&version_byte);
+
+    let count_bytes = (entries.len() as u64).to_le_bytes();
+    f.write_all(&count_bytes)
         .map_err(|e| format!("write entry count: {e}"))?;
+    footer_hasher.update(&count_bytes);
 
     // Entries
     for entry in entries {
+        // Track entry bytes for per-entry CRC32
+        let mut entry_hasher = crc32fast::Hasher::new();
+
         let key_bytes = entry.key.as_bytes();
-        f.write_all(&(key_bytes.len() as u32).to_le_bytes())
+        let key_len_bytes = (key_bytes.len() as u32).to_le_bytes();
+        f.write_all(&key_len_bytes)
             .map_err(|e| format!("write key_len: {e}"))?;
+        entry_hasher.update(&key_len_bytes);
+        footer_hasher.update(&key_len_bytes);
+
         f.write_all(key_bytes)
             .map_err(|e| format!("write key: {e}"))?;
+        entry_hasher.update(key_bytes);
+        footer_hasher.update(key_bytes);
 
         // Compress if threshold > 0 and value is large enough
         let (flags, stored_value): (u8, Vec<u8>) =
@@ -134,34 +164,73 @@ pub fn write_snapshot(
                 (0u8, entry.value.clone())
             };
 
-        f.write_all(&[flags])
+        let flags_byte = [flags];
+        f.write_all(&flags_byte)
             .map_err(|e| format!("write flags: {e}"))?;
-        f.write_all(&(stored_value.len() as u32).to_le_bytes())
+        entry_hasher.update(&flags_byte);
+        footer_hasher.update(&flags_byte);
+
+        let val_len_bytes = (stored_value.len() as u32).to_le_bytes();
+        f.write_all(&val_len_bytes)
             .map_err(|e| format!("write val_len: {e}"))?;
+        entry_hasher.update(&val_len_bytes);
+        footer_hasher.update(&val_len_bytes);
+
         f.write_all(&stored_value)
             .map_err(|e| format!("write value: {e}"))?;
-        f.write_all(&[entry.memory_type.to_u8()])
+        entry_hasher.update(&stored_value);
+        footer_hasher.update(&stored_value);
+
+        let mt_byte = [entry.memory_type.to_u8()];
+        f.write_all(&mt_byte)
             .map_err(|e| format!("write memory_type: {e}"))?;
+        entry_hasher.update(&mt_byte);
+        footer_hasher.update(&mt_byte);
 
         // Embedding flag: 0 = no embedding, 1 = has embedding
         let embedding_flag: u8 = if entry.embedding.is_some() { 1 } else { 0 };
-        f.write_all(&[embedding_flag])
+        let emb_flag_byte = [embedding_flag];
+        f.write_all(&emb_flag_byte)
             .map_err(|e| format!("write embedding_flag: {e}"))?;
+        entry_hasher.update(&emb_flag_byte);
+        footer_hasher.update(&emb_flag_byte);
 
-        f.write_all(&entry.expires_at.unwrap_or(0).to_le_bytes())
+        let exp_bytes = entry.expires_at.unwrap_or(0).to_le_bytes();
+        f.write_all(&exp_bytes)
             .map_err(|e| format!("write expires_at: {e}"))?;
+        entry_hasher.update(&exp_bytes);
+        footer_hasher.update(&exp_bytes);
 
         // If embedding is present, write dim (u32 LE) then dim*f32 bytes
         if let Some(ref emb) = entry.embedding {
             let dim = emb.len() as u32;
-            f.write_all(&dim.to_le_bytes())
+            let dim_bytes = dim.to_le_bytes();
+            f.write_all(&dim_bytes)
                 .map_err(|e| format!("write embedding dim: {e}"))?;
+            entry_hasher.update(&dim_bytes);
+            footer_hasher.update(&dim_bytes);
+
             for &val in emb {
-                f.write_all(&val.to_le_bytes())
+                let val_bytes = val.to_le_bytes();
+                f.write_all(&val_bytes)
                     .map_err(|e| format!("write embedding value: {e}"))?;
+                entry_hasher.update(&val_bytes);
+                footer_hasher.update(&val_bytes);
             }
         }
+
+        // Write per-entry CRC32 (LE)
+        let entry_crc = entry_hasher.finalize();
+        let entry_crc_bytes = entry_crc.to_le_bytes();
+        f.write_all(&entry_crc_bytes)
+            .map_err(|e| format!("write entry_crc: {e}"))?;
+        footer_hasher.update(&entry_crc_bytes);
     }
+
+    // Write footer CRC32 (LE) - CRC of all bytes from MAGIC through last entry_crc
+    let footer_crc = footer_hasher.finalize();
+    f.write_all(&footer_crc.to_le_bytes())
+        .map_err(|e| format!("write footer_crc: {e}"))?;
 
     f.flush().map_err(|e| format!("flush snapshot: {e}"))?;
     f.sync_all().map_err(|e| format!("fsync snapshot: {e}"))?;
@@ -181,8 +250,12 @@ pub fn write_snapshot(
 
 /// Read a snapshot from disk.
 ///
-/// Supports version 3 (embedding vectors), version 2 (flags byte, no embedding),
-/// and version 1 (no flags byte, no compression, no embedding).
+/// Supports version 4 (CRC32 checksums, embedding vectors), version 3 (embedding vectors, no checksums),
+/// version 2 (flags byte, no embedding), and version 1 (no flags byte, no compression, no embedding).
+///
+/// For v4 files: validates per-entry CRC32 and footer CRC32. Corrupt entries are
+/// skipped with a warning. Footer CRC mismatches are logged as warnings.
+/// For v1-v3 files: logs a warning about missing checksums.
 ///
 /// Returns the list of entries stored in the snapshot.
 pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
@@ -203,38 +276,58 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut version = [0u8; 1];
     f.read_exact(&mut version)
         .map_err(|e| format!("read version: {e}"))?;
-    if version[0] != VERSION_3 && version[0] != VERSION_2 && version[0] != VERSION_1 {
+    if version[0] != VERSION_4 && version[0] != VERSION_3 && version[0] != VERSION_2 && version[0] != VERSION_1 {
         return Err(format!(
-            "unsupported snapshot version {} in {} (expected {}, {}, or {})",
+            "unsupported snapshot version {} in {} (expected {}, {}, {}, or {})",
             version[0],
             path.display(),
             VERSION_1,
             VERSION_2,
-            VERSION_3
+            VERSION_3,
+            VERSION_4
         ));
     }
     let ver = version[0];
     let is_v1 = ver == VERSION_1;
-    let is_v3 = ver == VERSION_3;
+    let is_v4 = ver == VERSION_4;
+    let is_v3_or_v4 = ver == VERSION_3 || ver == VERSION_4;
+
+    // For v4, we track all bytes read for footer CRC validation
+    let mut footer_hasher = if is_v4 { Some(crc32fast::Hasher::new()) } else { None };
+
+    if is_v4 {
+        // Update footer hasher with magic + version
+        footer_hasher.as_mut().unwrap().update(MAGIC);
+        footer_hasher.as_mut().unwrap().update(&version);
+    }
 
     let mut count_bytes = [0u8; 8];
     f.read_exact(&mut count_bytes)
         .map_err(|e| format!("read entry count: {e}"))?;
+    if is_v4 {
+        footer_hasher.as_mut().unwrap().update(&count_bytes);
+    }
     let entry_count = u64::from_le_bytes(count_bytes) as usize;
 
     let mut entries = Vec::with_capacity(entry_count.min(1_000_000));
+    let mut skipped_count: usize = 0;
 
     for i in 0..entry_count {
+        // For v4, we need to track entry bytes to compute and verify per-entry CRC
+        let mut entry_buf: Vec<u8> = Vec::new();
+
         // key_len
         let mut len_bytes = [0u8; 4];
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read key_len at entry {i}: {e}"))?;
+        if is_v4 { entry_buf.extend_from_slice(&len_bytes); }
         let key_len = u32::from_le_bytes(len_bytes) as usize;
 
         // key
         let mut key_bytes = vec![0u8; key_len];
         f.read_exact(&mut key_bytes)
             .map_err(|e| format!("read key at entry {i}: {e}"))?;
+        if is_v4 { entry_buf.extend_from_slice(&key_bytes); }
         let key = String::from_utf8(key_bytes)
             .map_err(|e| format!("invalid key UTF-8 at entry {i}: {e}"))?;
 
@@ -245,18 +338,21 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut flags_byte = [0u8; 1];
             f.read_exact(&mut flags_byte)
                 .map_err(|e| format!("read flags at entry {i}: {e}"))?;
+            if is_v4 { entry_buf.extend_from_slice(&flags_byte); }
             flags_byte[0]
         };
 
         // val_len
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read val_len at entry {i}: {e}"))?;
+        if is_v4 { entry_buf.extend_from_slice(&len_bytes); }
         let val_len = u32::from_le_bytes(len_bytes) as usize;
 
         // value (compressed if flag set)
         let mut stored_value = vec![0u8; val_len];
         f.read_exact(&mut stored_value)
             .map_err(|e| format!("read value at entry {i}: {e}"))?;
+        if is_v4 { entry_buf.extend_from_slice(&stored_value); }
 
         let value = if (flags & FLAG_COMPRESSED) != 0 {
             lz4_flex::decompress_size_prepended(&stored_value)
@@ -269,6 +365,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut mt_byte = [0u8; 1];
         f.read_exact(&mut mt_byte)
             .map_err(|e| format!("read memory_type at entry {i}: {e}"))?;
+        if is_v4 { entry_buf.extend_from_slice(&mt_byte); }
         let memory_type = MemoryType::from_u8(mt_byte[0]).ok_or_else(|| {
             format!(
                 "invalid memory_type {} at entry {i} in {}",
@@ -277,19 +374,21 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             )
         })?;
 
-        // In v3, read embedding_flag before expires_at
+        // In v3/v4, read embedding_flag before expires_at
         // In v1/v2, no embedding data
-        let _embedding = if is_v3 {
+        let entry_result = if is_v3_or_v4 {
             // embedding_flag: 0 = no embedding, 1 = has embedding
             let mut emb_flag_byte = [0u8; 1];
             f.read_exact(&mut emb_flag_byte)
                 .map_err(|e| format!("read embedding_flag at entry {i}: {e}"))?;
+            if is_v4 { entry_buf.extend_from_slice(&emb_flag_byte); }
             let emb_flag = emb_flag_byte[0];
 
             // expires_at
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
+            if is_v4 { entry_buf.extend_from_slice(&exp_bytes); }
             let expires_at_raw = u64::from_le_bytes(exp_bytes);
             let expires_at = if expires_at_raw == 0 {
                 None
@@ -302,10 +401,12 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 let mut dim_bytes = [0u8; 4];
                 f.read_exact(&mut dim_bytes)
                     .map_err(|e| format!("read embedding dim at entry {i}: {e}"))?;
+                if is_v4 { entry_buf.extend_from_slice(&dim_bytes); }
                 let dim = u32::from_le_bytes(dim_bytes) as usize;
                 let mut emb_data = vec![0u8; dim * 4];
                 f.read_exact(&mut emb_data)
                     .map_err(|e| format!("read embedding data at entry {i}: {e}"))?;
+                if is_v4 { entry_buf.extend_from_slice(&emb_data); }
                 let mut embedding = Vec::with_capacity(dim);
                 for j in 0..dim {
                     let offset = j * 4;
@@ -328,21 +429,20 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 ));
             };
 
-            // We need to return both expires_at and embedding, but we read
-            // expires_at here. Use a small struct-like approach via early push.
-            entries.push(SnapshotEntry {
+            Ok::<SnapshotEntry, String>(SnapshotEntry {
                 key,
                 value,
                 memory_type,
                 expires_at,
                 embedding: emb,
-            });
-            continue;
+            })
         } else {
             // v1/v2: no embedding flag, read expires_at directly
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
+            if is_v4 { entry_buf.extend_from_slice(&exp_bytes); }
+
             let expires_at_raw = u64::from_le_bytes(exp_bytes);
             let expires_at = if expires_at_raw == 0 {
                 None
@@ -350,15 +450,78 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 Some(expires_at_raw)
             };
 
-            entries.push(SnapshotEntry {
+            Ok::<SnapshotEntry, String>(SnapshotEntry {
                 key,
                 value,
                 memory_type,
                 expires_at,
                 embedding: None,
-            });
-            continue;
+            })
         };
+
+        let entry = entry_result?;
+
+        // For v4, read and verify per-entry CRC32
+        if is_v4 {
+            let mut entry_crc_bytes = [0u8; 4];
+            f.read_exact(&mut entry_crc_bytes)
+                .map_err(|e| format!("read entry_crc at entry {i}: {e}"))?;
+            let stored_entry_crc = u32::from_le_bytes(entry_crc_bytes);
+
+            // Compute CRC32 of the entry bytes we read
+            let mut entry_hasher = crc32fast::Hasher::new();
+            entry_hasher.update(&entry_buf);
+            let computed_entry_crc = entry_hasher.finalize();
+
+            // Update footer hasher with entry bytes + entry_crc
+            footer_hasher.as_mut().unwrap().update(&entry_buf);
+            footer_hasher.as_mut().unwrap().update(&entry_crc_bytes);
+
+            if computed_entry_crc != stored_entry_crc {
+                warn!(
+                    "snapshot entry {i} CRC32 mismatch: computed {computed_entry_crc:#010x}, stored {stored_entry_crc:#010x} in {}, skipping entry",
+                    path.display()
+                );
+                skipped_count += 1;
+                continue;
+            }
+        }
+
+        entries.push(entry);
+    }
+
+    // For v4, read and verify footer CRC32
+    if is_v4 {
+        let mut footer_crc_bytes = [0u8; 4];
+        if let Err(e) = f.read_exact(&mut footer_crc_bytes) {
+            warn!("snapshot footer CRC32 missing or unreadable in {}: {e}", path.display());
+        } else {
+            let stored_footer_crc = u32::from_le_bytes(footer_crc_bytes);
+            let footer_hasher = footer_hasher.take().unwrap();
+            let computed_footer_crc = footer_hasher.finalize();
+            if computed_footer_crc != stored_footer_crc {
+                warn!(
+                    "snapshot footer CRC32 mismatch: computed {computed_footer_crc:#010x}, stored {stored_footer_crc:#010x} in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // For v1-v3, warn about missing checksums
+    if ver == VERSION_1 || ver == VERSION_2 || ver == VERSION_3 {
+        warn!(
+            "snapshot has no checksums (version {}), consider re-saving to upgrade format",
+            ver
+        );
+    }
+
+    // Log if any corrupt entries were skipped
+    if skipped_count > 0 {
+        warn!(
+            "skipped {skipped_count} corrupt entry/entries in snapshot {}",
+            path.display()
+        );
     }
 
     Ok(entries)
@@ -1161,6 +1324,482 @@ mod tests {
             "error was: {err}"
         );
         assert!(err.contains("99"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_roundtrip() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_roundtrip");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "v4:key1".to_string(),
+                value: b"hello v4".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: None,
+            },
+            SnapshotEntry {
+                key: "v4:key2".to_string(),
+                value: b"world v4".to_vec(),
+                memory_type: MemoryType::Episodic,
+                expires_at: Some(9999999999999),
+                embedding: None,
+            },
+            SnapshotEntry {
+                key: "v4:key3".to_string(),
+                value: vec![0, 1, 2, 3, 255],
+                memory_type: MemoryType::Procedural,
+                expires_at: Some(12345),
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        assert!(path.exists());
+
+        // Verify the file starts with version 4
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(raw[7], 4, "snapshot version byte should be 4");
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+
+        assert_eq!(loaded[0].key, "v4:key1");
+        assert_eq!(loaded[0].value, b"hello v4".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+
+        assert_eq!(loaded[1].key, "v4:key2");
+        assert_eq!(loaded[1].value, b"world v4".to_vec());
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(9999999999999));
+        assert_eq!(loaded[1].embedding, None);
+
+        assert_eq!(loaded[2].key, "v4:key3");
+        assert_eq!(loaded[2].value, vec![0, 1, 2, 3, 255]);
+        assert_eq!(loaded[2].memory_type, MemoryType::Procedural);
+        assert_eq!(loaded[2].expires_at, Some(12345));
+        assert_eq!(loaded[2].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_corrupt_entry() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_corrupt_entry");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write 3 entries
+        let entries = vec![
+            SnapshotEntry {
+                key: "good:1".to_string(),
+                value: b"good value 1".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: None,
+            },
+            SnapshotEntry {
+                key: "bad:2".to_string(),
+                value: b"bad value 2".to_vec(),
+                memory_type: MemoryType::Episodic,
+                expires_at: Some(55555),
+                embedding: None,
+            },
+            SnapshotEntry {
+                key: "good:3".to_string(),
+                value: b"good value 3".to_vec(),
+                memory_type: MemoryType::Procedural,
+                expires_at: None,
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        let mut raw = fs::read(&path).unwrap();
+
+        // Corrupt a byte in the second entry's value data area so the entry can still
+        // be parsed (key is valid UTF-8) but the CRC32 will mismatch.
+        // Header is 16 bytes (7 magic + 1 version + 8 count)
+        // First entry: key="good:1"(6) -> key_len(4)+key(6)+flags(1)+val_len(4)+value(12)+mt(1)+emb_flag(1)+expires_at(8)+entry_crc(4) = 41
+        // Second entry starts at offset 16 + 41 = 57
+        // Entry2 layout: key_len(4) + key("bad:2"=6) + flags(1) + val_len(4) + value("bad value 2"=12) + ...
+        // Corrupt a byte in the value area of entry 2
+        let entry2_val_offset = 57 + 4 + 6 + 1 + 4; // after key_len + key + flags + val_len
+        raw[entry2_val_offset] ^= 0xFF;
+
+        fs::write(&path, &raw).unwrap();
+
+        // Read should succeed but skip the corrupt entry
+        let loaded = read_snapshot(&path).unwrap();
+        // The corrupt entry should be skipped, so we get 2 valid entries
+        assert_eq!(loaded.len(), 2, "corrupt entry should be skipped");
+        assert_eq!(loaded[0].key, "good:1");
+        assert_eq!(loaded[1].key, "good:3");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_missing_footer_crc() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_missing_footer");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "test:1".to_string(),
+                value: b"test value".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        let mut raw = fs::read(&path).unwrap();
+
+        // Truncate the last 4 bytes (footer CRC)
+        raw.truncate(raw.len() - 4);
+        fs::write(&path, &raw).unwrap();
+
+        // Read should still work, with a warning about missing footer CRC
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "test:1");
+        assert_eq!(loaded[0].value, b"test value".to_vec());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_corrupt_footer() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_corrupt_footer");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "test:1".to_string(),
+                value: b"test value".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        let mut raw = fs::read(&path).unwrap();
+
+        // Corrupt the footer CRC (last 4 bytes)
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+
+        fs::write(&path, &raw).unwrap();
+
+        // Read should still succeed, entries should be valid, but footer CRC warning logged
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key, "test:1");
+        assert_eq!(loaded[0].value, b"test value".to_vec());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_backward_compat_v3() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_compat_v3");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create a version 3 snapshot (same as v4 but without entry_crc and footer_crc)
+        let path = dir.join("snapshot-1000.bin");
+        let mut data = Vec::new();
+
+        // Magic
+        data.extend_from_slice(b"BASALT\x00");
+        // Version 3
+        data.push(3u8);
+        // Count: 2 entries
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        // Entry 1: key="v3key1", value="v3val1", flags=0, memory_type=Semantic, embedding_flag=0, expires_at=0
+        let key1 = b"v3key1";
+        data.extend_from_slice(&(key1.len() as u32).to_le_bytes());
+        data.extend_from_slice(key1);
+        data.push(0u8); // flags: no compression
+        let val1 = b"v3val1";
+        data.extend_from_slice(&(val1.len() as u32).to_le_bytes());
+        data.extend_from_slice(val1);
+        data.push(1u8); // Semantic
+        data.push(0u8); // embedding_flag: no embedding
+        data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+        // Entry 2: key="v3key2", value=[10,20,30], flags=0, memory_type=Episodic, embedding_flag=1, expires_at=55555
+        let key2 = b"v3key2";
+        data.extend_from_slice(&(key2.len() as u32).to_le_bytes());
+        data.extend_from_slice(key2);
+        data.push(0u8); // flags: no compression
+        let val2: Vec<u8> = vec![10, 20, 30];
+        data.extend_from_slice(&(val2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&val2);
+        data.push(0u8); // Episodic
+        data.push(1u8); // embedding_flag: has embedding
+        data.extend_from_slice(&55555u64.to_le_bytes());
+        // embedding: dim=3, values [1.0, -2.0, 0.5]
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&1.0f32.to_le_bytes());
+        data.extend_from_slice(&(-2.0f32).to_le_bytes());
+        data.extend_from_slice(&0.5f32.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        // Read back using current reader - should handle v3 format with warning
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].key, "v3key1");
+        assert_eq!(loaded[0].value, b"v3val1".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+
+        assert_eq!(loaded[1].key, "v3key2");
+        assert_eq!(loaded[1].value, vec![10, 20, 30]);
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(55555));
+        assert!(loaded[1].embedding.is_some());
+        let emb = loaded[1].embedding.as_ref().unwrap();
+        assert_eq!(emb.len(), 3);
+        assert!((emb[0] - 1.0f32).abs() < 1e-6);
+        assert!((emb[1] - (-2.0f32)).abs() < 1e-6);
+        assert!((emb[2] - 0.5f32).abs() < 1e-6);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_backward_compat_v2() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_compat_v2");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create a version 2 snapshot (flags byte, but no embedding_flag/embedding data)
+        // v2 format per entry: key_len(u32) key bytes flags(u8) val_len(u32) value bytes memory_type(u8) expires_at(u64)
+        let path = dir.join("snapshot-1000.bin");
+        let mut data = Vec::new();
+
+        // Magic
+        data.extend_from_slice(b"BASALT\x00");
+        // Version 2
+        data.push(2u8);
+        // Count: 2 entries
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        // Entry 1: key="v2key1", value="v2val1", flags=0, memory_type=Semantic, expires_at=0
+        let key1 = b"v2key1";
+        data.extend_from_slice(&(key1.len() as u32).to_le_bytes());
+        data.extend_from_slice(key1);
+        data.push(0u8); // flags: no compression
+        let val1 = b"v2val1";
+        data.extend_from_slice(&(val1.len() as u32).to_le_bytes());
+        data.extend_from_slice(val1);
+        data.push(1u8); // Semantic
+        data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+        // Entry 2: key="v2key2", value=[10,20,30], flags=0, memory_type=Episodic, expires_at=55555
+        let key2 = b"v2key2";
+        data.extend_from_slice(&(key2.len() as u32).to_le_bytes());
+        data.extend_from_slice(key2);
+        data.push(0u8); // flags: no compression
+        let val2: Vec<u8> = vec![10, 20, 30];
+        data.extend_from_slice(&(val2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&val2);
+        data.push(0u8); // Episodic
+        data.extend_from_slice(&55555u64.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        // Read back using current reader - should handle v2 format with warning
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].key, "v2key1");
+        assert_eq!(loaded[0].value, b"v2val1".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+
+        assert_eq!(loaded[1].key, "v2key2");
+        assert_eq!(loaded[1].value, vec![10, 20, 30]);
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(55555));
+        assert_eq!(loaded[1].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_backward_compat_v1() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_compat_v1");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Manually create a version 1 snapshot (no flags byte)
+        let path = dir.join("snapshot-1000.bin");
+        let mut data = Vec::new();
+
+        // Magic
+        data.extend_from_slice(b"BASALT\x00");
+        // Version 1
+        data.push(1u8);
+        // Count: 2 entries
+        data.extend_from_slice(&2u64.to_le_bytes());
+
+        // Entry 1: key="hello", value="world", memory_type=Semantic, expires_at=0
+        let key1 = b"hello";
+        data.extend_from_slice(&(key1.len() as u32).to_le_bytes());
+        data.extend_from_slice(key1);
+        let val1 = b"world";
+        data.extend_from_slice(&(val1.len() as u32).to_le_bytes());
+        data.extend_from_slice(val1);
+        data.push(1u8); // Semantic
+        data.extend_from_slice(&0u64.to_le_bytes()); // no expiry
+
+        // Entry 2: key="test", value=[0,1,2,3], memory_type=Procedural, expires_at=99999
+        let key2 = b"test";
+        data.extend_from_slice(&(key2.len() as u32).to_le_bytes());
+        data.extend_from_slice(key2);
+        let val2: Vec<u8> = vec![0, 1, 2, 3];
+        data.extend_from_slice(&(val2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&val2);
+        data.push(2u8); // Procedural
+        data.extend_from_slice(&99999u64.to_le_bytes());
+
+        fs::write(&path, &data).unwrap();
+
+        // Read back using current reader - should handle v1 format with warning
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        assert_eq!(loaded[0].key, "hello");
+        assert_eq!(loaded[0].value, b"world".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+
+        assert_eq!(loaded[1].key, "test");
+        assert_eq!(loaded[1].value, vec![0, 1, 2, 3]);
+        assert_eq!(loaded[1].memory_type, MemoryType::Procedural);
+        assert_eq!(loaded[1].expires_at, Some(99999));
+        assert_eq!(loaded[1].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_empty_snapshot() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_empty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entries: Vec<SnapshotEntry> = vec![];
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+
+        // Verify version byte is 4
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(raw[7], 4, "empty snapshot version should be 4");
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v4_with_embeddings() {
+        let dir = std::env::temp_dir().join("basalt_test_v4_embeddings");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let embedding1 = vec![0.1f32, 0.2, 0.3, 0.4, 0.5];
+        let embedding2 = vec![-1.0f32, 2.5, -0.001, 100.0];
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "emb:1".to_string(),
+                value: b"data1".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: Some(embedding1.clone()),
+            },
+            SnapshotEntry {
+                key: "emb:2".to_string(),
+                value: b"data2".to_vec(),
+                memory_type: MemoryType::Episodic,
+                expires_at: Some(88888),
+                embedding: Some(embedding2.clone()),
+            },
+            SnapshotEntry {
+                key: "noemb:3".to_string(),
+                value: b"data3".to_vec(),
+                memory_type: MemoryType::Procedural,
+                expires_at: Some(99999),
+                embedding: None,
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+
+        // Entry with embedding, no expiry
+        assert_eq!(loaded[0].key, "emb:1");
+        assert_eq!(loaded[0].value, b"data1".to_vec());
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert!(loaded[0].embedding.is_some());
+        let emb0 = loaded[0].embedding.as_ref().unwrap();
+        assert_eq!(emb0.len(), 5);
+        for (i, &v) in embedding1.iter().enumerate() {
+            assert!(
+                (emb0[i] - v).abs() < 1e-6,
+                "embedding1[{}] = {} vs {}",
+                i,
+                emb0[i],
+                v
+            );
+        }
+
+        // Entry with embedding and expiry
+        assert_eq!(loaded[1].key, "emb:2");
+        assert_eq!(loaded[1].value, b"data2".to_vec());
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(88888));
+        assert!(loaded[1].embedding.is_some());
+        let emb1 = loaded[1].embedding.as_ref().unwrap();
+        assert_eq!(emb1.len(), 4);
+        for (i, &v) in embedding2.iter().enumerate() {
+            assert!(
+                (emb1[i] - v).abs() < 1e-6,
+                "embedding2[{}] = {} vs {}",
+                i,
+                emb1[i],
+                v
+            );
+        }
+
+        // Entry without embedding
+        assert_eq!(loaded[2].key, "noemb:3");
+        assert_eq!(loaded[2].value, b"data3".to_vec());
+        assert_eq!(loaded[2].memory_type, MemoryType::Procedural);
+        assert_eq!(loaded[2].expires_at, Some(99999));
+        assert_eq!(loaded[2].embedding, None);
 
         fs::remove_dir_all(&dir).ok();
     }

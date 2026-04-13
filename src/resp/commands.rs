@@ -7,13 +7,10 @@ use crate::store::memory_type::MemoryType;
 use super::parser::{Command, RespValue};
 
 /// Extract the namespace from a key in "namespace:key" format.
-/// Returns the namespace portion (before the first ':'), or the full key if no ':' is present.
+/// Returns the namespace portion (before the first ':'), or None if no ':' is present.
 /// For constructing namespaced keys, prefer `NamespacedKey::new()`.
-pub fn extract_namespace(key: &str) -> &str {
-    match key.find(':') {
-        Some(pos) => &key[..pos],
-        None => key,
-    }
+pub fn extract_namespace(key: &str) -> Option<&str> {
+    key.find(':').map(|pos| &key[..pos])
 }
 
 /// Commands that do not access any key and thus need no per-command namespace check.
@@ -67,7 +64,15 @@ pub fn check_command_namespace(
         let mut i = 0;
         while i < cmd.args.len() {
             let key = String::from_utf8_lossy(&cmd.args[i]).to_string();
-            let ns = extract_namespace(&key);
+            let ns = match extract_namespace(&key) {
+                Some(ns) => ns,
+                None => {
+                    return Err(RespValue::Error(
+                        "ERR key must include namespace prefix (format: namespace:key)"
+                            .to_string(),
+                    ))
+                }
+            };
             if !auth.is_authorized(token, ns) {
                 return Err(RespValue::Error(format!(
                     "NOAUTH Token not authorized for namespace '{}'",
@@ -83,7 +88,15 @@ pub fn check_command_namespace(
     if name == "MGET" || name == "DEL" {
         for arg in &cmd.args {
             let key = String::from_utf8_lossy(arg).to_string();
-            let ns = extract_namespace(&key);
+            let ns = match extract_namespace(&key) {
+                Some(ns) => ns,
+                None => {
+                    return Err(RespValue::Error(
+                        "ERR key must include namespace prefix (format: namespace:key)"
+                            .to_string(),
+                    ))
+                }
+            };
             if !auth.is_authorized(token, ns) {
                 return Err(RespValue::Error(format!(
                     "NOAUTH Token not authorized for namespace '{}'",
@@ -97,7 +110,15 @@ pub fn check_command_namespace(
     // For single-key commands, check the first key arg
     if key_index < cmd.args.len() {
         let key = String::from_utf8_lossy(&cmd.args[key_index]).to_string();
-        let ns = extract_namespace(&key);
+        let ns = match extract_namespace(&key) {
+            Some(ns) => ns,
+            None => {
+                return Err(RespValue::Error(
+                    "ERR key must include namespace prefix (format: namespace:key)"
+                        .to_string(),
+                ))
+            }
+        };
         if !auth.is_authorized(token, ns) {
             return Err(RespValue::Error(format!(
                 "NOAUTH Token not authorized for namespace '{}'",

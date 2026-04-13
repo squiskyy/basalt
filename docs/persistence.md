@@ -71,6 +71,69 @@ Per entry:
 - Only compresses if LZ4 actually reduces the size (incompressible data stays uncompressed)
 - v2 reader can read v1 snapshots (backward compatible - no flags byte when version=1)
 
+### v3 Format (with embedding vectors)
+
+Same header but VERSION = 3. Adds an embedding flag and optional embedding data per entry:
+
+```
+Per entry:
+  key_len:        u32 LE
+  key:            [u8; key_len]
+  flags:          u8                  (bit 0 = compressed)
+  val_len:        u32 LE
+  value:          [u8; val_len]       (LZ4-compressed if flag bit 0 set)
+  mem_type:       u8
+  embedding_flag: u8                  (0 = no embedding, 1 = has embedding)
+  expires_at:     u64 LE
+  If embedding_flag == 1:
+    dim:          u32 LE              (number of f32 dimensions)
+    embedding:    [u8; dim * 4]       (each f32 as 4 LE bytes)
+```
+
+- v3 reader can read v1 and v2 snapshots (backward compatible)
+
+### v4 Format (with CRC32 checksums)
+
+Current format (VERSION = 4). Adds per-entry and footer CRC32 checksums for corruption detection:
+
+```
+MAGIC:        b"BASALT\x00" (7 bytes)
+VERSION:      u8 (1 byte, value = 4)
+COUNT:        u64 LE (8 bytes)
+
+Per entry (same fields as v3, plus entry_crc):
+  key_len:        u32 LE
+  key:            [u8; key_len]
+  flags:          u8
+  val_len:        u32 LE
+  value:          [u8; val_len]
+  mem_type:       u8
+  embedding_flag: u8
+  expires_at:     u64 LE
+  If embedding_flag == 1:
+    dim:          u32 LE
+    embedding:    [u8; dim * 4]
+  entry_crc:      u32 LE              (CRC32 of all entry bytes from key_len through embedding)
+
+Footer:
+  footer_crc:     u32 LE              (CRC32 of all bytes from MAGIC through last entry_crc)
+```
+
+**Why checksums?** The `.tmp` + `rename` atomic write pattern protects against partial writes from the snapshot process, but does not protect against:
+- Filesystem corruption
+- Bit rot on disk
+- Accidental manual editing of snapshot files
+- Disk full during write (rename succeeds, data truncated)
+- Crash between write and fsync
+
+**Recovery behavior:**
+- Per-entry CRC mismatch: the entry is skipped with a warning, restore continues with remaining entries
+- Footer CRC mismatch: a warning is logged, but entries that passed their individual CRC checks are still loaded
+- v1-v3 snapshots: still readable with a logged warning suggesting re-save to upgrade format
+- Re-saving a snapshot (triggering a new snapshot write) upgrades it to v4 format
+
+**Performance:** CRC32 via `crc32fast` adds negligible overhead - ~4 bytes per entry + 4 bytes footer, with hardware-accelerated CRC computation on modern CPUs.
+
 ### Memory Type Encoding
 
 | Value | Type |
@@ -192,7 +255,8 @@ Snapshots are written with default OS file permissions. The `db_path` directory 
 ### Disk Space Estimate
 
 Each entry in a snapshot takes roughly:
-- 4 bytes (key_len) + key bytes + 1 byte (flags) + 4 bytes (val_len) + value bytes + 1 byte (mem_type) + 8 bytes (expires_at)
+- 4 bytes (key_len) + key bytes + 1 byte (flags) + 4 bytes (val_len) + value bytes + 1 byte (mem_type) + 1 byte (embedding_flag) + 8 bytes (expires_at) + 4 bytes (entry_crc)
+- Plus 16 bytes header + 4 bytes footer_crc for the whole file
 
 For 1 million entries averaging 256 bytes per value:
 - Uncompressed: ~270 MB per snapshot
@@ -204,13 +268,18 @@ For 1 million entries averaging 256 bytes per value:
 1. If `db_path` is configured, find the latest snapshot file
 2. Read and validate the magic header and version
 3. Deserialize each entry:
-   - If version 2 and flags bit 0 is set, decompress the value
-   - If version 1, no flags byte (backward compatible)
-4. Insert each entry via `engine.set_force()` which bypasses capacity limits
+   - If version 4, verify per-entry CRC32 (skip corrupt entries with warning, continue with rest)
+   - If version 4, verify footer CRC32 after all entries (warn on mismatch)
+   - If version 3, read embedding vectors (no checksums - warn about missing checksums)
+   - If version 2 and flags bit 0 is set, decompress the value (no checksums - warn)
+   - If version 1, no flags byte (backward compatible - warn)
+4. Insert each valid entry via `engine.set_force()` which bypasses capacity limits
 5. Skip entries where `expires_at < now` (already expired)
-6. Log the number of restored entries
+6. Log the number of restored entries, plus any corrupt entries skipped
 
 `set_force()` is used instead of `set()` so that snapshots always restore fully regardless of the current `max_entries` setting.
+
+v1-v3 snapshots are fully readable but will log a warning recommending re-save to upgrade to v4 format. Triggering a new snapshot (via auto-snapshot interval, manual `POST /snapshot`, or `SNAP` command) writes a v4 file, effectively upgrading the format.
 
 ## Monitoring
 

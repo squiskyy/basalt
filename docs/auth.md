@@ -174,7 +174,13 @@ PING (no auth)           → -NOAUTH Authentication required
 5. If valid: `authenticated = true`, client can issue commands
 6. If invalid: `-ERR invalid token`, client remains unauthenticated
 
-Note: RESP uses a single auth token per connection (no per-command namespace scoping like HTTP). The token's namespace list determines which keys the connection can access.
+RESP now supports per-command namespace scoping, matching HTTP behavior. Each key must use the `namespace:key` format, and the namespace is extracted and checked against the token's authorized namespaces on every command.
+
+- The namespace is extracted from the key prefix (the portion before the first `:`)
+- Keys without a namespace prefix (no `:` separator) are rejected with an error: `ERR key must include namespace prefix (format: namespace:key)`
+- Wildcard tokens (`*`) bypass per-command namespace checks entirely
+- Multi-key commands (MGET, MSET, DEL) check every key in the argument list
+- Commands that do not access keys (PING, INFO, SNAP, AUTH, REPLICAOF) skip namespace checks
 
 ### AUTH is Intercepted at Connection Level
 

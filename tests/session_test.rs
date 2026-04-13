@@ -371,3 +371,122 @@ fn test_invalid_command_format() {
         other => panic!("expected error response, got: {:?}", other),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 13. Key without namespace prefix is rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_key_without_namespace_prefix_rejected() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "scoped".to_string(),
+        vec!["ns-alpha".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    // Authenticate with scoped token
+    let auth_cmd = make_command("AUTH", &["scoped"]);
+    let _ = session.process_command_batch(&[auth_cmd], &handler);
+
+    // GET with a bare key (no colon) should be rejected with namespace prefix error
+    let get_cmd = make_command("GET", &["mykey"]);
+    let result = session.process_command_batch(&[get_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(
+                msg.contains("namespace prefix"),
+                "expected namespace prefix error, got: {msg}"
+            );
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. SET key without namespace prefix is rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_set_key_without_namespace_prefix_rejected() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "scoped".to_string(),
+        vec!["ns-alpha".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    let auth_cmd = make_command("AUTH", &["scoped"]);
+    let _ = session.process_command_batch(&[auth_cmd], &handler);
+
+    // SET with a bare key (no colon) should be rejected
+    let set_cmd = make_command("SET", &["barekey", "value"]);
+    let result = session.process_command_batch(&[set_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(
+                msg.contains("namespace prefix"),
+                "expected namespace prefix error, got: {msg}"
+            );
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. MGET with mix of namespaced and bare keys is rejected
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_mget_bare_key_rejected() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "scoped".to_string(),
+        vec!["ns-alpha".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    let auth_cmd = make_command("AUTH", &["scoped"]);
+    let _ = session.process_command_batch(&[auth_cmd], &handler);
+
+    // MGET where one key lacks namespace prefix
+    let mget_cmd = make_command("MGET", &["ns-alpha:key1", "barekey"]);
+    let result = session.process_command_batch(&[mget_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(
+                msg.contains("namespace prefix"),
+                "expected namespace prefix error, got: {msg}"
+            );
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 16. Wildcard token allows bare key (no namespace check needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_wildcard_token_bypasses_namespace_check() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "admin".to_string(),
+        vec!["*".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    let auth_cmd = make_command("AUTH", &["admin"]);
+    let _ = session.process_command_batch(&[auth_cmd], &handler);
+
+    // With wildcard token, even a bare key should work (no namespace check at all)
+    let set_cmd = make_command("SET", &["barekey", "value"]);
+    let result = session.process_command_batch(&[set_cmd], &handler);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+}
