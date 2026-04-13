@@ -1,0 +1,373 @@
+//! Unit tests for ClientSession (src/resp/session.rs).
+//!
+//! Covers auth flow, namespace scoping, REPLICAOF actions,
+//! pipeline batching, and invalid command format handling.
+
+use std::sync::Arc;
+
+use basalt::http::auth::AuthStore;
+use basalt::resp::commands::CommandHandler;
+use basalt::resp::parser::{RespValue, parse_pipeline};
+use basalt::resp::session::{ClientSession, SessionAction};
+use basalt::store::engine::KvEngine;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Build a RESP array value representing a single command with arguments.
+fn make_command(name: &str, args: &[&str]) -> RespValue {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(format!("*{}\r\n", 1 + args.len()).as_bytes());
+    buf.extend_from_slice(format!("${}\r\n{name}\r\n", name.len()).as_bytes());
+    for arg in args {
+        buf.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+    }
+    let (values, _) = parse_pipeline(&buf);
+    assert_eq!(values.len(), 1, "expected exactly one parsed value");
+    values.into_iter().next().unwrap()
+}
+
+/// Create a CommandHandler backed by a fresh KvEngine with 4 shards.
+fn make_handler() -> CommandHandler {
+    let engine = Arc::new(KvEngine::new(4));
+    CommandHandler::new(engine, None)
+}
+
+/// Human-readable name for a SessionAction variant (no Debug derive).
+fn action_name(action: &SessionAction) -> &'static str {
+    match action {
+        SessionAction::ReplicaofNoOne => "ReplicaofNoOne",
+        SessionAction::ReplicaofReplicate { .. } => "ReplicaofReplicate",
+        SessionAction::None => "None",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. No-auth PING
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_no_auth_ping() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    let cmd = make_command("PING", &[]);
+    let result = session.process_command_batch(&[cmd], &handler);
+
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("PONG".to_string())
+    );
+    assert!(matches!(result.action, SessionAction::None));
+}
+
+// ---------------------------------------------------------------------------
+// 2. No-auth SET + GET
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_no_auth_set_get() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    let set_cmd = make_command("SET", &["mykey", "myvalue"]);
+    let result = session.process_command_batch(&[set_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+
+    let get_cmd = make_command("GET", &["mykey"]);
+    let result = session.process_command_batch(&[get_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::BulkString(Some(b"myvalue".to_vec()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Auth required, unauthenticated -> NOAUTH error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auth_required_rejects_commands() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "valid-token".to_string(),
+        vec!["*".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    assert!(!session.is_authenticated());
+
+    let cmd = make_command("PING", &[]);
+    let result = session.process_command_batch(&[cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::Error("NOAUTH Authentication required".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Auth with valid token, then PING works
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auth_succeeds_then_commands_work() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "valid-token".to_string(),
+        vec!["*".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    // AUTH first
+    let auth_cmd = make_command("AUTH", &["valid-token"]);
+    let result = session.process_command_batch(&[auth_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+    assert!(session.is_authenticated());
+
+    // Now PING should work
+    let ping_cmd = make_command("PING", &[]);
+    let result = session.process_command_batch(&[ping_cmd], &handler);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("PONG".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Auth with wrong token
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_auth_wrong_token() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "valid-token".to_string(),
+        vec!["*".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    let auth_cmd = make_command("AUTH", &["wrong-token"]);
+    let result = session.process_command_batch(&[auth_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::Error("ERR invalid token".to_string())
+    );
+
+    // Session should still be unauthenticated
+    assert!(!session.is_authenticated());
+}
+
+// ---------------------------------------------------------------------------
+// 6. Scoped token can access own namespace
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_scoped_token_can_access_own_namespace() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "scoped".to_string(),
+        vec!["ns-alpha".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    // Authenticate with scoped token
+    let auth_cmd = make_command("AUTH", &["scoped"]);
+    let result = session.process_command_batch(&[auth_cmd], &handler);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+
+    // SET in own namespace should succeed
+    let set_cmd = make_command("SET", &["ns-alpha:key", "value1"]);
+    let result = session.process_command_batch(&[set_cmd], &handler);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+
+    // GET from own namespace should succeed
+    let get_cmd = make_command("GET", &["ns-alpha:key"]);
+    let result = session.process_command_batch(&[get_cmd], &handler);
+    assert_eq!(
+        result.responses[0],
+        RespValue::BulkString(Some(b"value1".to_vec()))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Scoped token cannot access other namespace
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_scoped_token_cannot_access_other_namespace() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "scoped".to_string(),
+        vec!["ns-alpha".to_string()],
+    )]));
+    let mut session = ClientSession::new(auth, true);
+    let handler = make_handler();
+
+    // Authenticate with scoped token
+    let auth_cmd = make_command("AUTH", &["scoped"]);
+    let _ = session.process_command_batch(&[auth_cmd], &handler);
+
+    // SET in a different namespace should be rejected
+    let set_cmd = make_command("SET", &["ns-beta:key", "value2"]);
+    let result = session.process_command_batch(&[set_cmd], &handler);
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(
+                msg.contains("NOAUTH") && msg.contains("ns-beta"),
+                "expected NOAUTH error for ns-beta, got: {msg}"
+            );
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. REPLICAOF NO ONE
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_replicaof_no_one() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    let cmd = make_command("REPLICAOF", &["NO", "ONE"]);
+    let result = session.process_command_batch(&[cmd], &handler);
+
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+    assert!(matches!(result.action, SessionAction::ReplicaofNoOne));
+}
+
+// ---------------------------------------------------------------------------
+// 9. REPLICAOF host port
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_replicaof_replicate() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    let cmd = make_command("REPLICAOF", &["127.0.0.1", "6379"]);
+    let result = session.process_command_batch(&[cmd], &handler);
+
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+    match result.action {
+        SessionAction::ReplicaofReplicate { host, port } => {
+            assert_eq!(host, "127.0.0.1");
+            assert_eq!(port, 6379);
+        }
+        other => panic!("expected ReplicaofReplicate, got {}", action_name(&other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. REPLICAOF invalid syntax
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_replicaof_invalid() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    // No arguments at all
+    let cmd = make_command("REPLICAOF", &[]);
+    let result = session.process_command_batch(&[cmd], &handler);
+
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(msg.contains("ERR"), "expected ERR in response, got: {msg}");
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+    assert!(matches!(result.action, SessionAction::None));
+}
+
+// ---------------------------------------------------------------------------
+// 11. Pipeline: multiple commands in one batch
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pipeline_multiple_commands() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    let ping = make_command("PING", &[]);
+    let set_cmd = make_command("SET", &["pipekey", "pipeval"]);
+    let get_cmd = make_command("GET", &["pipekey"]);
+
+    let result = session.process_command_batch(&[ping, set_cmd, get_cmd], &handler);
+
+    assert_eq!(result.responses.len(), 3);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("PONG".to_string())
+    );
+    assert_eq!(
+        result.responses[1],
+        RespValue::SimpleString("OK".to_string())
+    );
+    assert_eq!(
+        result.responses[2],
+        RespValue::BulkString(Some(b"pipeval".to_vec()))
+    );
+    assert!(matches!(result.action, SessionAction::None));
+}
+
+// ---------------------------------------------------------------------------
+// 12. Invalid command format (SimpleString instead of Array)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_invalid_command_format() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::new(auth, false);
+    let handler = make_handler();
+
+    // A SimpleString is not a valid RESP command array
+    let bad_value = RespValue::SimpleString("JUST A STRING".to_string());
+    let result = session.process_command_batch(&[bad_value], &handler);
+
+    assert_eq!(result.responses.len(), 1);
+    match &result.responses[0] {
+        RespValue::Error(msg) => {
+            assert!(
+                msg.contains("invalid command format"),
+                "expected 'invalid command format' error, got: {msg}"
+            );
+        }
+        other => panic!("expected error response, got: {:?}", other),
+    }
+}
