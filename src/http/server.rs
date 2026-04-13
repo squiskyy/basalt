@@ -11,13 +11,15 @@ use crate::store::NamespacedKey;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
+use crate::metrics::Metrics;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
-    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, HealthResponse,
+    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse,
     InfoResponse, ListQuery, ListResponse, SearchRequest, SearchResponse, SearchResult,
     SimpleResponse, StoreRequest, StoreResponse,
 };
+use super::ready::{ReadyResponse, ReadyState};
 
 /// Shared application state wrapping the KV engine, auth store, and optional db_path.
 #[derive(Clone)]
@@ -27,6 +29,8 @@ pub struct AppState {
     pub db_path: Option<String>,
     pub compression_threshold: usize,
     pub repl_state: Option<Arc<crate::replication::ReplicationState>>,
+    pub ready_state: Arc<ReadyState>,
+    pub metrics: Arc<dyn Metrics>,
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
@@ -36,6 +40,8 @@ pub fn app(
     db_path: Option<String>,
     compression_threshold: usize,
     repl_state: Option<Arc<crate::replication::ReplicationState>>,
+    ready_state: Arc<ReadyState>,
+    metrics: Arc<dyn Metrics>,
 ) -> Router {
     let state = AppState {
         engine,
@@ -43,11 +49,15 @@ pub fn app(
         db_path,
         compression_threshold,
         repl_state,
+        ready_state,
+        metrics,
     };
 
     // Public routes (no auth)
     let public = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(readiness))
+        .route("/metrics", get(metrics_handler))
         .route("/info", get(info));
 
     // Protected routes (auth middleware)
@@ -76,10 +86,45 @@ pub fn app(
 // --- Handlers ---
 
 async fn health(State(_state): State<AppState>) -> impl IntoResponse {
-    let resp = HealthResponse {
+    // Liveness: always returns OK when the process is running
+    let resp = ReadyResponse {
         status: "ok".to_string(),
+        reason: None,
     };
     (StatusCode::OK, axum::Json(resp))
+}
+
+async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
+    if state.ready_state.is_ready() {
+        let resp = ReadyResponse {
+            status: "ok".to_string(),
+            reason: None,
+        };
+        (StatusCode::OK, axum::Json(resp))
+    } else {
+        let reason = state.ready_state.reason();
+        let resp = ReadyResponse {
+            status: "not_ready".to_string(),
+            reason: Some(reason),
+        };
+        (StatusCode::SERVICE_UNAVAILABLE, axum::Json(resp))
+    }
+}
+
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // Refresh shard entry counts before rendering metrics
+    let shard_count = state.engine.shard_count();
+    for i in 0..shard_count {
+        let count = state.engine.shard_entry_count(i);
+        state.metrics.set_shard_entries(i, count);
+    }
+
+    let body = state.metrics.render();
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 async fn info(State(state): State<AppState>) -> impl IntoResponse {
@@ -96,6 +141,7 @@ async fn store_memory(
     Path(namespace): Path<String>,
     axum::Json(body): axum::Json<StoreRequest>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "write", &namespace);
     let nk = NamespacedKey::new(&namespace, &body.key);
     let internal_key = nk.to_internal();
     let memory_type = body.r#type.unwrap_or(MemoryType::Semantic);
@@ -117,6 +163,7 @@ async fn store_memory(
 
     match result {
         Ok(()) => {
+            state.metrics.record_write(&namespace);
             let resp = SimpleResponse {
                 ok: true,
                 deleted: None,
@@ -142,6 +189,8 @@ async fn list_memories(
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "list", &namespace);
+    state.metrics.record_read(&namespace);
     let prefix = NamespacedKey::new(&namespace, "").prefix();
     let entries = state.engine.scan_prefix(&prefix);
 
@@ -185,6 +234,8 @@ async fn get_memory(
     State(state): State<AppState>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "read", &namespace);
+    state.metrics.record_read(&namespace);
     let internal_key = NamespacedKey::new(&namespace, &key).to_internal();
 
     match state.engine.get_with_meta(&internal_key) {
@@ -212,6 +263,7 @@ async fn delete_memory(
     State(state): State<AppState>,
     Path((namespace, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "delete", &namespace);
     let internal_key = NamespacedKey::new(&namespace, &key).to_internal();
     let deleted = state.engine.delete(&internal_key);
 
@@ -238,6 +290,7 @@ async fn delete_namespace(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "delete", &namespace);
     let prefix = NamespacedKey::new(&namespace, "").prefix();
     let count = state.engine.delete_prefix(&prefix);
 
@@ -262,6 +315,7 @@ async fn batch_store(
     Path(namespace): Path<String>,
     axum::Json(body): axum::Json<BatchStoreRequest>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "batch_write", &namespace);
     let mut stored = 0usize;
     for item in &body.memories {
         let internal_key = NamespacedKey::new(&namespace, &item.key).to_internal();
@@ -301,6 +355,7 @@ async fn batch_store(
     }
 
     let resp = BatchStoreResponse { ok: true, stored };
+    state.metrics.record_write(&namespace);
     (StatusCode::CREATED, axum::Json(resp)).into_response()
 }
 
@@ -309,6 +364,8 @@ async fn batch_get(
     Path(namespace): Path<String>,
     axum::Json(body): axum::Json<BatchGetRequest>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "batch_read", &namespace);
+    state.metrics.record_read(&namespace);
     let mut memories = Vec::with_capacity(body.keys.len());
     let mut missing = Vec::new();
 
@@ -347,6 +404,8 @@ async fn search_memories(
     Path(namespace): Path<String>,
     axum::Json(req): axum::Json<SearchRequest>,
 ) -> impl IntoResponse {
+    let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "search", &namespace);
+    state.metrics.record_read(&namespace);
     let results = state
         .engine
         .search_embedding(&namespace, &req.embedding, req.top_k);
@@ -370,6 +429,7 @@ async fn trigger_snapshot(State(state): State<AppState>) -> impl IntoResponse {
     match &state.db_path {
         Some(db_path) => {
             let path = std::path::Path::new(db_path);
+            let start = std::time::Instant::now();
             match crate::store::persistence::snapshot_with_threshold(
                 path,
                 &state.engine,
@@ -377,6 +437,8 @@ async fn trigger_snapshot(State(state): State<AppState>) -> impl IntoResponse {
                 state.compression_threshold,
             ) {
                 Ok(snapshot_path) => {
+                    state.metrics.observe_snapshot_duration(start.elapsed());
+                    state.metrics.set_snapshot_last_success();
                     let entries = crate::store::persistence::collect_entries(&state.engine).len();
                     let resp = SnapshotResponse {
                         ok: true,

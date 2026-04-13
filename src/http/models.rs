@@ -67,12 +67,6 @@ pub struct ListResponse {
     pub memories: Vec<StoreResponse>,
 }
 
-/// Health check response.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub status: String,
-}
-
 /// Server info response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InfoResponse {

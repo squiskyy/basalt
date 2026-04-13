@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
 
-pub mod config;
-pub mod http;
-pub mod replication;
-pub mod resp;
-pub mod store;
-pub mod time;
+use basalt::config;
+use basalt::http;
+use basalt::metrics;
+use basalt::replication;
+use basalt::resp;
+use basalt::store;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -146,6 +146,9 @@ async fn main() {
     ));
     let auth = Arc::new(auth_store);
 
+    // Create readiness state: not ready during snapshot restore
+    let ready_state = Arc::new(http::ready::ReadyState::new("restoring_snapshot"));
+
     // Load snapshot if db_path is configured
     if let Some(ref db_path) = cfg.server.db_path {
         let db_path = std::path::Path::new(db_path);
@@ -156,6 +159,12 @@ async fn main() {
             }
         }
     }
+
+    // Snapshot restore complete (or no snapshot configured): mark as ready
+    ready_state.set_ready();
+
+    // Create metrics instance
+    let metrics = metrics::create_metrics();
 
     info!(
         "basalt v{} - memory that moves fast",
@@ -241,6 +250,7 @@ async fn main() {
     let resp_auth = auth.clone();
     let http_config = cfg.server.clone();
     let resp_config = cfg.server.clone();
+    let http_ready_state = ready_state.clone();
 
     // Create replication state
     let repl_state = Arc::new(replication::ReplicationState::new_primary(
@@ -261,6 +271,8 @@ async fn main() {
             http_config.db_path.clone(),
             http_config.snapshot_compression_threshold,
             Some(http_repl_state),
+            http_ready_state,
+            metrics,
         );
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

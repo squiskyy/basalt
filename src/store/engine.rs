@@ -412,6 +412,15 @@ impl KvEngine {
         self.shards.len()
     }
 
+    /// Return the entry count for a specific shard (for metrics).
+    pub fn shard_entry_count(&self, shard_index: usize) -> usize {
+        if shard_index < self.shards.len() {
+            self.shards[shard_index].len()
+        } else {
+            0
+        }
+    }
+
     /// Return the max entries per shard.
     pub fn max_entries(&self) -> usize {
         self.max_entries

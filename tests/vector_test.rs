@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use basalt::http::auth::AuthStore;
+use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
 use basalt::store::engine::KvEngine;
 use basalt::store::memory_type::MemoryType;
@@ -28,7 +29,8 @@ async fn start_server(
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
 
-    let router = app(engine, auth, db_path, 1024, None);
+    let router = app(engine, auth, db_path, 1024, None, Arc::new(ReadyState::new_ready()), basalt::metrics::create_metrics());
+
     let handle = tokio::spawn(async move {
         serve(listener, router).await.unwrap();
     });
