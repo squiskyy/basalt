@@ -7,10 +7,10 @@ use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 
+use crate::store::NamespacedKey;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
-use crate::store::NamespacedKey;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
