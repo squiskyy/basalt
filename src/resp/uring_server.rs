@@ -29,9 +29,10 @@ use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
 
-use super::commands::{CommandHandler, ReplicaofResult, check_command_namespace};
+use super::commands::CommandHandler;
 use super::error::RespError;
 use super::parser::{RespValue, parse_pipeline, serialize_pipeline};
+use super::session::{ClientSession, SessionAction};
 
 const RING_SIZE: u32 = 1024;
 const READ_BUF_SIZE: usize = 8192;
@@ -53,11 +54,8 @@ enum Token {
 struct Connection {
     /// Accumulated incoming RESP data.
     read_buf: Vec<u8>,
-    /// Auth state.
-    authenticated: bool,
-    auth_token: Option<String>,
-    /// Whether this connection is currently in replica mode.
-    is_replica: bool,
+    /// Session state (auth, replica, etc.).
+    session: ClientSession,
 }
 
 /// Run the io_uring RESP2 server. Blocks the calling thread.
@@ -197,9 +195,7 @@ pub fn run(
 
                     let conn_id = connections.insert(Connection {
                         read_buf: Vec::with_capacity(READ_BUF_SIZE),
-                        authenticated: !auth_enabled,
-                        auth_token: None,
-                        is_replica: false,
+                        session: ClientSession::new(auth.clone(), auth_enabled),
                     });
 
                     // Allocate a stable read buffer (Box ensures stable address)
@@ -286,72 +282,32 @@ pub fn run(
                         continue;
                     }
 
-                    // Process commands
-                    let mut responses: Vec<RespValue> = Vec::with_capacity(values.len());
-                    for value in values {
-                        if let Some(cmd) = value.to_command() {
-                            if cmd.name == "AUTH" {
-                                let resp = handle_auth_resp(
-                                    &cmd,
-                                    &auth,
-                                    &mut conn.authenticated,
-                                    &mut conn.auth_token,
-                                );
-                                responses.push(resp);
-                                continue;
-                            }
+                    // Process commands - delegate to shared session
+                    let mut result = conn.session.process_command_batch(&values, &handler);
 
-                            // Handle REPLICAOF command at connection level
-                            if cmd.name == "REPLICAOF" {
-                                let result = handler.handle_replicaof(&cmd);
-                                match result {
-                                    ReplicaofResult::NoOne => {
-                                        // Stop replicating, become primary again
-                                        repl_state.stop_replica_stream();
-                                        repl_state.set_role(ReplicationRole::Primary);
-                                        conn.is_replica = false;
-                                        tracing::info!("REPLICAOF NO ONE - now primary (io_uring)");
-                                        responses.push(RespValue::SimpleString("OK".to_string()));
-                                    }
-                                    ReplicaofResult::Replicate { host, port } => {
-                                        // io_uring mode cannot spawn async replication tasks
-                                        // since it runs in its own thread outside tokio.
-                                        // Return a clear error message.
-                                        tracing::warn!(
-                                            "REPLICAOF {host}:{port} rejected in io_uring mode"
-                                        );
-                                        responses.push(RespValue::Error(
-                                            "ERR REPLICAOF not supported in io_uring mode; use the tokio RESP server for replication".to_string(),
-                                        ));
-                                    }
-                                    ReplicaofResult::Error(msg) => {
-                                        responses.push(RespValue::Error(msg));
-                                    }
-                                }
-                                continue;
+                    // Handle REPLICAOF actions
+                    match result.action {
+                        SessionAction::ReplicaofNoOne => {
+                            repl_state.stop_replica_stream();
+                            repl_state.set_role(ReplicationRole::Primary);
+                            conn.session.set_replica(false);
+                            tracing::info!("REPLICAOF NO ONE - now primary (io_uring)");
+                        }
+                        SessionAction::ReplicaofReplicate { ref host, port } => {
+                            // io_uring mode cannot spawn async replication tasks
+                            // since it runs in its own thread outside tokio.
+                            // Replace the OK response with an error.
+                            tracing::warn!("REPLICAOF {host}:{port} rejected in io_uring mode");
+                            if let Some(last) = result.responses.last_mut() {
+                                *last = RespValue::Error(
+                                    "ERR REPLICAOF not supported in io_uring mode; use the tokio RESP server for replication".to_string(),
+                                );
                             }
                         }
-                        if auth_enabled && !conn.authenticated {
-                            responses
-                                .push(RespValue::Error("NOAUTH Authentication required".into()));
-                            continue;
-                        }
-                        match value.to_command() {
-                            Some(cmd) => {
-                                // Per-command namespace authorization check
-                                if let Some(ref token) = conn.auth_token
-                                    && let Err(err_resp) =
-                                        check_command_namespace(&cmd, &auth, token)
-                                {
-                                    responses.push(err_resp);
-                                    continue;
-                                }
-                                responses.push(handler.handle(&cmd));
-                            }
-                            None => responses
-                                .push(RespValue::Error("ERR invalid command format".into())),
-                        }
+                        SessionAction::None => {}
                     }
+
+                    let responses = result.responses;
 
                     if !responses.is_empty() {
                         let out = serialize_pipeline(&responses);
@@ -516,27 +472,5 @@ fn set_nonblocking(fd: i32) {
         if flags >= 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
-    }
-}
-
-fn handle_auth_resp(
-    cmd: &super::parser::Command,
-    auth: &AuthStore,
-    authenticated: &mut bool,
-    auth_token: &mut Option<String>,
-) -> RespValue {
-    if cmd.args.len() != 1 {
-        return RespValue::Error("ERR wrong number of arguments for 'AUTH'".to_string());
-    }
-    let token = String::from_utf8_lossy(&cmd.args[0]).to_string();
-    // Check if this token exists at all (valid token).
-    // For AUTH, we just verify the token is valid - per-command namespace
-    // checks happen on each subsequent command.
-    if auth.token_exists(&token) {
-        *authenticated = true;
-        *auth_token = Some(token);
-        RespValue::SimpleString("OK".to_string())
-    } else {
-        RespValue::Error("ERR invalid token".to_string())
     }
 }
