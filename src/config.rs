@@ -42,6 +42,9 @@ pub struct ServerConfig {
     pub compression_threshold: usize,
     /// WAL size for replication (number of entries to keep). Default 10000.
     pub wal_size: usize,
+    /// Eviction policy when a shard hits max_entries capacity.
+    /// "reject" = reject writes (default), "ttl-first" = sweep expired then reject, "lru" = evict least-recently-used
+    pub eviction: String,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +64,7 @@ impl Default for ServerConfig {
             snapshot_compression_threshold: 1024,
             compression_threshold: 1024,
             wal_size: 10_000,
+            eviction: "reject".to_string(),
         }
     }
 }
@@ -112,6 +116,8 @@ struct ServerFile {
     compression_threshold: Option<usize>,
     #[serde(default)]
     wal_size: Option<usize>,
+    #[serde(default)]
+    eviction: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -163,6 +169,10 @@ impl Config {
                 .compression_threshold
                 .unwrap_or(server_defaults.compression_threshold),
             wal_size: file.server.wal_size.unwrap_or(server_defaults.wal_size),
+            eviction: file
+                .server
+                .eviction
+                .unwrap_or_else(|| server_defaults.eviction.clone()),
         };
 
         let auth = AuthConfig {
@@ -193,6 +203,7 @@ impl Config {
         snapshot_compression_threshold: Option<usize>,
         compression_threshold: Option<usize>,
         wal_size: Option<usize>,
+        eviction: Option<String>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -239,6 +250,9 @@ impl Config {
         }
         if let Some(v) = wal_size {
             self.server.wal_size = v;
+        }
+        if let Some(v) = eviction {
+            self.server.eviction = v;
         }
     }
 
@@ -446,6 +460,7 @@ http_port = 9999
             None,          // snapshot_compression_threshold
             None,          // compression_threshold
             None,          // wal_size
+            None,          // eviction
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);

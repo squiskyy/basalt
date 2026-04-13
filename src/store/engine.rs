@@ -1,5 +1,5 @@
 use crate::store::memory_type::MemoryType;
-use crate::store::shard::{Entry, Shard, ShardFullError};
+use crate::store::shard::{Entry, EvictionPolicy, Shard, ShardFullError};
 use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
@@ -36,6 +36,7 @@ pub struct KvEngine {
     shard_mask: usize,
     max_entries: usize,
     compression_threshold: usize,
+    eviction_policy: EvictionPolicy,
     /// Per-namespace HNSW vector indices, protected by a Mutex.
     /// Key: namespace (prefix before the first `:` in a key, or the full key).
     vector_indexes: Mutex<HashMap<String, HnswIndex>>,
@@ -126,8 +127,8 @@ fn next_power_of_2(n: usize) -> usize {
 impl KvEngine {
     /// Create a new KvEngine with the given target shard count.
     /// The actual shard count will be rounded up to the next power of 2.
-    /// Each shard gets a default max_entries of 1,000,000 and default compression
-    /// threshold of 1024 bytes.
+    /// Each shard gets a default max_entries of 1,000,000, default compression
+    /// threshold of 1024 bytes, and default eviction policy (reject).
     pub fn new(shard_count: usize) -> Self {
         Self::with_max_entries(shard_count, 1_000_000)
     }
@@ -144,6 +145,7 @@ impl KvEngine {
             shard_mask: count - 1,
             max_entries,
             compression_threshold: 1024,
+            eviction_policy: EvictionPolicy::Reject,
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -168,6 +170,33 @@ impl KvEngine {
             shard_mask: count - 1,
             max_entries,
             compression_threshold,
+            eviction_policy: EvictionPolicy::Reject,
+            vector_indexes: Mutex::new(HashMap::new()),
+            namespace_versions: Mutex::new(HashMap::new()),
+            hash_state: RandomState::new(),
+        }
+    }
+
+    /// Create a new KvEngine with the given target shard count,
+    /// max entries per shard, compression threshold, and eviction policy.
+    pub fn with_eviction_policy(
+        shard_count: usize,
+        max_entries: usize,
+        compression_threshold: usize,
+        eviction_policy: EvictionPolicy,
+    ) -> Self {
+        let count = next_power_of_2(shard_count.max(1));
+        let shards = (0..count)
+            .map(|_| {
+                Shard::with_eviction_policy(max_entries, compression_threshold, eviction_policy)
+            })
+            .collect();
+        KvEngine {
+            shards,
+            shard_mask: count - 1,
+            max_entries,
+            compression_threshold,
+            eviction_policy,
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -218,9 +247,16 @@ impl KvEngine {
             expires_at,
             memory_type,
             embedding: None,
+            last_accessed_ms: 0, // overwritten by Shard::set
         };
         let idx = self.shard_index(key);
-        self.shards[idx].set(key.to_string(), entry)?;
+        let result = self.shards[idx].set(key.to_string(), entry);
+        if let Err(ref e) = result {
+            // Fill in shard_index before propagating
+            let mut err = e.clone();
+            err.shard_index = idx;
+            return Err(err);
+        }
         // Increment version only for the namespace that was modified
         self.increment_namespace_version(namespace_of_key(key));
         Ok(())
@@ -244,9 +280,15 @@ impl KvEngine {
             expires_at,
             memory_type,
             embedding,
+            last_accessed_ms: 0, // overwritten by Shard::set
         };
         let idx = self.shard_index(key);
-        self.shards[idx].set(key.to_string(), entry)?;
+        let result = self.shards[idx].set(key.to_string(), entry);
+        if let Err(ref e) = result {
+            let mut err = e.clone();
+            err.shard_index = idx;
+            return Err(err);
+        }
         // Increment version only for the namespace that was modified
         self.increment_namespace_version(namespace_of_key(key));
         Ok(())
@@ -268,6 +310,7 @@ impl KvEngine {
             expires_at,
             memory_type,
             embedding: None,
+            last_accessed_ms: 0, // overwritten by Shard::set_force
         };
         let idx = self.shard_index(key);
         self.shards[idx].set_force(key.to_string(), entry);
@@ -291,6 +334,7 @@ impl KvEngine {
             expires_at,
             memory_type,
             embedding,
+            last_accessed_ms: 0, // overwritten by Shard::set_force
         };
         let idx = self.shard_index(key);
         self.shards[idx].set_force(key.to_string(), entry);
@@ -429,6 +473,11 @@ impl KvEngine {
     /// Return the compression threshold in bytes.
     pub fn compression_threshold(&self) -> usize {
         self.compression_threshold
+    }
+
+    /// Return the eviction policy.
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
     }
 
     /// Clear all data from the engine, removing every entry from every shard

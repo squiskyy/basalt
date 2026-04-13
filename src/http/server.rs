@@ -131,10 +131,18 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn info(State(state): State<AppState>) -> impl IntoResponse {
+    let shard_count = state.engine.shard_count();
+    let mut shard_entries = Vec::with_capacity(shard_count);
+    for i in 0..shard_count {
+        shard_entries.push(state.engine.shard_entry_count(i));
+    }
     let resp = InfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        shards: state.engine.shard_count(),
+        shards: shard_count,
         compression_threshold: state.engine.compression_threshold(),
+        eviction_policy: state.engine.eviction_policy().to_string(),
+        max_entries_per_shard: state.engine.max_entries(),
+        shard_entries,
     };
     (StatusCode::OK, axum::Json(resp))
 }
@@ -176,11 +184,13 @@ async fn store_memory(
         Err(ShardFullError {
             max_entries,
             current,
+            shard_index,
         }) => {
             let body = serde_json::json!({
                 "error": "max entries exceeded",
                 "max_entries": max_entries,
                 "current": current,
+                "shard": shard_index,
             });
             (StatusCode::INSUFFICIENT_STORAGE, axum::Json(body)).into_response()
         }
@@ -346,12 +356,14 @@ async fn batch_store(
             Err(ShardFullError {
                 max_entries,
                 current,
+                shard_index,
             }) => {
                 let body = serde_json::json!({
                     "error": "max entries exceeded",
                     "max_entries": max_entries,
                     "current": current,
                     "stored": stored,
+                    "shard": shard_index,
                 });
                 return (StatusCode::INSUFFICIENT_STORAGE, axum::Json(body)).into_response();
             }

@@ -312,7 +312,10 @@ impl CommandHandler {
                 }
                 RespValue::SimpleString("OK".to_string())
             }
-            Err(_) => RespValue::Error("ERR max entries exceeded".to_string()),
+            Err(e) => RespValue::Error(format!(
+                "ERR max entries exceeded (shard {}, {}/{})",
+                e.shard_index, e.current, e.max_entries
+            )),
         }
     }
 
@@ -379,8 +382,11 @@ impl CommandHandler {
                         repl.record_set(key.as_bytes(), &value, MemoryType::Semantic, None);
                     }
                 }
-                Err(_) => {
-                    return RespValue::Error("ERR max entries exceeded".to_string());
+                Err(e) => {
+                    return RespValue::Error(format!(
+                        "ERR max entries exceeded (shard {}, {}/{})",
+                        e.shard_index, e.current, e.max_entries
+                    ));
                 }
             }
             i += 2;
@@ -408,6 +414,7 @@ impl CommandHandler {
         RespValue::Array(Some(keys))
     }
 
+    /// RESP INFO handler - return server information.
     fn handle_info(&self, cmd: &Command) -> RespValue {
         let section = if !cmd.args.is_empty() {
             String::from_utf8_lossy(&cmd.args[0]).to_lowercase()
@@ -426,10 +433,23 @@ impl CommandHandler {
         }
 
         // Default INFO response
+        let shard_count = self.engine.shard_count();
+        let mut shard_entries = Vec::with_capacity(shard_count);
+        for i in 0..shard_count {
+            shard_entries.push(self.engine.shard_entry_count(i));
+        }
+        let shard_entries_str = shard_entries
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("shard_{i}_entries:{c}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+
         let info = format!(
-            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{}\r\ncompression_threshold:{}\r\n",
-            self.engine.shard_count(),
-            self.engine.compression_threshold()
+            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{shard_count}\r\ncompression_threshold:{}\r\neviction_policy:{}\r\nmax_entries_per_shard:{}\r\n{shard_entries_str}\r\n",
+            self.engine.compression_threshold(),
+            self.engine.eviction_policy(),
+            self.engine.max_entries(),
         );
         RespValue::BulkString(Some(info.into_bytes()))
     }
@@ -491,7 +511,10 @@ impl CommandHandler {
                 }
                 RespValue::SimpleString("OK".to_string())
             }
-            Err(_) => RespValue::Error("ERR max entries exceeded".to_string()),
+            Err(e) => RespValue::Error(format!(
+                "ERR max entries exceeded (shard {}, {}/{})",
+                e.shard_index, e.current, e.max_entries
+            )),
         }
     }
 

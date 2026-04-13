@@ -73,6 +73,9 @@ pub struct InfoResponse {
     pub version: String,
     pub shards: usize,
     pub compression_threshold: usize,
+    pub eviction_policy: String,
+    pub max_entries_per_shard: usize,
+    pub shard_entries: Vec<usize>,
 }
 
 /// Query parameters for list endpoints.

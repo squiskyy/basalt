@@ -74,6 +74,10 @@ struct Args {
     #[arg(long, value_name = "N")]
     wal_size: Option<usize>,
 
+    /// Eviction policy when shards hit capacity: reject, ttl-first, or lru (overrides config file)
+    #[arg(long, value_name = "POLICY")]
+    eviction: Option<String>,
+
     /// Auth tokens (format: "token:ns1,ns2" or "token:*" for all).
     /// Overrides tokens from config file. Can be specified multiple times.
     #[arg(long, value_name = "TOKEN")]
@@ -129,6 +133,7 @@ async fn main() {
         args.snapshot_compression_threshold,
         args.compression_threshold,
         args.wal_size,
+        args.eviction,
     );
 
     // Resolve auth tokens from file + CLI
@@ -139,11 +144,23 @@ async fn main() {
         http::auth::AuthStore::from_list(auth_tokens)
     };
 
-    let engine = Arc::new(store::engine::KvEngine::with_max_entries_and_compression(
-        cfg.server.shard_count,
-        cfg.server.max_entries,
-        cfg.server.compression_threshold,
-    ));
+    let engine = Arc::new(
+        match store::shard::EvictionPolicy::from_str_loose(&cfg.server.eviction) {
+            Some(policy) => store::engine::KvEngine::with_eviction_policy(
+                cfg.server.shard_count,
+                cfg.server.max_entries,
+                cfg.server.compression_threshold,
+                policy,
+            ),
+            None => {
+                eprintln!(
+                    "error: invalid eviction policy '{}'. Use: reject, ttl-first, or lru",
+                    cfg.server.eviction
+                );
+                std::process::exit(1);
+            }
+        },
+    );
     let auth = Arc::new(auth_store);
 
     // Create readiness state: not ready during snapshot restore
@@ -175,6 +192,8 @@ async fn main() {
         "compression threshold: {} bytes",
         cfg.server.compression_threshold
     );
+    info!("eviction policy: {}", cfg.server.eviction);
+    info!("max entries per shard: {}", cfg.server.max_entries);
     if auth.is_enabled() {
         info!("auth: enabled ({} tokens)", auth.list_tokens().len());
     } else {

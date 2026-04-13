@@ -3,6 +3,40 @@ use crate::time::now_ms;
 use papaya::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Eviction policy when a shard hits its entry capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EvictionPolicy {
+    /// Reject writes when the shard is full (current behavior, most conservative).
+    #[default]
+    Reject,
+    /// Eagerly sweep expired entries on capacity hit. If still full after sweeping, reject.
+    TtlFirst,
+    /// Evict the least-recently-used entry to make room for the new one.
+    Lru,
+}
+
+impl EvictionPolicy {
+    /// Parse from a string (case-insensitive). Returns None for unknown values.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "reject" => Some(EvictionPolicy::Reject),
+            "ttl-first" => Some(EvictionPolicy::TtlFirst),
+            "lru" => Some(EvictionPolicy::Lru),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for EvictionPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EvictionPolicy::Reject => write!(f, "reject"),
+            EvictionPolicy::TtlFirst => write!(f, "ttl-first"),
+            EvictionPolicy::Lru => write!(f, "lru"),
+        }
+    }
+}
+
 /// A single entry stored in a shard.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -14,6 +48,8 @@ pub struct Entry {
     pub memory_type: MemoryType,
     /// Optional embedding vector for semantic similarity search.
     pub embedding: Option<Vec<f32>>,
+    /// Last access time (UNIX millis). Updated on read for LRU eviction.
+    pub last_accessed_ms: u64,
 }
 
 impl Entry {
@@ -37,6 +73,18 @@ impl Entry {
             self.value.clone()
         }
     }
+
+    /// Create a new entry with current time as last_accessed_ms.
+    pub fn new(value: Vec<u8>, expires_at: Option<u64>, memory_type: MemoryType) -> Self {
+        Entry {
+            value,
+            compressed: false,
+            expires_at,
+            memory_type,
+            embedding: None,
+            last_accessed_ms: now_ms(),
+        }
+    }
 }
 
 /// Error returned when a shard has reached its entry limit.
@@ -44,6 +92,7 @@ impl Entry {
 pub struct ShardFullError {
     pub max_entries: usize,
     pub current: usize,
+    pub shard_index: usize,
 }
 
 /// Default maximum entries per shard.
@@ -64,6 +113,8 @@ pub struct Shard {
     /// Minimum value size (bytes) to trigger LZ4 compression in memory.
     /// 0 = disable runtime compression.
     compression_threshold: usize,
+    /// Eviction policy when the shard is at capacity.
+    eviction_policy: EvictionPolicy,
 }
 
 impl Shard {
@@ -86,7 +137,28 @@ impl Shard {
             count: AtomicUsize::new(0),
             max_entries,
             compression_threshold,
+            eviction_policy: EvictionPolicy::Reject,
         }
+    }
+
+    /// Create a shard with a specific entry limit, compression threshold, and eviction policy.
+    pub fn with_eviction_policy(
+        max_entries: usize,
+        compression_threshold: usize,
+        eviction_policy: EvictionPolicy,
+    ) -> Self {
+        Shard {
+            map: HashMap::new(),
+            count: AtomicUsize::new(0),
+            max_entries,
+            compression_threshold,
+            eviction_policy,
+        }
+    }
+
+    /// Return this shard's eviction policy.
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        self.eviction_policy
     }
 
     /// Compress a value if it exceeds the compression threshold.
@@ -105,7 +177,12 @@ impl Shard {
     /// Insert or replace a key-value entry.
     ///
     /// If the key already exists, the value is replaced and the count stays the same.
-    /// If the key is new and the shard is at capacity, returns `Err(ShardFullError)`.
+    /// If the key is new and the shard is at capacity, the behavior depends on the
+    /// eviction policy:
+    /// - `Reject`: immediately return `Err(ShardFullError)`
+    /// - `TtlFirst`: eagerly reap expired entries, then reject if still full
+    /// - `Lru`: evict the least-recently-accessed entry to make room
+    ///
     /// The capacity pre-check is approximate (acceptable for a memory guard rail),
     /// but the count increment is determined atomically from the insert return value,
     /// eliminating the TOCTOU race between checking key existence and inserting.
@@ -117,12 +194,49 @@ impl Shard {
         if self.count.load(Ordering::Relaxed) >= self.max_entries
             && self.map.pin().get(&key).is_none()
         {
-            return Err(ShardFullError {
-                max_entries: self.max_entries,
-                current: self.count.load(Ordering::Relaxed),
-            });
+            // At capacity with a new key - try eviction
+            match self.eviction_policy {
+                EvictionPolicy::Reject => {
+                    return Err(ShardFullError {
+                        max_entries: self.max_entries,
+                        current: self.count.load(Ordering::Relaxed),
+                        shard_index: 0, // filled in by KvEngine
+                    });
+                }
+                EvictionPolicy::TtlFirst => {
+                    // Eagerly sweep expired entries
+                    let reaped = self.reap_expired();
+                    if reaped > 0 {
+                        tracing::debug!(
+                            "ttl-first eviction: reaped {reaped} expired entries from shard"
+                        );
+                    }
+                    // Re-check capacity after sweeping
+                    if self.count.load(Ordering::Relaxed) >= self.max_entries {
+                        return Err(ShardFullError {
+                            max_entries: self.max_entries,
+                            current: self.count.load(Ordering::Relaxed),
+                            shard_index: 0,
+                        });
+                    }
+                }
+                EvictionPolicy::Lru => {
+                    // Find and evict the least-recently-accessed entry
+                    let evicted = self.evict_lru();
+                    if !evicted {
+                        // No entries to evict (shard should be non-empty since count >= max_entries,
+                        // but handle the edge case defensively)
+                        return Err(ShardFullError {
+                            max_entries: self.max_entries,
+                            current: self.count.load(Ordering::Relaxed),
+                            shard_index: 0,
+                        });
+                    }
+                }
+            }
         }
         // Compress the value if needed (only if not already compressed)
+        let now = now_ms();
         let entry = if !entry.compressed {
             let (value, compressed) = self.maybe_compress(entry.value);
             Entry {
@@ -131,9 +245,13 @@ impl Shard {
                 expires_at: entry.expires_at,
                 memory_type: entry.memory_type,
                 embedding: entry.embedding,
+                last_accessed_ms: now,
             }
         } else {
-            entry
+            Entry {
+                last_accessed_ms: now,
+                ..entry
+            }
         };
         // insert returns None for new keys, Some(&old) for updates.
         // This eliminates the TOCTOU race: we know definitively whether this
@@ -153,6 +271,7 @@ impl Shard {
     /// Used during snapshot restore to ensure data integrity.
     pub fn set_force(&self, key: String, entry: Entry) {
         // Compress the value if needed (only if not already compressed)
+        let now = now_ms();
         let entry = if !entry.compressed {
             let (value, compressed) = self.maybe_compress(entry.value);
             Entry {
@@ -161,9 +280,13 @@ impl Shard {
                 expires_at: entry.expires_at,
                 memory_type: entry.memory_type,
                 embedding: entry.embedding,
+                last_accessed_ms: now,
             }
         } else {
-            entry
+            Entry {
+                last_accessed_ms: now,
+                ..entry
+            }
         };
         // insert returns None for new keys, Some(&old) for updates.
         // This eliminates the TOCTOU race: the count is adjusted based on
@@ -176,6 +299,26 @@ impl Shard {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
         // else: update of existing key, count unchanged
+    }
+
+    /// Evict the least-recently-used entry from this shard.
+    /// Returns true if an entry was evicted, false if the shard is empty.
+    /// Used by the LRU eviction policy when the shard is at capacity.
+    fn evict_lru(&self) -> bool {
+        let pin = self.map.pin();
+        // Find the entry with the oldest last_accessed_ms
+        let lru_key = pin
+            .iter()
+            .min_by_key(|(_, v)| v.last_accessed_ms)
+            .map(|(k, _)| k.clone());
+        drop(pin);
+
+        if let Some(key) = lru_key {
+            tracing::debug!("lru eviction: removing key {:?}", key);
+            self.delete(&key)
+        } else {
+            false
+        }
     }
 
     /// Get the value bytes for a key, returning None if missing or expired.
@@ -197,10 +340,12 @@ impl Shard {
             expires_at: entry.expires_at,
             memory_type: entry.memory_type,
             embedding: entry.embedding,
+            last_accessed_ms: entry.last_accessed_ms,
         })
     }
 
     /// Internal: get the raw entry (possibly compressed) from the map.
+    /// Also updates last_accessed_ms for LRU eviction tracking.
     fn get_entry_raw(&self, key: &str) -> Option<Entry> {
         let pin = self.map.pin();
         let entry = pin.get(key)?;
@@ -211,7 +356,19 @@ impl Shard {
             self.delete(key);
             None
         } else {
-            Some(entry.clone())
+            // Touch LRU access time if it's been more than 1 second
+            // (avoids excessive writes on hot keys)
+            let needs_touch = now.saturating_sub(entry.last_accessed_ms) > 1000;
+            let cloned = entry.clone();
+            drop(pin);
+            if needs_touch {
+                let mut updated = cloned.clone();
+                updated.last_accessed_ms = now;
+                // Use set-force semantics: just insert, count already correct
+                let pin2 = self.map.pin();
+                pin2.insert(key.to_string(), updated);
+            }
+            Some(cloned)
         }
     }
 
@@ -260,6 +417,7 @@ impl Shard {
                         expires_at: v.expires_at,
                         memory_type: v.memory_type,
                         embedding: v.embedding.clone(),
+                        last_accessed_ms: v.last_accessed_ms,
                     },
                 ));
             }
@@ -348,6 +506,7 @@ mod tests {
             expires_at,
             memory_type,
             embedding: None,
+            last_accessed_ms: now_ms(),
         }
     }
 
@@ -727,5 +886,145 @@ mod tests {
         // Should decompress correctly
         let result = shard.get("force_key").unwrap();
         assert_eq!(result, big_val);
+    }
+
+    #[test]
+    fn test_eviction_policy_reject() {
+        // Reject policy (default): should fail when at capacity
+        let shard = Shard::with_eviction_policy(3, 1024, EvictionPolicy::Reject);
+        for i in 0..3 {
+            let entry = make_entry(format!("val{i}").into_bytes(), None, MemoryType::Semantic);
+            assert!(shard.set(format!("key{i}"), entry).is_ok());
+        }
+        // 4th insert should fail with Reject policy
+        let entry = make_entry(b"overflow".to_vec(), None, MemoryType::Semantic);
+        let result = shard.set("key3_extra".into(), entry);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.max_entries, 3);
+        assert!(err.current >= 3);
+        assert_eq!(err.shard_index, 0);
+    }
+
+    #[test]
+    fn test_eviction_policy_ttl_first() {
+        // TtlFirst policy: should sweep expired entries and make room
+        let shard = Shard::with_eviction_policy(3, 1024, EvictionPolicy::TtlFirst);
+        // Insert 3 entries, 2 with very short TTL (already expired)
+        let entry = make_entry(b"permanent".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("perm".into(), entry).is_ok());
+        let entry = make_entry(b"exp1".to_vec(), Some(1), MemoryType::Episodic);
+        assert!(shard.set("exp1".into(), entry).is_ok());
+        let entry = make_entry(b"exp2".to_vec(), Some(1), MemoryType::Episodic);
+        assert!(shard.set("exp2".into(), entry).is_ok());
+
+        // Wait for expired entries to be reaped
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // 4th insert should succeed because expired entries will be swept
+        let entry = make_entry(b"new_val".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("new_key".into(), entry).is_ok());
+
+        // The permanent entry should still be there
+        assert!(shard.get("perm").is_some());
+        // The new entry should be there
+        assert!(shard.get("new_key").is_some());
+    }
+
+    #[test]
+    fn test_eviction_policy_ttl_first_still_rejects_if_no_expired() {
+        // TtlFirst policy: should reject if no expired entries to sweep
+        let shard = Shard::with_eviction_policy(2, 1024, EvictionPolicy::TtlFirst);
+        // Insert 2 permanent entries
+        let entry = make_entry(b"val1".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key1".into(), entry).is_ok());
+        let entry = make_entry(b"val2".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key2".into(), entry).is_ok());
+
+        // 3rd insert should fail - no expired entries to sweep
+        let entry = make_entry(b"val3".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key3".into(), entry).is_err());
+    }
+
+    #[test]
+    fn test_eviction_policy_lru() {
+        // LRU policy: should evict the least recently used entry
+        let shard = Shard::with_eviction_policy(2, 1024, EvictionPolicy::Lru);
+        // Insert 2 entries
+        let entry = make_entry(b"first".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key1".into(), entry).is_ok());
+        let entry = make_entry(b"second".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key2".into(), entry).is_ok());
+
+        // 3rd insert should succeed by evicting the LRU entry (key1)
+        let entry = make_entry(b"third".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key3".into(), entry).is_ok());
+
+        // key1 should have been evicted (LRU), key2 and key3 should remain
+        assert!(shard.get("key1").is_none());
+        assert!(shard.get("key2").is_some());
+        assert!(shard.get("key3").is_some());
+        assert_eq!(shard.len(), 2);
+    }
+
+    #[test]
+    fn test_eviction_policy_lru_with_access_pattern() {
+        // LRU policy: when at capacity, one entry is evicted to make room.
+        // Keys inserted in the same millisecond have tied timestamps,
+        // so we verify that eviction happens (count stays at max) rather
+        // than depending on which specific key is evicted.
+        let shard = Shard::with_eviction_policy(2, 0, EvictionPolicy::Lru);
+        let entry = make_entry(b"first".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key1".into(), entry).is_ok());
+        let entry = make_entry(b"second".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key2".into(), entry).is_ok());
+
+        // Insert key3 - one existing key should be evicted to make room
+        let entry = make_entry(b"third".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key3".into(), entry).is_ok());
+
+        // One of the original keys should have been evicted
+        assert_eq!(shard.len(), 2);
+        assert!(shard.get("key3").is_some());
+        // Exactly one of key1/key2 was evicted
+        let remaining =
+            (shard.get("key1").is_some() as usize) + (shard.get("key2").is_some() as usize);
+        assert_eq!(remaining, 1, "exactly one of key1/key2 should remain");
+    }
+
+    #[test]
+    fn test_eviction_policy_display() {
+        assert_eq!(EvictionPolicy::Reject.to_string(), "reject");
+        assert_eq!(EvictionPolicy::TtlFirst.to_string(), "ttl-first");
+        assert_eq!(EvictionPolicy::Lru.to_string(), "lru");
+    }
+
+    #[test]
+    fn test_eviction_policy_from_str_loose() {
+        assert_eq!(
+            EvictionPolicy::from_str_loose("reject"),
+            Some(EvictionPolicy::Reject)
+        );
+        assert_eq!(
+            EvictionPolicy::from_str_loose("TTL-FIRST"),
+            Some(EvictionPolicy::TtlFirst)
+        );
+        assert_eq!(
+            EvictionPolicy::from_str_loose("Lru"),
+            Some(EvictionPolicy::Lru)
+        );
+        assert_eq!(EvictionPolicy::from_str_loose("invalid"), None);
+    }
+
+    #[test]
+    fn test_shard_full_error_has_shard_index() {
+        let shard = Shard::with_max_entries(1);
+        let entry = make_entry(b"first".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key1".into(), entry).is_ok());
+        let entry = make_entry(b"overflow".to_vec(), None, MemoryType::Semantic);
+        let result = shard.set("key2".into(), entry);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.shard_index, 0); // filled in by KvEngine, not Shard directly
     }
 }
