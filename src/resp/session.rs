@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use crate::http::auth::AuthStore;
+use crate::store::share::ShareStore;
 
-use super::commands::{CommandHandler, ReplicaofResult, check_command_namespace};
+use super::commands::{CommandHandler, ReplicaofResult, ShareHandler, check_command_namespace};
 use super::parser::{Command, RespValue};
 
 /// Per-connection session state shared between both server implementations.
@@ -11,6 +12,7 @@ pub struct ClientSession {
     pub auth_token: Option<String>,
     pub auth_enabled: bool,
     pub auth: Arc<AuthStore>,
+    pub share: Arc<ShareStore>,
     pub is_replica: bool,
 }
 
@@ -34,12 +36,13 @@ pub struct BatchResult {
 impl ClientSession {
     /// Create a new session. If auth is not required, the session starts
     /// pre-authenticated.
-    pub fn new(auth: Arc<AuthStore>, auth_enabled: bool) -> Self {
+    pub fn new(auth: Arc<AuthStore>, share: Arc<ShareStore>, auth_enabled: bool) -> Self {
         Self {
             authenticated: !auth_enabled,
             auth_token: None,
             auth_enabled,
             auth,
+            share,
             is_replica: false,
         }
     }
@@ -66,6 +69,7 @@ impl ClientSession {
         &mut self,
         values: &[RespValue],
         handler: &CommandHandler,
+        share_handler: &ShareHandler,
     ) -> BatchResult {
         let mut responses: Vec<RespValue> = Vec::with_capacity(values.len());
         let mut action = SessionAction::None;
@@ -116,9 +120,29 @@ impl ClientSession {
 
             match value.to_command() {
                 Some(cmd) => {
-                    // Per-command namespace authorization check
+                    let cmd_name = cmd.name.to_uppercase();
+
+                    // Share commands are handled by ShareHandler
+                    if cmd_name == "SHARE"
+                        || cmd_name == "SHAREDEL"
+                        || cmd_name == "SHARELIST"
+                        || cmd_name == "SHAREWITH"
+                    {
+                        if let Some(ref token) = self.auth_token {
+                            let resp = share_handler.handle(&cmd, token);
+                            responses.push(resp);
+                        } else {
+                            responses.push(RespValue::Error(
+                                "NOAUTH Authentication required".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+
+                    // Per-command namespace authorization check (with sharing support)
                     if let Some(ref token) = self.auth_token
-                        && let Err(err_resp) = check_command_namespace(&cmd, &self.auth, token)
+                        && let Err(err_resp) =
+                            check_command_namespace(&cmd, &self.auth, &self.share, token)
                     {
                         responses.push(err_resp);
                         continue;

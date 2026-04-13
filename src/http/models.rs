@@ -1,4 +1,5 @@
 use crate::store::memory_type::MemoryType;
+use crate::store::share::SharePolicy;
 use serde::{Deserialize, Serialize};
 
 /// Request body for storing a single memory entry.
@@ -114,4 +115,29 @@ pub struct SearchResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
+}
+
+// --- Share Models ---
+
+/// Request body for granting a sharing policy.
+#[derive(Debug, Deserialize)]
+pub struct GrantShareRequest {
+    pub source_namespace: String,
+    pub target_namespace: String,
+    pub permission: crate::store::share::SharePermission,
+    pub key_prefix: Option<String>,
+}
+
+/// Request body for revoking a sharing policy.
+#[derive(Debug, Deserialize)]
+pub struct RevokeShareRequest {
+    pub source_namespace: String,
+    pub target_namespace: String,
+    pub key_prefix: Option<String>,
+}
+
+/// Response body for listing sharing policies.
+#[derive(Debug, Serialize)]
+pub struct ShareListResponse {
+    pub policies: Vec<SharePolicy>,
 }

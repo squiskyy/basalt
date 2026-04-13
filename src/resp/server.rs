@@ -7,8 +7,9 @@ use tokio::sync::watch;
 use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
+use crate::store::share::ShareStore;
 
-use super::commands::CommandHandler;
+use super::commands::{CommandHandler, ShareHandler};
 use super::error::RespError;
 use super::parser::{parse_pipeline, serialize_pipeline};
 use super::session::{ClientSession, SessionAction};
@@ -25,21 +26,24 @@ pub async fn run(
     port: u16,
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
 ) -> Result<(), RespError> {
     let repl_state = Arc::new(ReplicationState::new_primary(engine.clone(), 10_000));
     let (_tx, rx) = watch::channel(false);
-    run_with_replication(host, port, engine, auth, db_path, repl_state, rx).await
+    run_with_replication(host, port, engine, auth, share, db_path, repl_state, rx).await
 }
 
 /// Run the RESP2 TCP server with replication support.
 /// Accepts a shutdown receiver; when the shutdown signal fires, the accept
 /// loop exits and the server returns gracefully.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_replication(
     host: &str,
     port: u16,
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
     repl_state: Arc<ReplicationState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -51,9 +55,10 @@ pub async fn run_with_replication(
 
     let handler = Arc::new(CommandHandler::with_replication(
         engine.clone(),
-        db_path,
+        db_path.clone(),
         repl_state.clone(),
     ));
+    let share_handler = Arc::new(ShareHandler::new(share.clone(), auth.clone()));
     let auth_enabled = auth.is_enabled();
 
     loop {
@@ -61,11 +66,13 @@ pub async fn run_with_replication(
             result = listener.accept() => {
                 let (socket, addr) = result.map_err(RespError::Accept)?;
                 let handler = Arc::clone(&handler);
+                let share_handler = Arc::clone(&share_handler);
                 let auth = Arc::clone(&auth);
+                let share = share.clone();
                 let repl_state = repl_state.clone();
                 let engine = engine.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(socket, handler, auth, auth_enabled, repl_state, engine).await {
+                    if let Err(e) = handle_connection(socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine).await {
                         tracing::debug!("connection {addr} error: {e}");
                     }
                 });
@@ -78,11 +85,14 @@ pub async fn run_with_replication(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: TcpStream,
     handler: Arc<CommandHandler>,
+    share_handler: Arc<ShareHandler>,
     auth: Arc<AuthStore>,
     auth_enabled: bool,
+    share: Arc<ShareStore>,
     repl_state: Arc<ReplicationState>,
     engine: Arc<KvEngine>,
 ) -> Result<(), RespError> {
@@ -94,7 +104,7 @@ async fn handle_connection(
     let mut tmp = [0u8; 8192];
 
     // Per-connection session managing auth state and command dispatch
-    let mut session = ClientSession::new(auth.clone(), auth_enabled);
+    let mut session = ClientSession::new(auth.clone(), share.clone(), auth_enabled);
 
     loop {
         let n = reader.read(&mut tmp).await.map_err(RespError::Read)?;
@@ -115,7 +125,7 @@ async fn handle_connection(
             read_buf.drain(..consumed);
 
             // Delegate auth/dispatch to ClientSession
-            let result = session.process_command_batch(&values, &handler);
+            let result = session.process_command_batch(&values, &handler, &share_handler);
 
             // Handle REPLICAOF actions that require server-level coordination
             let responses_already_flushed = match result.action {

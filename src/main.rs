@@ -9,6 +9,7 @@ use basalt::metrics;
 use basalt::replication;
 use basalt::resp;
 use basalt::store;
+use basalt::store::share::ShareStore;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -162,6 +163,7 @@ async fn main() {
         },
     );
     let auth = Arc::new(auth_store);
+    let share = Arc::new(ShareStore::new());
 
     // Create readiness state: not ready during snapshot restore
     let ready_state = Arc::new(http::ready::ReadyState::new("restoring_snapshot"));
@@ -265,8 +267,10 @@ async fn main() {
     // Start both servers concurrently
     let http_engine = engine.clone();
     let http_auth = auth.clone();
+    let http_share = share.clone();
     let resp_engine = engine.clone();
     let resp_auth = auth.clone();
+    let resp_share = share.clone();
     let http_config = cfg.server.clone();
     let resp_config = cfg.server.clone();
     let http_ready_state = ready_state.clone();
@@ -287,6 +291,7 @@ async fn main() {
         let app = http::server::app(
             http_engine,
             http_auth,
+            http_share,
             http_config.db_path.clone(),
             http_config.snapshot_compression_threshold,
             Some(http_repl_state),
@@ -321,6 +326,7 @@ async fn main() {
                     port,
                     resp_engine,
                     resp_auth,
+                    resp_share,
                     db_path,
                     uring_repl_state,
                 ) {
@@ -335,6 +341,7 @@ async fn main() {
                 resp_config.resp_port,
                 resp_engine,
                 resp_auth,
+                resp_share,
                 resp_config.db_path.clone(),
                 repl_state.clone(),
                 resp_shutdown_rx,
@@ -353,6 +360,7 @@ async fn main() {
                 resp_config.resp_port,
                 resp_engine,
                 resp_auth,
+                resp_share,
                 resp_config.db_path.clone(),
                 repl_state.clone(),
                 rx,

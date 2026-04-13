@@ -10,6 +10,7 @@ use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
 use basalt::store::engine::KvEngine;
+use basalt::store::share::ShareStore;
 
 use axum::serve;
 use reqwest::{Client, StatusCode};
@@ -34,6 +35,7 @@ async fn start_server(
     let router = app(
         engine,
         auth,
+        Arc::new(ShareStore::new()),
         db_path,
         1024,
         None,

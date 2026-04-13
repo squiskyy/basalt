@@ -3,6 +3,8 @@ use std::sync::Arc;
 use crate::replication::ReplicationState;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::store::share::{SharePermission, SharePolicy, ShareStore};
+use crate::time::now_ms;
 
 use super::parser::{Command, RespValue};
 
@@ -14,7 +16,17 @@ pub fn extract_namespace(key: &str) -> Option<&str> {
 }
 
 /// Commands that do not access any key and thus need no per-command namespace check.
-const NO_KEY_COMMANDS: &[&str] = &["PING", "INFO", "SNAP", "AUTH", "REPLICAOF"];
+const NO_KEY_COMMANDS: &[&str] = &[
+    "PING",
+    "INFO",
+    "SNAP",
+    "AUTH",
+    "REPLICAOF",
+    "SHARE",
+    "SHAREDEL",
+    "SHARELIST",
+    "SHAREWITH",
+];
 
 /// Return the first key-carrying argument index for a given command name.
 /// Returns None for commands that carry no keys.
@@ -32,10 +44,12 @@ fn first_key_arg_index(cmd_name: &str) -> Option<usize> {
 
 /// Check whether a command is authorized for a given auth token by extracting
 /// the namespace from its key arguments and verifying against the AuthStore.
+/// Also checks sharing policies via the ShareStore when direct auth fails.
 /// Returns Ok(()) if authorized, or Err(response) with a RESP error.
 pub fn check_command_namespace(
     cmd: &Command,
     auth: &crate::http::auth::AuthStore,
+    share: &ShareStore,
     token: &str,
 ) -> Result<(), RespValue> {
     let name = cmd.name.to_uppercase();
@@ -59,6 +73,28 @@ pub fn check_command_namespace(
         return Ok(()); // will be caught by command handler arg validation
     }
 
+    // Determine if this is a write command
+    let is_write = !matches!(
+        name.as_str(),
+        "GET" | "MGET" | "MGETT" | "KEYS" | "MSCAN" | "MTYPE" | "VSEARCH"
+    );
+
+    // Helper to check namespace auth with sharing
+    let check_ns = |ns: &str, key: &str| -> bool {
+        if auth.is_authorized(token, ns) {
+            return true;
+        }
+        // Check sharing policies
+        if let Some(tok) = auth.get_token(token) {
+            for token_ns in &tok.namespaces {
+                if share.check_access(token_ns, ns, key, is_write) {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+
     // For MSET, keys are at even indices (0, 2, 4, ...); check all of them
     if name == "MSET" {
         let mut i = 0;
@@ -72,7 +108,7 @@ pub fn check_command_namespace(
                     ));
                 }
             };
-            if !auth.is_authorized(token, ns) {
+            if !check_ns(ns, &key) {
                 return Err(RespValue::Error(format!(
                     "NOAUTH Token not authorized for namespace '{}'",
                     ns
@@ -95,7 +131,7 @@ pub fn check_command_namespace(
                     ));
                 }
             };
-            if !auth.is_authorized(token, ns) {
+            if !check_ns(ns, &key) {
                 return Err(RespValue::Error(format!(
                     "NOAUTH Token not authorized for namespace '{}'",
                     ns
@@ -116,7 +152,7 @@ pub fn check_command_namespace(
                 ));
             }
         };
-        if !auth.is_authorized(token, ns) {
+        if !check_ns(ns, &key) {
             return Err(RespValue::Error(format!(
                 "NOAUTH Token not authorized for namespace '{}'",
                 ns
@@ -132,6 +168,12 @@ pub struct CommandHandler {
     engine: Arc<KvEngine>,
     db_path: Option<String>,
     repl_state: Option<Arc<ReplicationState>>,
+}
+
+/// Handles share management commands.
+pub struct ShareHandler {
+    share: Arc<ShareStore>,
+    auth: Arc<crate::http::auth::AuthStore>,
 }
 
 impl CommandHandler {
@@ -179,6 +221,10 @@ impl CommandHandler {
             }
             // AUTH is handled separately in the connection handler
             "AUTH" => RespValue::Error("ERR AUTH already handled at connection level".to_string()),
+            // Share commands are handled by ShareHandler, not here
+            "SHARE" | "SHAREDEL" | "SHARELIST" | "SHAREWITH" => {
+                RespValue::Error("ERR share commands must be handled via ShareHandler".to_string())
+            }
             _ => RespValue::Error(format!("ERR unknown command '{}'", cmd.name)),
         }
     }
@@ -678,6 +724,186 @@ pub enum ReplicaofResult {
     NoOne,
     /// Error
     Error(String),
+}
+
+impl ShareHandler {
+    pub fn new(share: Arc<ShareStore>, auth: Arc<crate::http::auth::AuthStore>) -> Self {
+        ShareHandler { share, auth }
+    }
+
+    /// Handle a share command. The caller must verify auth/namespace ownership.
+    pub fn handle(&self, cmd: &Command, token: &str) -> RespValue {
+        let name = cmd.name.to_uppercase();
+        match name.as_str() {
+            "SHARE" => self.handle_share(cmd, token),
+            "SHAREDEL" => self.handle_sharedel(cmd, token),
+            "SHARELIST" => self.handle_sharelist(cmd, token),
+            "SHAREWITH" => self.handle_sharewith(cmd, token),
+            _ => RespValue::Error(format!("ERR unknown share command '{}'", cmd.name)),
+        }
+    }
+
+    // SHARE <source_ns> <target_ns> <read|read-write> [key_prefix]
+    fn handle_share(&self, cmd: &Command, token: &str) -> RespValue {
+        if cmd.args.len() < 3 {
+            return RespValue::Error("ERR wrong number of arguments for 'SHARE'".to_string());
+        }
+        let source_ns = String::from_utf8_lossy(&cmd.args[0]).to_string();
+        let target_ns = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        let perm_str = String::from_utf8_lossy(&cmd.args[2]).to_lowercase();
+
+        if source_ns == target_ns {
+            return RespValue::Error("ERR cannot share namespace with itself".to_string());
+        }
+
+        // Auth: token must own source_namespace
+        if !self.auth.is_authorized(token, &source_ns) {
+            return RespValue::Error(format!(
+                "NOAUTH Token not authorized for namespace '{}'",
+                source_ns
+            ));
+        }
+
+        let permission = match perm_str.as_str() {
+            "read" => SharePermission::Read,
+            "read-write" | "readwrite" => SharePermission::ReadWrite,
+            _ => {
+                return RespValue::Error(
+                    "ERR permission must be 'read' or 'read-write'".to_string(),
+                );
+            }
+        };
+
+        let key_prefix = if cmd.args.len() > 3 {
+            Some(String::from_utf8_lossy(&cmd.args[3]).to_string())
+        } else {
+            None
+        };
+
+        let policy = SharePolicy {
+            source_namespace: source_ns.clone(),
+            target_namespace: target_ns.clone(),
+            permission,
+            key_prefix: key_prefix.clone(),
+            created_at: now_ms(),
+        };
+        self.share.grant(policy);
+
+        tracing::info!(
+            source = %source_ns,
+            target = %target_ns,
+            permission = ?perm_str,
+            prefix = ?key_prefix,
+            "Share policy granted (RESP)"
+        );
+
+        RespValue::SimpleString("OK".to_string())
+    }
+
+    // SHAREDEL <source_ns> <target_ns> [key_prefix]
+    fn handle_sharedel(&self, cmd: &Command, token: &str) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR wrong number of arguments for 'SHAREDEL'".to_string());
+        }
+        let source_ns = String::from_utf8_lossy(&cmd.args[0]).to_string();
+        let target_ns = String::from_utf8_lossy(&cmd.args[1]).to_string();
+
+        if !self.auth.is_authorized(token, &source_ns) {
+            return RespValue::Error(format!(
+                "NOAUTH Token not authorized for namespace '{}'",
+                source_ns
+            ));
+        }
+
+        let key_prefix = if cmd.args.len() > 2 {
+            Some(String::from_utf8_lossy(&cmd.args[2]).to_string())
+        } else {
+            None
+        };
+
+        let removed = self
+            .share
+            .revoke(&source_ns, &target_ns, key_prefix.as_deref());
+        if removed {
+            RespValue::Integer(1)
+        } else {
+            RespValue::Integer(0)
+        }
+    }
+
+    // SHARELIST <namespace>
+    fn handle_sharelist(&self, cmd: &Command, token: &str) -> RespValue {
+        if cmd.args.is_empty() {
+            return RespValue::Error("ERR wrong number of arguments for 'SHARELIST'".to_string());
+        }
+        let namespace = String::from_utf8_lossy(&cmd.args[0]).to_string();
+
+        if !self.auth.is_authorized(token, &namespace) {
+            return RespValue::Error(format!(
+                "NOAUTH Token not authorized for namespace '{}'",
+                namespace
+            ));
+        }
+
+        let policies = self.share.policies_for(&namespace);
+        let items: Vec<RespValue> = policies
+            .iter()
+            .flat_map(|p| {
+                let prefix = p.key_prefix.as_deref().unwrap_or("");
+                vec![
+                    RespValue::BulkString(Some(
+                        format!("source:{}", p.source_namespace).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(
+                        format!("target:{}", p.target_namespace).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(
+                        format!("permission:{}", p.permission).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(format!("prefix:{}", prefix).into_bytes())),
+                    RespValue::BulkString(Some(format!("created:{}", p.created_at).into_bytes())),
+                ]
+            })
+            .collect();
+        RespValue::Array(Some(items))
+    }
+
+    // SHAREWITH <namespace>
+    fn handle_sharewith(&self, cmd: &Command, token: &str) -> RespValue {
+        if cmd.args.is_empty() {
+            return RespValue::Error("ERR wrong number of arguments for 'SHAREWITH'".to_string());
+        }
+        let namespace = String::from_utf8_lossy(&cmd.args[0]).to_string();
+
+        if !self.auth.is_authorized(token, &namespace) {
+            return RespValue::Error(format!(
+                "NOAUTH Token not authorized for namespace '{}'",
+                namespace
+            ));
+        }
+
+        let policies = self.share.shared_with(&namespace);
+        let items: Vec<RespValue> = policies
+            .iter()
+            .flat_map(|p| {
+                let prefix = p.key_prefix.as_deref().unwrap_or("");
+                vec![
+                    RespValue::BulkString(Some(
+                        format!("source:{}", p.source_namespace).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(
+                        format!("target:{}", p.target_namespace).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(
+                        format!("permission:{}", p.permission).into_bytes(),
+                    )),
+                    RespValue::BulkString(Some(format!("prefix:{}", prefix).into_bytes())),
+                    RespValue::BulkString(Some(format!("created:{}", p.created_at).into_bytes())),
+                ]
+            })
+            .collect();
+        RespValue::Array(Some(items))
+    }
 }
 
 #[cfg(test)]

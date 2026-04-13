@@ -6,10 +6,11 @@
 use std::sync::Arc;
 
 use basalt::http::auth::AuthStore;
-use basalt::resp::commands::CommandHandler;
+use basalt::resp::commands::{CommandHandler, ShareHandler};
 use basalt::resp::parser::{RespValue, parse_pipeline};
 use basalt::resp::session::{ClientSession, SessionAction};
 use basalt::store::engine::KvEngine;
+use basalt::store::share::ShareStore;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -34,6 +35,18 @@ fn make_handler() -> CommandHandler {
     CommandHandler::new(engine, None)
 }
 
+/// Create a ShareHandler backed by fresh ShareStore and AuthStore.
+fn make_share_handler() -> ShareHandler {
+    let auth = Arc::new(AuthStore::new());
+    let share = Arc::new(ShareStore::new());
+    ShareHandler::new(share, auth)
+}
+
+/// Create a fresh ShareStore wrapped in Arc.
+fn make_share() -> Arc<ShareStore> {
+    Arc::new(ShareStore::new())
+}
+
 /// Human-readable name for a SessionAction variant (no Debug derive).
 fn action_name(action: &SessionAction) -> &'static str {
     match action {
@@ -50,11 +63,12 @@ fn action_name(action: &SessionAction) -> &'static str {
 #[test]
 fn test_no_auth_ping() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let cmd = make_command("PING", &[]);
-    let result = session.process_command_batch(&[cmd], &handler);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
@@ -71,11 +85,12 @@ fn test_no_auth_ping() {
 #[test]
 fn test_no_auth_set_get() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let set_cmd = make_command("SET", &["mykey", "myvalue"]);
-    let result = session.process_command_batch(&[set_cmd], &handler);
+    let result = session.process_command_batch(&[set_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
         result.responses[0],
@@ -83,7 +98,7 @@ fn test_no_auth_set_get() {
     );
 
     let get_cmd = make_command("GET", &["mykey"]);
-    let result = session.process_command_batch(&[get_cmd], &handler);
+    let result = session.process_command_batch(&[get_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
         result.responses[0],
@@ -101,13 +116,14 @@ fn test_auth_required_rejects_commands() {
         "valid-token".to_string(),
         vec!["*".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     assert!(!session.is_authenticated());
 
     let cmd = make_command("PING", &[]);
-    let result = session.process_command_batch(&[cmd], &handler);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
         result.responses[0],
@@ -125,12 +141,13 @@ fn test_auth_succeeds_then_commands_work() {
         "valid-token".to_string(),
         vec!["*".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // AUTH first
     let auth_cmd = make_command("AUTH", &["valid-token"]);
-    let result = session.process_command_batch(&[auth_cmd], &handler);
+    let result = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
         result.responses[0],
@@ -140,7 +157,7 @@ fn test_auth_succeeds_then_commands_work() {
 
     // Now PING should work
     let ping_cmd = make_command("PING", &[]);
-    let result = session.process_command_batch(&[ping_cmd], &handler);
+    let result = session.process_command_batch(&[ping_cmd], &handler, &share_handler);
     assert_eq!(
         result.responses[0],
         RespValue::SimpleString("PONG".to_string())
@@ -157,11 +174,12 @@ fn test_auth_wrong_token() {
         "valid-token".to_string(),
         vec!["*".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let auth_cmd = make_command("AUTH", &["wrong-token"]);
-    let result = session.process_command_batch(&[auth_cmd], &handler);
+    let result = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
         result.responses[0],
@@ -182,12 +200,13 @@ fn test_scoped_token_can_access_own_namespace() {
         "scoped".to_string(),
         vec!["ns-alpha".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // Authenticate with scoped token
     let auth_cmd = make_command("AUTH", &["scoped"]);
-    let result = session.process_command_batch(&[auth_cmd], &handler);
+    let result = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
     assert_eq!(
         result.responses[0],
         RespValue::SimpleString("OK".to_string())
@@ -195,7 +214,7 @@ fn test_scoped_token_can_access_own_namespace() {
 
     // SET in own namespace should succeed
     let set_cmd = make_command("SET", &["ns-alpha:key", "value1"]);
-    let result = session.process_command_batch(&[set_cmd], &handler);
+    let result = session.process_command_batch(&[set_cmd], &handler, &share_handler);
     assert_eq!(
         result.responses[0],
         RespValue::SimpleString("OK".to_string())
@@ -203,7 +222,7 @@ fn test_scoped_token_can_access_own_namespace() {
 
     // GET from own namespace should succeed
     let get_cmd = make_command("GET", &["ns-alpha:key"]);
-    let result = session.process_command_batch(&[get_cmd], &handler);
+    let result = session.process_command_batch(&[get_cmd], &handler, &share_handler);
     assert_eq!(
         result.responses[0],
         RespValue::BulkString(Some(b"value1".to_vec()))
@@ -220,16 +239,17 @@ fn test_scoped_token_cannot_access_other_namespace() {
         "scoped".to_string(),
         vec!["ns-alpha".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // Authenticate with scoped token
     let auth_cmd = make_command("AUTH", &["scoped"]);
-    let _ = session.process_command_batch(&[auth_cmd], &handler);
+    let _ = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
 
     // SET in a different namespace should be rejected
     let set_cmd = make_command("SET", &["ns-beta:key", "value2"]);
-    let result = session.process_command_batch(&[set_cmd], &handler);
+    let result = session.process_command_batch(&[set_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
         RespValue::Error(msg) => {
@@ -249,11 +269,12 @@ fn test_scoped_token_cannot_access_other_namespace() {
 #[test]
 fn test_replicaof_no_one() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let cmd = make_command("REPLICAOF", &["NO", "ONE"]);
-    let result = session.process_command_batch(&[cmd], &handler);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
@@ -270,11 +291,12 @@ fn test_replicaof_no_one() {
 #[test]
 fn test_replicaof_replicate() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let cmd = make_command("REPLICAOF", &["127.0.0.1", "6379"]);
-    let result = session.process_command_batch(&[cmd], &handler);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 1);
     assert_eq!(
@@ -297,12 +319,13 @@ fn test_replicaof_replicate() {
 #[test]
 fn test_replicaof_invalid() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // No arguments at all
     let cmd = make_command("REPLICAOF", &[]);
-    let result = session.process_command_batch(&[cmd], &handler);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
@@ -321,14 +344,15 @@ fn test_replicaof_invalid() {
 #[test]
 fn test_pipeline_multiple_commands() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let ping = make_command("PING", &[]);
     let set_cmd = make_command("SET", &["pipekey", "pipeval"]);
     let get_cmd = make_command("GET", &["pipekey"]);
 
-    let result = session.process_command_batch(&[ping, set_cmd, get_cmd], &handler);
+    let result = session.process_command_batch(&[ping, set_cmd, get_cmd], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 3);
     assert_eq!(
@@ -353,12 +377,13 @@ fn test_pipeline_multiple_commands() {
 #[test]
 fn test_invalid_command_format() {
     let auth = Arc::new(AuthStore::new());
-    let mut session = ClientSession::new(auth, false);
+    let mut session = ClientSession::new(auth, make_share(), false);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // A SimpleString is not a valid RESP command array
     let bad_value = RespValue::SimpleString("JUST A STRING".to_string());
-    let result = session.process_command_batch(&[bad_value], &handler);
+    let result = session.process_command_batch(&[bad_value], &handler, &share_handler);
 
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
@@ -382,16 +407,17 @@ fn test_key_without_namespace_prefix_rejected() {
         "scoped".to_string(),
         vec!["ns-alpha".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     // Authenticate with scoped token
     let auth_cmd = make_command("AUTH", &["scoped"]);
-    let _ = session.process_command_batch(&[auth_cmd], &handler);
+    let _ = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
 
     // GET with a bare key (no colon) should be rejected with namespace prefix error
     let get_cmd = make_command("GET", &["mykey"]);
-    let result = session.process_command_batch(&[get_cmd], &handler);
+    let result = session.process_command_batch(&[get_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
         RespValue::Error(msg) => {
@@ -414,15 +440,16 @@ fn test_set_key_without_namespace_prefix_rejected() {
         "scoped".to_string(),
         vec!["ns-alpha".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let auth_cmd = make_command("AUTH", &["scoped"]);
-    let _ = session.process_command_batch(&[auth_cmd], &handler);
+    let _ = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
 
     // SET with a bare key (no colon) should be rejected
     let set_cmd = make_command("SET", &["barekey", "value"]);
-    let result = session.process_command_batch(&[set_cmd], &handler);
+    let result = session.process_command_batch(&[set_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
         RespValue::Error(msg) => {
@@ -445,15 +472,16 @@ fn test_mget_bare_key_rejected() {
         "scoped".to_string(),
         vec!["ns-alpha".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let auth_cmd = make_command("AUTH", &["scoped"]);
-    let _ = session.process_command_batch(&[auth_cmd], &handler);
+    let _ = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
 
     // MGET where one key lacks namespace prefix
     let mget_cmd = make_command("MGET", &["ns-alpha:key1", "barekey"]);
-    let result = session.process_command_batch(&[mget_cmd], &handler);
+    let result = session.process_command_batch(&[mget_cmd], &handler, &share_handler);
     assert_eq!(result.responses.len(), 1);
     match &result.responses[0] {
         RespValue::Error(msg) => {
@@ -476,15 +504,16 @@ fn test_wildcard_token_bypasses_namespace_check() {
         "admin".to_string(),
         vec!["*".to_string()],
     )]));
-    let mut session = ClientSession::new(auth, true);
+    let mut session = ClientSession::new(auth, make_share(), true);
     let handler = make_handler();
+    let share_handler = make_share_handler();
 
     let auth_cmd = make_command("AUTH", &["admin"]);
-    let _ = session.process_command_batch(&[auth_cmd], &handler);
+    let _ = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
 
     // With wildcard token, even a bare key should work (no namespace check at all)
     let set_cmd = make_command("SET", &["barekey", "value"]);
-    let result = session.process_command_batch(&[set_cmd], &handler);
+    let result = session.process_command_batch(&[set_cmd], &handler, &share_handler);
     assert_eq!(
         result.responses[0],
         RespValue::SimpleString("OK".to_string())

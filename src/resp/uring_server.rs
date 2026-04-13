@@ -28,8 +28,9 @@ use io_uring::{IoUring, opcode, squeue, types};
 use crate::http::auth::AuthStore;
 use crate::replication::{ReplicationRole, ReplicationState};
 use crate::store::engine::KvEngine;
+use crate::store::share::ShareStore;
 
-use super::commands::CommandHandler;
+use super::commands::{CommandHandler, ShareHandler};
 use super::error::RespError;
 use super::parser::{RespValue, parse_pipeline, serialize_pipeline};
 use super::session::{ClientSession, SessionAction};
@@ -64,6 +65,7 @@ pub fn run(
     port: u16,
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
     repl_state: Arc<ReplicationState>,
 ) -> Result<(), RespError> {
@@ -96,6 +98,7 @@ pub fn run(
         db_path,
         repl_state.clone(),
     ));
+    let share_handler = Arc::new(ShareHandler::new(share.clone(), auth.clone()));
     let auth_enabled = auth.is_enabled();
 
     // Submit multishot accept
@@ -195,7 +198,7 @@ pub fn run(
 
                     let conn_id = connections.insert(Connection {
                         read_buf: Vec::with_capacity(READ_BUF_SIZE),
-                        session: ClientSession::new(auth.clone(), auth_enabled),
+                        session: ClientSession::new(auth.clone(), share.clone(), auth_enabled),
                     });
 
                     // Allocate a stable read buffer (Box ensures stable address)
@@ -283,7 +286,9 @@ pub fn run(
                     }
 
                     // Process commands - delegate to shared session
-                    let mut result = conn.session.process_command_batch(&values, &handler);
+                    let mut result =
+                        conn.session
+                            .process_command_batch(&values, &handler, &share_handler);
 
                     // Handle REPLICAOF actions
                     match result.action {

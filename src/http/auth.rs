@@ -99,6 +99,11 @@ impl AuthStore {
         !self.tokens.pin().is_empty()
     }
 
+    /// Get a token by its value.
+    pub fn get_token(&self, value: &str) -> Option<Token> {
+        self.tokens.pin().get(value).cloned()
+    }
+
     /// List all tokens (for AUTH INFO command).
     pub fn list_tokens(&self) -> Vec<(String, Vec<String>)> {
         self.tokens
@@ -107,6 +112,43 @@ impl AuthStore {
             .map(|(_, token)| (token.value.clone(), token.namespaces.clone()))
             .collect()
     }
+}
+
+/// Check if a token is authorized for a namespace, considering both direct
+/// namespace access and sharing policies.
+///
+/// Returns true if:
+/// - The token has direct access to the namespace (via its namespace list or wildcard)
+/// - Any of the token's namespaces have been granted share access to the target namespace
+pub fn is_authorized_with_sharing(
+    auth_store: &AuthStore,
+    share_store: &crate::store::share::ShareStore,
+    token_value: &str,
+    namespace: &str,
+    key: &str,
+    write: bool,
+) -> bool {
+    // First check direct authorization
+    if auth_store.is_authorized(token_value, namespace) {
+        return true;
+    }
+
+    // If not directly authorized, check sharing policies.
+    // Look up the token's namespaces and check if any of them
+    // have been granted access to the requested namespace.
+    let token = match auth_store.get_token(token_value) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Wildcard tokens already pass direct auth check above
+    for token_ns in &token.namespaces {
+        if share_store.check_access(token_ns, namespace, key, write) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Extract bearer token from Authorization header.
@@ -132,6 +174,36 @@ pub async fn auth_middleware(
     }
 
     let path = request.uri().path();
+    let method = request.method().clone();
+
+    // Share endpoints handle their own auth (they need namespace parameter from body/query)
+    if path.starts_with("/share") {
+        // Just verify the token exists; namespace ownership is checked in the handler
+        let token = match extract_bearer(&request) {
+            Some(t) => t,
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(SimpleResponse {
+                        ok: false,
+                        deleted: None,
+                    }),
+                )
+                    .into_response();
+            }
+        };
+        if !auth_store.token_exists(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SimpleResponse {
+                    ok: false,
+                    deleted: None,
+                }),
+            )
+                .into_response();
+        }
+        return next.run(request).await;
+    }
 
     // Only /store/* paths require auth; all other paths are allowed through
     if !path.starts_with("/store/") {
@@ -156,9 +228,15 @@ pub async fn auth_middleware(
         }
     };
 
-    // Check authorization
+    // Determine if this is a write operation
+    let is_write = method != "GET";
+
+    // Extract key from path for share prefix scoping
+    let key = extract_key_from_path(path);
+
+    // Check authorization with sharing support
     if let Some(ns) = namespace {
-        if auth_store.is_authorized(token, ns) {
+        if is_authorized_with_sharing(&state.auth, &state.share, token, ns, &key, is_write) {
             return next.run(request).await;
         }
     } else {
@@ -183,6 +261,19 @@ fn extract_namespace_from_path(path: &str) -> Option<&str> {
     let stripped = path.strip_prefix("/store/")?;
     let end = stripped.find('/').unwrap_or(stripped.len());
     Some(&stripped[..end])
+}
+
+/// Extract the key portion from a path like /store/{namespace}/{key}
+fn extract_key_from_path(path: &str) -> String {
+    let stripped = match path.strip_prefix("/store/") {
+        Some(s) => s,
+        None => return String::new(),
+    };
+    // Skip the namespace segment
+    match stripped.find('/') {
+        Some(pos) => stripped[pos + 1..].to_string(),
+        None => String::new(), // No key segment (e.g. /store/{namespace})
+    }
 }
 
 #[cfg(test)]

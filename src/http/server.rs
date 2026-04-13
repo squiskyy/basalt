@@ -12,20 +12,23 @@ use crate::store::NamespacedKey;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
+use crate::store::share::{SharePolicy, ShareStore};
+use crate::time::now_ms;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
-    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, InfoResponse,
-    ListQuery, ListResponse, SearchRequest, SearchResponse, SearchResult, SimpleResponse,
-    StoreRequest, StoreResponse,
+    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, GrantShareRequest,
+    InfoResponse, ListQuery, ListResponse, RevokeShareRequest, SearchRequest, SearchResponse,
+    SearchResult, ShareListResponse, SimpleResponse, StoreRequest, StoreResponse,
 };
 use super::ready::{ReadyResponse, ReadyState};
 
-/// Shared application state wrapping the KV engine, auth store, and optional db_path.
+/// Shared application state wrapping the KV engine, auth store, share store, and optional db_path.
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<KvEngine>,
     pub auth: Arc<AuthStore>,
+    pub share: Arc<ShareStore>,
     pub db_path: Option<String>,
     pub compression_threshold: usize,
     pub repl_state: Option<Arc<crate::replication::ReplicationState>>,
@@ -34,9 +37,11 @@ pub struct AppState {
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
+#[allow(clippy::too_many_arguments)]
 pub fn app(
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
     compression_threshold: usize,
     repl_state: Option<Arc<crate::replication::ReplicationState>>,
@@ -46,6 +51,7 @@ pub fn app(
     let state = AppState {
         engine,
         auth,
+        share,
         db_path,
         compression_threshold,
         repl_state,
@@ -71,6 +77,10 @@ pub fn app(
         .route("/store/{namespace}/{key}", get(get_memory))
         .route("/store/{namespace}/{key}", delete(delete_memory))
         .route("/snapshot", post(trigger_snapshot))
+        .route("/share", post(grant_share))
+        .route("/share", delete(revoke_share))
+        .route("/share", get(list_granted))
+        .route("/shared-with-me", get(list_shared_with_me))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -489,4 +499,195 @@ struct SnapshotResponse {
     ok: bool,
     path: String,
     entries: usize,
+}
+
+// --- Share handlers ---
+
+async fn grant_share(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<GrantShareRequest>,
+) -> impl IntoResponse {
+    // Auth: calling token must own source_namespace
+    let token = match extract_bearer_from_headers(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "Missing auth token"})),
+            )
+                .into_response();
+        }
+    };
+    if !state.auth.is_authorized(&token, &req.source_namespace) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "Not authorized to share this namespace"})),
+        )
+            .into_response();
+    }
+    if req.source_namespace == req.target_namespace {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "Cannot share namespace with itself"})),
+        )
+            .into_response();
+    }
+
+    let policy = SharePolicy {
+        source_namespace: req.source_namespace.clone(),
+        target_namespace: req.target_namespace.clone(),
+        permission: req.permission,
+        key_prefix: req.key_prefix.clone(),
+        created_at: now_ms(),
+    };
+    state.share.grant(policy);
+
+    tracing::info!(
+        source = %req.source_namespace,
+        target = %req.target_namespace,
+        permission = ?req.permission,
+        prefix = ?req.key_prefix,
+        "Share policy granted"
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "granted"})),
+    )
+        .into_response()
+}
+
+async fn revoke_share(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<RevokeShareRequest>,
+) -> impl IntoResponse {
+    let token = match extract_bearer_from_headers(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "Missing auth token"})),
+            )
+                .into_response();
+        }
+    };
+    if !state.auth.is_authorized(&token, &req.source_namespace) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(
+                serde_json::json!({"error": "Not authorized to revoke sharing for this namespace"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let removed = state.share.revoke(
+        &req.source_namespace,
+        &req.target_namespace,
+        req.key_prefix.as_deref(),
+    );
+
+    if removed {
+        tracing::info!(
+            source = %req.source_namespace,
+            target = %req.target_namespace,
+            "Share policy revoked"
+        );
+        (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"status": "revoked"})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "No matching share policy found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn list_granted(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let namespace = match params.get("namespace") {
+        Some(ns) => ns.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "Missing namespace parameter"})),
+            )
+                .into_response();
+        }
+    };
+    let token = match extract_bearer_from_headers(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "Missing auth token"})),
+            )
+                .into_response();
+        }
+    };
+    if !state.auth.is_authorized(&token, &namespace) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "Not authorized"})),
+        )
+            .into_response();
+    }
+
+    let policies = state.share.policies_for(&namespace);
+    (StatusCode::OK, axum::Json(ShareListResponse { policies })).into_response()
+}
+
+async fn list_shared_with_me(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let namespace = match params.get("namespace") {
+        Some(ns) => ns.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({"error": "Missing namespace parameter"})),
+            )
+                .into_response();
+        }
+    };
+    let token = match extract_bearer_from_headers(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "Missing auth token"})),
+            )
+                .into_response();
+        }
+    };
+    if !state.auth.is_authorized(&token, &namespace) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "Not authorized"})),
+        )
+            .into_response();
+    }
+
+    let policies = state.share.shared_with(&namespace);
+    (StatusCode::OK, axum::Json(ShareListResponse { policies })).into_response()
+}
+
+/// Extract bearer token from HeaderMap (for use in handlers where we have HeaderMap, not Request).
+fn extract_bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
 }

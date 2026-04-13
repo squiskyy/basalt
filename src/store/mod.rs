@@ -2,6 +2,7 @@ pub mod engine;
 pub mod memory_type;
 pub mod persistence;
 pub mod shard;
+pub mod share;
 pub mod vector;
 
 pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine, NamespacedKey};

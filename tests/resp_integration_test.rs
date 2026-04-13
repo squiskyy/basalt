@@ -11,6 +11,7 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::resp::server::run as resp_run;
 use basalt::store::engine::KvEngine;
+use basalt::store::share::ShareStore;
 
 use common::{
     encode_resp_command, make_engine, make_no_auth, make_scoped_auth, make_wildcard_auth,
@@ -48,6 +49,7 @@ async fn read_resp_response(stream: &mut TcpStream) -> String {
 async fn start_resp_server(
     engine: Arc<KvEngine>,
     auth: Arc<AuthStore>,
+    share: Arc<ShareStore>,
     db_path: Option<String>,
 ) -> (u16, tokio::task::JoinHandle<()>) {
     // We need to find the actual port. Bind a listener ourselves, get the
@@ -63,7 +65,7 @@ async fn start_resp_server(
         // Small delay to ensure the port is released
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         // If run fails (e.g., port conflict), that's a test failure
-        let _ = resp_run("127.0.0.1", port, engine, auth, db_path).await;
+        let _ = resp_run("127.0.0.1", port, engine, auth, share, db_path).await;
     });
 
     // Give the server time to bind
@@ -74,12 +76,24 @@ async fn start_resp_server(
 
 /// Convenience: start a RESP server with no auth, returning (port, handle).
 async fn start_default_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_no_auth(), None).await
+    start_resp_server(
+        make_engine(),
+        make_no_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
+    .await
 }
 
 /// Start a RESP server with auth enabled, returning (port, handle).
 async fn start_auth_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_wildcard_auth(), None).await
+    start_resp_server(
+        make_engine(),
+        make_wildcard_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
+    .await
 }
 
 /// Connect to the RESP server and return the TcpStream.
@@ -268,7 +282,13 @@ async fn test_auth_wrong_token() {
 
 /// Start a RESP server with a scoped (non-wildcard) auth token.
 async fn start_scoped_auth_resp_server() -> (u16, tokio::task::JoinHandle<()>) {
-    start_resp_server(make_engine(), make_scoped_auth(), None).await
+    start_resp_server(
+        make_engine(),
+        make_scoped_auth(),
+        Arc::new(ShareStore::new()),
+        None,
+    )
+    .await
 }
 
 #[tokio::test]
