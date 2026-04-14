@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::replication::ReplicationState;
+use crate::store::consolidation::ConsolidationRule;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::share::{SharePermission, SharePolicy, ShareStore};
@@ -29,6 +30,7 @@ const NO_KEY_COMMANDS: &[&str] = &[
     "DECAYCONFIG",
     "REAPLOW",
     "TRIGGER",
+    "CONSOLIDATE",
 ];
 
 /// Return the first key-carrying argument index for a given command name.
@@ -259,6 +261,7 @@ impl CommandHandler {
             "DECAYCONFIG" => self.handle_decayconfig(cmd),
             "REAPLOW" => self.handle_reaplow(cmd),
             "TRIGGER" => self.handle_trigger(cmd),
+            "CONSOLIDATE" => self.handle_consolidate(cmd),
             "REPLICAOF" => {
                 RespValue::Error("ERR REPLICAOF must be handled at connection level".to_string())
             }
@@ -1061,6 +1064,87 @@ impl CommandHandler {
             None => RespValue::Error("ERR trigger not found".to_string()),
         }
     }
+
+    /// CONSOLIDATE <namespace> [promote|compress] - Run consolidation for a namespace.
+    /// CONSOLIDATE STATUS - Show consolidation status.
+    fn handle_consolidate(&self, cmd: &Command) -> RespValue {
+        let first = match cmd.args.first() {
+            Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+            None => {
+                return RespValue::Error(
+                    "ERR CONSOLIDATE requires: <namespace> [promote|compress] or STATUS"
+                        .to_string(),
+                );
+            }
+        };
+
+        if first == "STATUS" {
+            let mgr = self.engine.consolidation_manager();
+            return RespValue::Array(Some(vec![
+                RespValue::SimpleString(format!("enabled:{}", mgr.is_enabled())),
+                RespValue::SimpleString(format!("rules:{}", mgr.rules().len())),
+            ]));
+        }
+
+        // first is the namespace
+        let namespace = String::from_utf8_lossy(cmd.args.first().unwrap()).to_string();
+        let mgr = self.engine.consolidation_manager();
+        if !mgr.is_enabled() {
+            return RespValue::Error("ERR consolidation is disabled".to_string());
+        }
+
+        let rules = mgr.rules();
+        let rule_type = cmd
+            .args
+            .get(1)
+            .map(|s| String::from_utf8_lossy(s).to_lowercase());
+        let filtered: Vec<_> = match rule_type.as_deref() {
+            Some("promote") => rules
+                .into_iter()
+                .filter(|r| matches!(r, ConsolidationRule::Promote { .. }))
+                .collect(),
+            Some("compress") => rules
+                .into_iter()
+                .filter(|r| matches!(r, ConsolidationRule::Compress { .. }))
+                .collect(),
+            _ => rules,
+        };
+
+        let result = crate::store::consolidation::run_consolidation(
+            &self.engine,
+            &namespace,
+            &filtered,
+        );
+
+        // Update meta
+        let mut meta = mgr
+            .get_meta(&namespace)
+            .unwrap_or_default();
+        meta.last_run_ms = now_ms();
+        meta.total_promoted += result.promoted as u64;
+        meta.total_compressed += result.compressed as u64;
+        mgr.update_meta(&namespace, meta);
+
+        RespValue::Array(Some(vec![
+            RespValue::SimpleString(format!("promoted:{}", result.promoted)),
+            RespValue::SimpleString(format!("compressed:{}", result.compressed)),
+            RespValue::SimpleString(format!("skipped:{}", result.skipped)),
+            RespValue::Array(Some(
+                result
+                    .details
+                    .into_iter()
+                    .map(|d| {
+                        RespValue::Array(Some(vec![
+                            RespValue::SimpleString(d.action),
+                            RespValue::SimpleString(d.from),
+                            RespValue::SimpleString(d.to),
+                            RespValue::Integer(d.occurrences as i64),
+                        ]))
+                    })
+                    .collect(),
+            )),
+        ]))
+    }
 }
 
 /// Result of REPLICAOF command, used by the connection handler.
@@ -1258,7 +1342,13 @@ mod tests {
     use super::*;
 
     fn make_handler() -> CommandHandler {
-        CommandHandler::new(Arc::new(KvEngine::new(4, Arc::new(crate::store::ConsolidationManager::disabled()))), None)
+        CommandHandler::new(
+            Arc::new(KvEngine::new(
+                4,
+                Arc::new(crate::store::ConsolidationManager::disabled()),
+            )),
+            None,
+        )
     }
 
     #[test]
