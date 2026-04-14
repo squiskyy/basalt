@@ -147,7 +147,7 @@ mod tests {
     fn test_default_halflife() {
         let config = DecayConfig::default();
         // After 24 hours, relevance should be roughly 0.5
-        let now = 172_800_000; // 48 hours in ms (arbitrary start)
+        let now: u64 = 1_000_000_000_000; // large timestamp
         let created = now - 86_400_000; // 24 hours ago
         let relevance = config.current_relevance(1.0, created, false, now);
         assert!(
@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn test_pinned_always_1() {
         let config = DecayConfig::default();
-        let now = 172_800_000;
+        let now: u64 = 1_000_000_000_000;
         let created = now - 86_400_000; // 24h ago
         let relevance = config.current_relevance(1.0, created, true, now);
         assert_eq!(relevance, 1.0, "pinned entries should have relevance 1.0");
@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn test_decay_over_time() {
         let config = DecayConfig::default();
-        let now = 172_800_000;
+        let now = 1_000_000_000_000; // large enough timestamp in ms
         // 1 hour ago: should still be quite high
         let created = now - 3_600_000;
         let relevance = config.current_relevance(1.0, created, false, now);

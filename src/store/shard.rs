@@ -1142,4 +1142,58 @@ mod tests {
         let err = result.unwrap_err();
         assert_eq!(err.shard_index, 0); // filled in by KvEngine, not Shard directly
     }
+
+    #[test]
+    fn test_shard_set_pinned() {
+        let shard = Shard::new();
+        shard
+            .set(
+                "ns:key1".into(),
+                make_entry(b"val".to_vec(), None, MemoryType::Semantic),
+            )
+            .unwrap();
+        // Initially not pinned
+        let entry = shard.get_entry("ns:key1").unwrap();
+        assert!(!entry.pinned);
+        // Pin it
+        shard.set_pinned("ns:key1", true);
+        let entry = shard.get_entry_untouched("ns:key1").unwrap();
+        assert!(entry.pinned);
+        // Unpin it
+        shard.set_pinned("ns:key1", false);
+        let entry = shard.get_entry_untouched("ns:key1").unwrap();
+        assert!(!entry.pinned);
+    }
+
+    #[test]
+    fn test_shard_reap_low_relevance() {
+        let shard = Shard::new();
+        // Insert entries with low relevance
+        let mut low_entry = make_entry(b"low".to_vec(), None, MemoryType::Semantic);
+        low_entry.relevance = 0.001; // below default floor of 0.01
+        low_entry.pinned = false;
+        shard.set("ns:low".into(), low_entry).unwrap();
+
+        // Insert a pinned entry with low relevance - should survive
+        let mut pinned_entry = make_entry(b"pinned".to_vec(), None, MemoryType::Semantic);
+        pinned_entry.relevance = 0.001;
+        pinned_entry.pinned = true;
+        shard.set("ns:pinned".into(), pinned_entry).unwrap();
+
+        // Insert a high relevance entry - should survive
+        let mut high_entry = make_entry(b"high".to_vec(), None, MemoryType::Semantic);
+        high_entry.relevance = 0.5;
+        high_entry.pinned = false;
+        shard.set("ns:high".into(), high_entry).unwrap();
+
+        // Reap with floor=0.01 and lambda (doesn't matter for already-low relevance)
+        let reaped = shard.reap_low_relevance(0.01, 0.0289, crate::store::shard::now_ms());
+        assert_eq!(reaped, 1, "should reap 1 low-relevance non-pinned entry");
+        // Low entry should be gone
+        assert!(shard.get_entry("ns:low").is_none());
+        // Pinned entry should survive
+        assert!(shard.get_entry_untouched("ns:pinned").is_some());
+        // High entry should survive
+        assert!(shard.get_entry("ns:high").is_some());
+    }
 }

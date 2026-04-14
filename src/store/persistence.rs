@@ -1483,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_roundtrip() {
+    fn test_v5_roundtrip() {
         let dir = std::env::temp_dir().join("basalt_test_v4_roundtrip");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
 
         // Verify the file starts with version 4
         let raw = fs::read(&path).unwrap();
-        assert_eq!(raw[7], 4, "snapshot version byte should be 4");
+        assert_eq!(raw[7], 5, "snapshot version byte should be 5");
 
         let loaded = read_snapshot(&path).unwrap();
         assert_eq!(loaded.len(), 3);
@@ -1547,7 +1547,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_corrupt_entry() {
+    fn test_v5_corrupt_entry() {
         let dir = std::env::temp_dir().join("basalt_test_v4_corrupt_entry");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1585,13 +1585,19 @@ mod tests {
 
         // Corrupt a byte in the second entry's value data area so the entry can still
         // be parsed (key is valid UTF-8) but the CRC32 will mismatch.
-        // Header is 16 bytes (7 magic + 1 version + 8 count)
-        // First entry: key="good:1"(6) -> key_len(4)+key(6)+flags(1)+val_len(4)+value(12)+mt(1)+emb_flag(1)+expires_at(8)+entry_crc(4) = 41
-        // Second entry starts at offset 16 + 41 = 57
-        // Entry2 layout: key_len(4) + key("bad:2"=6) + flags(1) + val_len(4) + value("bad value 2"=12) + ...
-        // Corrupt a byte in the value area of entry 2
-        let entry2_val_offset = 57 + 4 + 6 + 1 + 4; // after key_len + key + flags + val_len
-        raw[entry2_val_offset] ^= 0xFF;
+        // Find the key "bad:2" in the raw data and corrupt a byte after it.
+        let key_bytes = b"bad:2";
+        let key_pos = raw
+            .windows(key_bytes.len())
+            .position(|w| w == key_bytes)
+            .expect("should find key 'bad:2' in snapshot");
+        // Corrupt a byte a few positions after the key (in the value area)
+        // The value "bad value 2" starts after: key_len(4) is before key, then
+        // flags(1) + val_len(4) after key, then value starts
+        let corrupt_offset = key_pos + key_bytes.len() + 1 + 4; // after flags + val_len
+        if corrupt_offset < raw.len() {
+            raw[corrupt_offset] ^= 0xFF;
+        }
 
         fs::write(&path, &raw).unwrap();
 
@@ -1606,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_missing_footer_crc() {
+    fn test_v5_missing_footer_crc() {
         let dir = std::env::temp_dir().join("basalt_test_v4_missing_footer");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1637,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_corrupt_footer() {
+    fn test_v5_corrupt_footer() {
         let dir = std::env::temp_dir().join("basalt_test_v4_corrupt_footer");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1861,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_empty_snapshot() {
+    fn test_v5_empty_snapshot() {
         let dir = std::env::temp_dir().join("basalt_test_v4_empty");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1871,7 +1877,7 @@ mod tests {
 
         // Verify version byte is 4
         let raw = fs::read(&path).unwrap();
-        assert_eq!(raw[7], 4, "empty snapshot version should be 4");
+        assert_eq!(raw[7], 5, "empty snapshot version should be 5");
 
         let loaded = read_snapshot(&path).unwrap();
         assert_eq!(loaded.len(), 0);
@@ -1880,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v4_with_embeddings() {
+    fn test_v5_with_embeddings() {
         let dir = std::env::temp_dir().join("basalt_test_v4_embeddings");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1961,6 +1967,96 @@ mod tests {
         assert_eq!(loaded[2].memory_type, MemoryType::Procedural);
         assert_eq!(loaded[2].expires_at, Some(99999));
         assert_eq!(loaded[2].embedding, None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_v5_relevance_roundtrip() {
+        let dir = std::env::temp_dir().join("basalt_test_v5_relevance");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let entries = vec![
+            SnapshotEntry {
+                key: "ns:mem1".to_string(),
+                value: b"pinned data".to_vec(),
+                memory_type: MemoryType::Semantic,
+                expires_at: None,
+                embedding: None,
+                relevance: 1.0,
+                created_at_ms: 1_700_000_000_000,
+                access_count: 5,
+                pinned: true,
+            },
+            SnapshotEntry {
+                key: "ns:mem2".to_string(),
+                value: b"decayed data".to_vec(),
+                memory_type: MemoryType::Episodic,
+                expires_at: Some(9999999999999),
+                embedding: Some(vec![0.5f32, -0.5, 1.0]),
+                relevance: 0.35,
+                created_at_ms: 1_699_000_000_000,
+                access_count: 10,
+                pinned: false,
+            },
+            SnapshotEntry {
+                key: "ns:mem3".to_string(),
+                value: b"new data".to_vec(),
+                memory_type: MemoryType::Procedural,
+                expires_at: None,
+                embedding: None,
+                ..Default::default()
+            },
+        ];
+
+        let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
+        assert!(path.exists());
+
+        // Verify version byte is 5
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(raw[7], 5, "snapshot version byte should be 5");
+
+        let loaded = read_snapshot(&path).unwrap();
+        assert_eq!(loaded.len(), 3);
+
+        // Pinned entry
+        assert_eq!(loaded[0].key, "ns:mem1");
+        assert_eq!(loaded[0].value, b"pinned data");
+        assert_eq!(loaded[0].memory_type, MemoryType::Semantic);
+        assert_eq!(loaded[0].expires_at, None);
+        assert_eq!(loaded[0].embedding, None);
+        assert!(
+            (loaded[0].relevance - 1.0).abs() < 0.001,
+            "relevance should be 1.0"
+        );
+        assert_eq!(loaded[0].created_at_ms, 1_700_000_000_000);
+        assert_eq!(loaded[0].access_count, 5);
+        assert!(loaded[0].pinned);
+
+        // Decayed entry with embedding
+        assert_eq!(loaded[1].key, "ns:mem2");
+        assert_eq!(loaded[1].value, b"decayed data");
+        assert_eq!(loaded[1].memory_type, MemoryType::Episodic);
+        assert_eq!(loaded[1].expires_at, Some(9999999999999));
+        assert!(loaded[1].embedding.is_some());
+        assert!(
+            (loaded[1].relevance - 0.35).abs() < 0.001,
+            "relevance should be 0.35"
+        );
+        assert_eq!(loaded[1].created_at_ms, 1_699_000_000_000);
+        assert_eq!(loaded[1].access_count, 10);
+        assert!(!loaded[1].pinned);
+
+        // Default entry (no explicit relevance fields)
+        assert_eq!(loaded[2].key, "ns:mem3");
+        assert!(
+            (loaded[2].relevance - 1.0).abs() < 0.001,
+            "default relevance should be 1.0"
+        );
+        assert_eq!(loaded[2].created_at_ms, 0);
+        assert_eq!(loaded[2].access_count, 0);
+        assert!(!loaded[2].pinned);
 
         fs::remove_dir_all(&dir).ok();
     }
