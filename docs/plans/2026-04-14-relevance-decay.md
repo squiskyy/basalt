@@ -1,5 +1,7 @@
 # Relevance Decay Implementation Plan
 
+> **Status: COMPLETED** - All 10 tasks implemented and pushed to master.
+
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
 **Goal:** Add floating-point relevance scores that decay over time, boosted by access frequency, integrated into query ranking, and used for GC eligibility.
