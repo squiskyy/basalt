@@ -6,11 +6,14 @@
 //! metadata such as last run time and cumulative counters.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::time::now_ms;
 
 /// Policy for resolving conflicts when a consolidation target already exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +211,272 @@ impl ConsolidationManager {
     pub fn namespaces_with_meta(&self) -> Vec<String> {
         self.meta.lock().unwrap().keys().cloned().collect()
     }
+}
+
+/// Run consolidation for a single namespace using the provided rules.
+/// Returns a ConsolidationResult summarizing what happened.
+pub fn run_consolidation(
+    engine: &KvEngine,
+    namespace: &str,
+    rules: &[ConsolidationRule],
+) -> ConsolidationResult {
+    let mut result = ConsolidationResult::new();
+    for rule in rules {
+        match rule {
+            ConsolidationRule::Promote {
+                min_occurrences,
+                key_prefix,
+                target_type,
+                conflict_policy,
+                ..
+            } => {
+                run_promote_rule(
+                    engine,
+                    namespace,
+                    *min_occurrences,
+                    key_prefix,
+                    *target_type,
+                    *conflict_policy,
+                    &mut result,
+                );
+            }
+            ConsolidationRule::Compress {
+                min_episodes,
+                group_by,
+                summary_strategy,
+                target_key,
+                target_type,
+                delete_source,
+                ..
+            } => {
+                run_compress_rule(
+                    engine,
+                    namespace,
+                    *min_episodes,
+                    *group_by,
+                    *summary_strategy,
+                    target_key,
+                    *target_type,
+                    *delete_source,
+                    &mut result,
+                );
+            }
+        }
+    }
+    result
+}
+
+/// Handle a single Promote rule: scan episodic entries matching key_prefix,
+/// group by suffix, and promote groups that meet the occurrence threshold.
+fn run_promote_rule(
+    engine: &KvEngine,
+    namespace: &str,
+    min_occurrences: usize,
+    key_prefix: &str,
+    target_type: MemoryType,
+    conflict_policy: ConflictPolicy,
+    result: &mut ConsolidationResult,
+) {
+    let scan_prefix = format!("{}:{}", namespace, key_prefix);
+    let entries = engine.scan_prefix(&scan_prefix);
+
+    // Group by suffix: strip "namespace:" then strip key_prefix,
+    // then group by the first segment of the suffix (before any further ':')
+    let mut groups: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+    for (full_key, value, meta) in entries {
+        if meta.memory_type != MemoryType::Episodic {
+            continue;
+        }
+        // Strip "namespace:" to get the key portion
+        let key_part = match full_key.strip_prefix(&format!("{}:", namespace)) {
+            Some(k) => k,
+            None => continue,
+        };
+        // Strip the key_prefix to get the suffix
+        let suffix_raw = match key_part.strip_prefix(key_prefix) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Group by first segment of the suffix (before any ':')
+        let group_key = suffix_raw
+            .split(':')
+            .next()
+            .unwrap_or(suffix_raw)
+            .to_string();
+        groups.entry(group_key).or_default().push((full_key, value));
+    }
+
+    for (suffix, mut entries) in groups {
+        if entries.len() < min_occurrences {
+            continue;
+        }
+
+        // Sort by key so that the "last" entry is the lexicographically latest
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let target_key_suffix = format!("fact:{}", suffix);
+        let target_internal = format!("{}:{}", namespace, target_key_suffix);
+
+        // Check for conflict with existing semantic entry
+        let existing = engine.get_with_meta(&target_internal);
+        if let Some((_, meta)) = &existing {
+            if meta.memory_type == MemoryType::Semantic {
+                match conflict_policy {
+                    ConflictPolicy::Skip => {
+                        result.skipped += 1;
+                        continue;
+                    }
+                    ConflictPolicy::Overwrite => { /* proceed to overwrite below */ }
+                    ConflictPolicy::Version => {
+                        // Find next available version
+                        let mut version = 2u32;
+                        loop {
+                            let versioned_suffix = format!("fact:{}_v{}", suffix, version);
+                            let versioned_internal = format!("{}:{}", namespace, versioned_suffix);
+                            if engine.get(&versioned_internal).is_none() {
+                                // Use this versioned key instead
+                                let _ = engine.set(
+                                    &versioned_internal,
+                                    entries.last().unwrap().1.clone(),
+                                    None,
+                                    target_type,
+                                );
+                                // Delete all source episodic entries
+                                for (src_key, _) in &entries {
+                                    engine.delete(src_key);
+                                }
+                                result.details.push(ConsolidationDetail {
+                                    action: "promote".to_string(),
+                                    from: format!("{} episodic entries", entries.len()),
+                                    to: versioned_internal,
+                                    occurrences: entries.len(),
+                                });
+                                result.promoted += 1;
+                                break;
+                            }
+                            version += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Write the latest value from the group as the target type (no TTL)
+        let latest_value = entries.last().unwrap().1.clone();
+        let _ = engine.set(&target_internal, latest_value, None, target_type);
+
+        // Delete all source episodic entries
+        for (src_key, _) in &entries {
+            engine.delete(src_key);
+        }
+
+        result.details.push(ConsolidationDetail {
+            action: "promote".to_string(),
+            from: format!("{} episodic entries", entries.len()),
+            to: target_internal,
+            occurrences: entries.len(),
+        });
+        result.promoted += 1;
+    }
+}
+
+/// Handle a single Compress rule: scan episodic entries, group them,
+/// and produce summary entries for groups that meet the episode threshold.
+fn run_compress_rule(
+    engine: &KvEngine,
+    namespace: &str,
+    min_episodes: usize,
+    group_by: GroupBy,
+    summary_strategy: SummaryStrategy,
+    target_key: &str,
+    target_type: MemoryType,
+    delete_source: bool,
+    result: &mut ConsolidationResult,
+) {
+    let scan_prefix = format!("{}:", namespace);
+    let entries = engine.scan_prefix(&scan_prefix);
+
+    // Only consider episodic entries
+    let episodic: Vec<(String, Vec<u8>)> = entries
+        .into_iter()
+        .filter(|(_, _, meta)| meta.memory_type == MemoryType::Episodic)
+        .map(|(k, v, _)| (k, v))
+        .collect();
+
+    // Group by the chosen strategy
+    let mut groups: HashMap<String, Vec<(String, Vec<u8>)>> = HashMap::new();
+    for (full_key, value) in episodic {
+        let group_key = match group_by {
+            GroupBy::KeyPrefix => {
+                // First segment before ':' after stripping namespace
+                let key_part = match full_key.strip_prefix(&format!("{}:", namespace)) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                match key_part.split(':').next() {
+                    Some(prefix) => prefix.to_string(),
+                    None => key_part.to_string(),
+                }
+            }
+            GroupBy::Namespace => "__all__".to_string(),
+        };
+        groups.entry(group_key).or_default().push((full_key, value));
+    }
+
+    for (group_key, entries) in groups {
+        if entries.len() < min_episodes {
+            continue;
+        }
+
+        // Build summary
+        let summary = match summary_strategy {
+            SummaryStrategy::Concat => concat_dedupe(&entries),
+            SummaryStrategy::Dedupe => {
+                let unique: HashSet<Vec<u8>> = entries.iter().map(|(_, v)| v.clone()).collect();
+                let parts: Vec<String> = unique
+                    .iter()
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .collect();
+                parts.join("; ")
+            }
+            SummaryStrategy::LlmSummary => {
+                // LLM summary not implemented; fall back to concat
+                concat_dedupe(&entries)
+            }
+        };
+
+        let final_key = target_key.replace("{prefix}", &group_key);
+        let target_internal = format!("{}:{}", namespace, final_key);
+
+        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
+
+        if delete_source {
+            for (src_key, _) in &entries {
+                engine.delete(src_key);
+            }
+        }
+
+        result.details.push(ConsolidationDetail {
+            action: "compress".to_string(),
+            from: format!("{} episodes in group '{}'", entries.len(), group_key),
+            to: target_internal,
+            occurrences: entries.len(),
+        });
+        result.compressed += 1;
+    }
+}
+
+/// Deduplicate values and join with newline separator.
+fn concat_dedupe(entries: &[(String, Vec<u8>)]) -> String {
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    let mut parts: Vec<String> = Vec::new();
+    for (_, value) in entries {
+        if seen.insert(value.clone()) {
+            parts.push(String::from_utf8_lossy(value).into_owned());
+        }
+    }
+    parts.join("\n")
 }
 
 #[cfg(test)]
@@ -438,5 +707,359 @@ mod tests {
         let ns = mgr.namespaces_with_meta();
         assert_eq!(ns.len(), 1);
         assert!(ns.contains(&"ns1".to_string()));
+    }
+
+    // --- Runner logic tests ---
+
+    use crate::store::engine::KvEngine;
+    use std::sync::Arc;
+
+    fn make_engine() -> Arc<KvEngine> {
+        Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())))
+    }
+
+    #[test]
+    fn test_promote_basic() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Insert 3 episodic entries with keys sharing the same suffix group "ping"
+        for i in 0..3 {
+            let key = format!("{}:event:ping:{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("val{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Promote {
+            description: "promote pings".to_string(),
+            min_occurrences: 3,
+            lookback_secs: 0,
+            key_prefix: "event:".to_string(),
+            target_type: MemoryType::Semantic,
+            conflict_policy: ConflictPolicy::Skip,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.skipped, 0);
+
+        // The semantic entry should exist at fact:ping
+        let target = format!("{}:fact:ping", namespace);
+        let val = engine.get(&target).unwrap();
+        assert_eq!(val, b"val2"); // latest value (from ping:2)
+
+        // The episodic entries should be gone
+        for i in 0..3 {
+            let src = format!("{}:event:ping:{}", namespace, i);
+            assert!(
+                engine.get(&src).is_none(),
+                "source entry {} should be deleted",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_promote_below_threshold() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Insert only 2 episodic entries, but min_occurrences=3
+        for i in 0..2 {
+            let key = format!("{}:event:ping:{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("val{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Promote {
+            description: "promote pings".to_string(),
+            min_occurrences: 3,
+            lookback_secs: 0,
+            key_prefix: "event:".to_string(),
+            target_type: MemoryType::Semantic,
+            conflict_policy: ConflictPolicy::Skip,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped, 0);
+
+        // Episodic entries should still exist
+        for i in 0..2 {
+            let src = format!("{}:event:ping:{}", namespace, i);
+            assert!(engine.get(&src).is_some());
+        }
+    }
+
+    #[test]
+    fn test_promote_conflict_skip() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Pre-existing semantic entry at the target key
+        let target = format!("{}:fact:ping", namespace);
+        engine
+            .set(&target, b"existing".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+
+        // Insert 3 episodic entries
+        for i in 0..3 {
+            let key = format!("{}:event:ping:{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("val{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Promote {
+            description: "promote pings".to_string(),
+            min_occurrences: 3,
+            lookback_secs: 0,
+            key_prefix: "event:".to_string(),
+            target_type: MemoryType::Semantic,
+            conflict_policy: ConflictPolicy::Skip,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped, 1);
+
+        // Original semantic value should remain
+        let val = engine.get(&target).unwrap();
+        assert_eq!(val, b"existing");
+    }
+
+    #[test]
+    fn test_promote_conflict_overwrite() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Pre-existing semantic entry at the target key
+        let target = format!("{}:fact:ping", namespace);
+        engine
+            .set(&target, b"old".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+
+        // Insert 3 episodic entries
+        for i in 0..3 {
+            let key = format!("{}:event:ping:{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("val{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Promote {
+            description: "promote pings".to_string(),
+            min_occurrences: 3,
+            lookback_secs: 0,
+            key_prefix: "event:".to_string(),
+            target_type: MemoryType::Semantic,
+            conflict_policy: ConflictPolicy::Overwrite,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.skipped, 0);
+
+        // Should have been overwritten with latest value
+        let val = engine.get(&target).unwrap();
+        assert_eq!(val, b"val2");
+    }
+
+    #[test]
+    fn test_promote_conflict_version() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Pre-existing semantic entry at the target key
+        let target = format!("{}:fact:ping", namespace);
+        engine
+            .set(&target, b"v1".to_vec(), None, MemoryType::Semantic)
+            .unwrap();
+
+        // Insert 3 episodic entries
+        for i in 0..3 {
+            let key = format!("{}:event:ping:{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("val{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Promote {
+            description: "promote pings".to_string(),
+            min_occurrences: 3,
+            lookback_secs: 0,
+            key_prefix: "event:".to_string(),
+            target_type: MemoryType::Semantic,
+            conflict_policy: ConflictPolicy::Version,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.skipped, 0);
+
+        // v2 should have been created
+        let v2_key = format!("{}:fact:ping_v2", namespace);
+        let val = engine.get(&v2_key).unwrap();
+        assert_eq!(val, b"val2");
+
+        // Original should remain
+        let val = engine.get(&target).unwrap();
+        assert_eq!(val, b"v1");
+
+        // Episodic entries should be gone
+        for i in 0..3 {
+            let src = format!("{}:event:ping:{}", namespace, i);
+            assert!(
+                engine.get(&src).is_none(),
+                "source entry {} should be deleted",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_concat() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Insert 5 episodic entries with the same key prefix
+        for i in 0..5 {
+            let key = format!("{}:log:entry{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("data{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Compress {
+            description: "compress logs".to_string(),
+            min_episodes: 5,
+            group_by: GroupBy::KeyPrefix,
+            summary_strategy: SummaryStrategy::Concat,
+            target_key: "summary:{prefix}".to_string(),
+            target_type: MemoryType::Semantic,
+            delete_source: false,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.compressed, 1);
+
+        // Summary should exist
+        let target = format!("{}:summary:log", namespace);
+        let val = engine.get(&target).unwrap();
+        let summary = String::from_utf8(val).unwrap();
+        // Should contain all 5 data values, newline-separated
+        for i in 0..5 {
+            assert!(
+                summary.contains(&format!("data{}", i)),
+                "summary missing data{}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_below_threshold() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Insert only 3 episodic entries, but min_episodes=5
+        for i in 0..3 {
+            let key = format!("{}:log:entry{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("data{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Compress {
+            description: "compress logs".to_string(),
+            min_episodes: 5,
+            group_by: GroupBy::KeyPrefix,
+            summary_strategy: SummaryStrategy::Concat,
+            target_key: "summary:{prefix}".to_string(),
+            target_type: MemoryType::Semantic,
+            delete_source: false,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.compressed, 0);
+
+        // No summary should exist
+        let target = format!("{}:summary:log", namespace);
+        assert!(engine.get(&target).is_none());
+    }
+
+    #[test]
+    fn test_compress_delete_source() {
+        let engine = make_engine();
+        let namespace = "test";
+        // Insert 5 episodic entries
+        for i in 0..5 {
+            let key = format!("{}:log:entry{}", namespace, i);
+            engine
+                .set(
+                    &key,
+                    format!("data{}", i).into_bytes(),
+                    None,
+                    MemoryType::Episodic,
+                )
+                .unwrap();
+        }
+
+        let rules = vec![ConsolidationRule::Compress {
+            description: "compress logs".to_string(),
+            min_episodes: 5,
+            group_by: GroupBy::KeyPrefix,
+            summary_strategy: SummaryStrategy::Concat,
+            target_key: "summary:{prefix}".to_string(),
+            target_type: MemoryType::Semantic,
+            delete_source: true,
+        }];
+
+        let result = run_consolidation(&engine, namespace, &rules);
+        assert_eq!(result.compressed, 1);
+
+        // Summary should exist
+        let target = format!("{}:summary:log", namespace);
+        assert!(engine.get(&target).is_some());
+
+        // Source entries should be deleted
+        for i in 0..5 {
+            let key = format!("{}:log:entry{}", namespace, i);
+            assert!(
+                engine.get(&key).is_none(),
+                "source entry {} should be deleted",
+                i
+            );
+        }
     }
 }
