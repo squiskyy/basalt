@@ -12,6 +12,7 @@ Ultra-high performance key-value store purpose-built for AI agent memory.
 - **[Persistence](./persistence.md)** - Binary snapshots, compression, restore, and disk management
 - **[Replication](./replication.md)** - Primary-replica async replication, WAL protocol, and failover
 - **[Vector Search](./vector-search.md)** - HNSW semantic similarity search with embeddings
+- **[LLM Inference](./llm.md)** - Optional LLM integration for summarization, consolidation, and relevance scoring
 - **[Performance](./performance.md)** - Benchmark results, tuning guide, and architecture for speed
 - **[Deployment](./deployment.md)** - Building, running, systemd, Docker, and production checklist
 - **[Development](./development.md)** - Building, testing, code conventions, and contributing

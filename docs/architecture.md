@@ -18,7 +18,11 @@ Basalt is a dual-protocol key-value store purpose-built for AI agent memory. Thi
                       ▼       ▼       ▼
                    Snapshot  WAL   Expired
                    Loop     Writer  Entry
-                   (tokio)  (async)  Sweeper
+                              │
+                      ┌───────┴───────┐
+                      ▼               ▼
+                 LlmClient      Consolidation
+                 (background)   (background)
 ```
 
 Both protocols share a single `Arc<KvEngine>` instance. There is no data duplication - the HTTP and RESP frontends are thin dispatch layers over the same engine.
@@ -336,18 +340,28 @@ src/
 ├── http/
 │   ├── mod.rs
 │   ├── auth.rs          # AuthStore + axum middleware + namespace extraction
-│   ├── server.rs        # axum router + handlers (including /search)
+│   ├── ready.rs         # Readiness endpoint for K8s (503 during failover)
+│   ├── server.rs        # axum router + handlers (including /search, /share, /metrics)
 │   └── models.rs        # JSON request/response types
 ├── resp/
 │   ├── mod.rs
 │   ├── error.rs         # RespError enum (thiserror)
 │   ├── parser.rs        # RESP2 protocol parser (memchr-accelerated)
 │   ├── commands.rs      # Command dispatch → KvEngine
+│   ├── session.rs       # ClientSession + process_command_batch
 │   ├── server.rs        # Tokio TCP server + connection handling
-│   └── uring_server.rs  # io_uring RESP server (feature-gated)
-└── replication/
-    ├── mod.rs           # ReplicationState, ReplicationRole
-    ├── wal.rs           # Write-Ahead Log (circular buffer + serialization)
-    ├── primary.rs       # Primary-side replica tracking + streaming
-    └── replica.rs       # Replica-side sync + stream follower
+│   ├── uring_server.rs  # io_uring RESP server (feature-gated)
+│   └── tls.rs           # TLS support (rustls or native-tls, feature-gated)
+├── llm/
+│   ├── mod.rs
+│   ├── error.rs         # LlmError enum
+│   ├── provider.rs      # LlmProvider trait, LlmRequest, LlmResponse
+│   ├── openai.rs        # OpenAI-compatible provider
+│   ├── anthropic.rs     # Anthropic Messages API provider
+│   └── client.rs        # LlmClient facade (disabled mode, summarize, classify_relevance)
+├── replication/
+│   ├── mod.rs           # ReplicationState, ReplicationRole, failover config
+│   ├── wal.rs           # Write-Ahead Log (circular buffer + serialization)
+│   ├── primary.rs       # Primary-side replica tracking + streaming
+│   └── replica.rs       # Replica-side sync + stream follower
 ```

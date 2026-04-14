@@ -130,6 +130,17 @@ All server settings are available as CLI flags. These override config file value
 
 Only available when compiled with `--features io-uring`.
 
+### LLM Inference
+
+|| Flag | Type | Default | Description ||
+|--|--|--|--|--|
+| `--llm-provider` | string | - | LLM provider: `openai`, `anthropic`, or `custom` |
+| `--llm-api-key` | string | - | API key for the LLM provider |
+| `--llm-model` | string | - | Model identifier (provider defaults if omitted) |
+| `--llm-base-url` | string | - | Base URL override for OpenAI-compatible endpoints |
+
+When no `--llm-provider` is set, LLM features are disabled. See [LLM Inference](./llm.md) for full details.
+
 ## Auth Tokens File
 
 A plain text file with one token per line:

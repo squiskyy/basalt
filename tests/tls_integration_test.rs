@@ -88,6 +88,10 @@ mod tls_rustls_tests {
 
     /// Create a TLS connector that accepts any server cert (for testing).
     fn make_tls_connector() -> TlsConnector {
+        // Install the ring crypto provider as the default if not already installed.
+        // Required for rustls 0.23+ which removed the built-in provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
         let config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))

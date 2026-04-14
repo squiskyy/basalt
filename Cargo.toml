@@ -9,7 +9,7 @@ license = "MIT"
 default = []
 io-uring = ["dep:io-uring", "dep:slab", "dep:libc"]
 metrics = ["dep:prometheus"]
-tls-rustls = ["dep:tokio-rustls", "dep:rustls-pemfile"]
+tls-rustls = ["dep:tokio-rustls", "dep:rustls-pemfile", "dep:rustls"]
 tls-native-tls = ["dep:tokio-native-tls", "dep:native-tls"]
 
 [dependencies]
@@ -38,6 +38,7 @@ libc = { version = "0.2", optional = true }
 prometheus = { version = "0.13", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+rustls = { version = "0.23", optional = true, features = ["ring"] }
 tokio-native-tls = { version = "0.3", optional = true }
 native-tls = { version = "0.2", optional = true }
 

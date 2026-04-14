@@ -79,31 +79,43 @@ basalt/
 │   ├── main.rs              # Entry point, tokio::select! for dual servers
 │   ├── lib.rs               # Re-exports for integration tests + benchmarks
 │   ├── config.rs            # CLI args (clap) + TOML config
+│   ├── metrics.rs           # Prometheus metrics (feature-gated)
 │   ├── time.rs              # Monotonic time with backward-clock fallback
 │   ├── store/
 │   │   ├── mod.rs           # Re-exports
 │   │   ├── engine.rs        # Sharded KV engine + vector search + compression
-│   │   ├── shard.rs         # Single shard: papaya HashMap + TTL + capacity
+│   │   ├── shard.rs         # Single shard: papaya HashMap + TTL + capacity + LRU
 │   │   ├── memory_type.rs   # MemoryType enum
-│   │   ├── persistence.rs   # Binary snapshot v2 (with compression flags)
-│   │   └── vector.rs        # HNSW index for semantic search
+│   │   ├── persistence.rs   # Binary snapshots (v1/v2/v3/v4 with CRC)
+│   │   ├── vector.rs        # HNSW index for semantic search
+│   │   └── share.rs         # Cross-agent memory sharing (ShareStore)
 │   ├── http/
 │   │   ├── mod.rs           # Re-exports
-│   │   ├── auth.rs          # AuthStore + axum middleware
-│   │   ├── server.rs        # axum router + handlers
-│   │   └── models.rs        # JSON request/response types
+│   │   ├── auth.rs          # AuthStore + axum middleware + sharing fallback
+│   │   ├── ready.rs         # Readiness endpoint for K8s (503 during failover)
+│   │   ├── server.rs        # axum router + handlers (including /share, /metrics)
+│   │   └── models.rs        # JSON request/response types (StoreRequest, SearchRequest, etc.)
 │   ├── resp/
 │   │   ├── mod.rs           # Re-exports
 │   │   ├── error.rs         # RespError enum (thiserror)
 │   │   ├── parser.rs        # RESP2 parser (memchr-accelerated)
-│   │   ├── commands.rs      # Command dispatch -> KvEngine
+│   │   ├── commands.rs      # Command dispatch -> KvEngine (including VSEARCH, REPLICAOF, AUTH, SHARE)
+│   │   ├── session.rs       # ClientSession + process_command_batch (shared by tokio + io_uring)
 │   │   ├── server.rs        # Tokio TCP server
-│   │   └── uring_server.rs  # io_uring RESP server (feature-gated)
+│   │   ├── uring_server.rs  # io_uring RESP server (feature-gated)
+│   │   └── tls.rs           # TLS support (rustls or native-tls, feature-gated)
+│   ├── llm/
+│   │   ├── mod.rs           # Re-exports
+│   │   ├── error.rs         # LlmError enum (NotConfigured, RequestFailed, etc.)
+│   │   ├── provider.rs      # LlmProvider trait, LlmRequest, LlmResponse
+│   │   ├── openai.rs        # OpenAI-compatible provider (Ollama, vLLM, LiteLLM)
+│   │   ├── anthropic.rs     # Anthropic Messages API provider
+│   │   └── client.rs        # LlmClient facade (disabled mode, summarize, classify_relevance)
 │   └── replication/
-│       ├── mod.rs           # ReplicationState, ReplicationRole
-│       ├── wal.rs           # Write-Ahead Log
-│       ├── primary.rs       # Primary-side replica tracking
-│       └── replica.rs       # Replica-side sync
+│       ├── mod.rs           # ReplicationState, ReplicationRole, failover config
+│       ├── wal.rs           # Write-Ahead Log (binary serialization)
+│       ├── primary.rs       # Primary-side replica tracking + streaming
+│       └── replica.rs       # Replica-side sync + lease monitoring
 ├── tests/
 │   ├── engine_test.rs       # Unit tests for engine/shard
 │   ├── http_integration_test.rs  # HTTP API integration tests
@@ -114,7 +126,11 @@ basalt/
 │   ├── vector_search_integration_test.rs  # Vector search integration tests
 │   ├── replication_test.rs  # WAL + ReplicationState tests
 │   ├── replication_e2e_test.rs  # End-to-end replication tests
-│   └── io_uring_test.rs     # io_uring feature-gated tests
+│   ├── session_test.rs      # ClientSession unit tests (auth, dispatch, REPLICAOF)
+│   ├── tls_integration_test.rs  # TLS RESP integration tests (feature-gated)
+│   ├── llm_test.rs          # LLM config, client, provider tests
+│   ├── io_uring_test.rs     # io_uring feature-gated tests
+│   └── common/mod.rs        # Shared test helpers
 ├── benches/
 │   ├── basalt_bench.rs      # Engine benchmarks (set, get, mixed, scan)
 │   └── resp_bench.rs        # RESP parser benchmarks

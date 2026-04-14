@@ -48,6 +48,10 @@ mod imp {
     impl TlsAcceptor {
         /// Create a new rustls TLS acceptor from PEM cert and key files.
         pub fn new(cert_path: &str, key_path: &str) -> Result<Self, String> {
+            // Install the ring crypto provider as the default if not already installed.
+            // This is required for rustls 0.23+ which removed the built-in provider.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+
             let certs = load_certs(cert_path)?;
             let key = load_key(key_path)?;
 
