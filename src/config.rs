@@ -62,6 +62,8 @@ pub struct ServerConfig {
     pub decay_default_lambda: f64,
     /// How often (ms) to check trigger conditions and fire matching triggers. 0 = disabled.
     pub trigger_sweep_interval_ms: u64,
+    /// How often (ms) to run consolidation sweep. 0 = disabled.
+    pub consolidation_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -90,6 +92,7 @@ impl Default for ServerConfig {
             decay_reap_interval_ms: 0,
             decay_default_lambda: std::f64::consts::LN_2 / 24.0,
             trigger_sweep_interval_ms: 30_000,
+            consolidation_interval_ms: 300_000, // 5 minutes
         }
     }
 }
@@ -205,6 +208,8 @@ struct ServerFile {
     decay_default_lambda: Option<f64>,
     #[serde(default)]
     trigger_sweep_interval_ms: Option<u64>,
+    #[serde(default)]
+    consolidation_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -300,6 +305,10 @@ impl Config {
                 .server
                 .trigger_sweep_interval_ms
                 .unwrap_or(server_defaults.trigger_sweep_interval_ms),
+            consolidation_interval_ms: file
+                .server
+                .consolidation_interval_ms
+                .unwrap_or(server_defaults.consolidation_interval_ms),
         };
 
         let auth = AuthConfig {
