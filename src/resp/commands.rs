@@ -28,6 +28,7 @@ const NO_KEY_COMMANDS: &[&str] = &[
     "SHAREWITH",
     "DECAYCONFIG",
     "REAPLOW",
+    "TRIGGER",
 ];
 
 /// Return the first key-carrying argument index for a given command name.
@@ -179,6 +180,35 @@ pub struct ShareHandler {
     auth: Arc<crate::http::auth::AuthStore>,
 }
 
+/// Convert TriggerInfo to a RESP array for TRIGGER LIST/INFO responses.
+fn trigger_info_to_resp(info: &crate::store::trigger::TriggerInfo) -> RespValue {
+    let condition_json = serde_json::to_string(&info.condition).unwrap_or_default();
+    let mut fields: Vec<RespValue> = vec![
+        RespValue::BulkString(Some("id".to_string().into_bytes())),
+        RespValue::BulkString(Some(info.id.clone().into_bytes())),
+        RespValue::BulkString(Some("condition".to_string().into_bytes())),
+        RespValue::BulkString(Some(condition_json.into_bytes())),
+        RespValue::BulkString(Some("enabled".to_string().into_bytes())),
+        if info.enabled {
+            RespValue::SimpleString("yes".to_string())
+        } else {
+            RespValue::SimpleString("no".to_string())
+        },
+        RespValue::BulkString(Some("cooldown_ms".to_string().into_bytes())),
+        RespValue::BulkString(Some(info.cooldown_ms.to_string().into_bytes())),
+    ];
+    if let Some(last) = info.last_fired_ms {
+        fields.push(RespValue::BulkString(Some("last_fired_ms".to_string().into_bytes())));
+        fields.push(RespValue::BulkString(Some(last.to_string().into_bytes())));
+    }
+    if let Some(ref action) = info.action_config {
+        let action_json = serde_json::to_string(action).unwrap_or_default();
+        fields.push(RespValue::BulkString(Some("action".to_string().into_bytes())));
+        fields.push(RespValue::BulkString(Some(action_json.into_bytes())));
+    }
+    RespValue::Array(Some(fields))
+}
+
 impl CommandHandler {
     pub fn new(engine: Arc<KvEngine>, db_path: Option<String>) -> Self {
         CommandHandler {
@@ -224,6 +254,7 @@ impl CommandHandler {
             "UNPIN" => self.handle_unpin(cmd),
             "DECAYCONFIG" => self.handle_decayconfig(cmd),
             "REAPLOW" => self.handle_reaplow(cmd),
+            "TRIGGER" => self.handle_trigger(cmd),
             "REPLICAOF" => {
                 RespValue::Error("ERR REPLICAOF must be handled at connection level".to_string())
             }
@@ -872,6 +903,159 @@ impl CommandHandler {
         // For simplicity, we report that the sweep was initiated.
         // A production implementation would await the result.
         RespValue::SimpleString("OK sweep initiated".to_string())
+    }
+
+    /// TRIGGER ADD <id> <condition_json> [cooldown_ms] - Register a trigger
+    /// TRIGGER DEL <id> - Remove a trigger
+    /// TRIGGER LIST - List all triggers
+    /// TRIGGER FIRE <id> - Manually fire a trigger
+    /// TRIGGER ENABLE <id> - Enable a trigger
+    /// TRIGGER DISABLE <id> - Disable a trigger
+    /// TRIGGER INFO <id> - Get trigger info
+    fn handle_trigger(&self, cmd: &Command) -> RespValue {
+        let sub = match cmd.args.first() {
+            Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+            None => {
+                return RespValue::Error(
+                    "ERR TRIGGER requires a subcommand: ADD|DEL|LIST|FIRE|ENABLE|DISABLE|INFO"
+                        .to_string(),
+                )
+            }
+        };
+        match sub.as_str() {
+            "ADD" => self.handle_trigger_add(cmd),
+            "DEL" => self.handle_trigger_del(cmd),
+            "LIST" => self.handle_trigger_list(cmd),
+            "FIRE" => self.handle_trigger_fire(cmd),
+            "ENABLE" => self.handle_trigger_enable(cmd),
+            "DISABLE" => self.handle_trigger_disable(cmd),
+            "INFO" => self.handle_trigger_info(cmd),
+            _ => RespValue::Error(format!("ERR unknown TRIGGER subcommand: {sub}")),
+        }
+    }
+
+    fn handle_trigger_add(&self, cmd: &Command) -> RespValue {
+        // TRIGGER ADD <id> <condition_json> [cooldown_ms]
+        if cmd.args.len() < 3 {
+            return RespValue::Error(
+                "ERR TRIGGER ADD requires: <id> <condition_json> [cooldown_ms]".to_string(),
+            );
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        let condition_json = String::from_utf8_lossy(&cmd.args[2]).to_string();
+        let cooldown_ms: u64 = cmd
+            .args
+            .get(3)
+            .and_then(|s| String::from_utf8_lossy(s).parse().ok())
+            .unwrap_or(60_000);
+
+        let condition: crate::store::trigger::TriggerCondition =
+            match serde_json::from_str(&condition_json) {
+                Ok(c) => c,
+                Err(e) => return RespValue::Error(format!("ERR invalid condition JSON: {e}")),
+            };
+
+        let trigger = crate::store::trigger::trigger_from_config(
+            id.clone(),
+            condition,
+            None, // No action_config via RESP; use HTTP for webhooks
+            cooldown_ms,
+        );
+
+        match self.engine.trigger_manager().register(trigger) {
+            Ok(()) => {
+                let info = self.engine.trigger_manager().get(&id).unwrap();
+                trigger_info_to_resp(&info)
+            }
+            Err(e) => RespValue::Error(format!("ERR {e}")),
+        }
+    }
+
+    fn handle_trigger_del(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR TRIGGER DEL requires: <id>".to_string());
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        if self.engine.trigger_manager().unregister(&id) {
+            RespValue::SimpleString("OK".to_string())
+        } else {
+            RespValue::Error("ERR trigger not found".to_string())
+        }
+    }
+
+    fn handle_trigger_list(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() > 1 {
+            return RespValue::Error("ERR TRIGGER LIST takes no arguments".to_string());
+        }
+        let triggers = self.engine.trigger_manager().list();
+        if triggers.is_empty() {
+            return RespValue::Array(Some(vec![]));
+        }
+        let items: Vec<RespValue> = triggers
+            .into_iter()
+            .map(|i| trigger_info_to_resp(&i))
+            .collect();
+        RespValue::Array(Some(items))
+    }
+
+    fn handle_trigger_fire(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR TRIGGER FIRE requires: <id>".to_string());
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        let mgr = self.engine.trigger_manager();
+        let info = match mgr.get(&id) {
+            Some(i) => i,
+            None => return RespValue::Error("ERR trigger not found".to_string()),
+        };
+
+        let now_ms = now_ms();
+        match self.engine.check_trigger_condition(&info.condition, now_ms) {
+            Some(entries) => {
+                let count = entries.len();
+                if let Some(_ctx) = mgr.force_fire(&id, entries, now_ms) {
+                    RespValue::Integer(count as i64)
+                } else {
+                    RespValue::Error("ERR trigger is disabled".to_string())
+                }
+            }
+            None => RespValue::Integer(0),
+        }
+    }
+
+    fn handle_trigger_enable(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR TRIGGER ENABLE requires: <id>".to_string());
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        if self.engine.trigger_manager().set_enabled(&id, true) {
+            RespValue::SimpleString("OK".to_string())
+        } else {
+            RespValue::Error("ERR trigger not found".to_string())
+        }
+    }
+
+    fn handle_trigger_disable(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR TRIGGER DISABLE requires: <id>".to_string());
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        if self.engine.trigger_manager().set_enabled(&id, false) {
+            RespValue::SimpleString("OK".to_string())
+        } else {
+            RespValue::Error("ERR trigger not found".to_string())
+        }
+    }
+
+    fn handle_trigger_info(&self, cmd: &Command) -> RespValue {
+        if cmd.args.len() < 2 {
+            return RespValue::Error("ERR TRIGGER INFO requires: <id>".to_string());
+        }
+        let id = String::from_utf8_lossy(&cmd.args[1]).to_string();
+        match self.engine.trigger_manager().get(&id) {
+            Some(info) => trigger_info_to_resp(&info),
+            None => RespValue::Error("ERR trigger not found".to_string()),
+        }
     }
 }
 
