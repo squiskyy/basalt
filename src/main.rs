@@ -591,6 +591,7 @@ async fn main() {
             Some(http_repl_state),
             http_ready_state,
             metrics,
+            http_config.consolidation_interval_ms,
         );
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();

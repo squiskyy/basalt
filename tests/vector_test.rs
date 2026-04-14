@@ -8,9 +8,9 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::memory_type::MemoryType;
 use basalt::store::share::ShareStore;
+use basalt::store::{ConsolidationManager, KvEngine};
 
 use axum::serve;
 use reqwest::{Client, StatusCode};
@@ -39,6 +39,7 @@ async fn start_server(
         None,
         Arc::new(ReadyState::new_ready()),
         basalt::metrics::create_metrics(),
+        300_000,
     );
 
     let handle = tokio::spawn(async move {
@@ -370,7 +371,10 @@ fn test_vsearch_command() {
     use basalt::resp::commands::CommandHandler;
     use basalt::resp::parser::Command;
 
-    let handler = CommandHandler::new(Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled()))), None);
+    let handler = CommandHandler::new(
+        Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled()))),
+        None,
+    );
 
     // Store entries with embeddings using set_with_embedding through the engine
     let _engine = &handler;

@@ -205,3 +205,59 @@ pub struct TriggerFireResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
+
+// --- Consolidation Models ---
+
+/// Query parameters for the consolidate endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ConsolidateQuery {
+    /// Only run rules of this type ("promote" or "compress"). Optional.
+    #[serde(rename = "type")]
+    pub rule_type: Option<String>,
+}
+
+/// Response body for consolidation.
+#[derive(Debug, Serialize)]
+pub struct ConsolidateResponse {
+    pub promoted: usize,
+    pub compressed: usize,
+    pub skipped: usize,
+    pub details: Vec<ConsolidateDetailResponse>,
+}
+
+/// A single consolidation action detail in the response.
+#[derive(Debug, Serialize)]
+pub struct ConsolidateDetailResponse {
+    pub action: String,
+    pub from: String,
+    pub to: String,
+    pub occurrences: usize,
+}
+
+impl From<crate::store::consolidation::ConsolidationResult> for ConsolidateResponse {
+    fn from(r: crate::store::consolidation::ConsolidationResult) -> Self {
+        ConsolidateResponse {
+            promoted: r.promoted,
+            compressed: r.compressed,
+            skipped: r.skipped,
+            details: r
+                .details
+                .into_iter()
+                .map(|d| ConsolidateDetailResponse {
+                    action: d.action,
+                    from: d.from,
+                    to: d.to,
+                    occurrences: d.occurrences,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Response body for consolidation status.
+#[derive(Debug, Serialize)]
+pub struct ConsolidationStatusResponse {
+    pub enabled: bool,
+    pub rules_count: usize,
+    pub interval_ms: u64,
+}

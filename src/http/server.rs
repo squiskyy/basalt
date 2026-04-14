@@ -9,6 +9,7 @@ use axum::routing::{delete, get, post};
 
 use crate::metrics::Metrics;
 use crate::store::NamespacedKey;
+use crate::store::consolidation::ConsolidationRule;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::ShardFullError;
@@ -17,10 +18,11 @@ use crate::time::now_ms;
 
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
-    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, GrantShareRequest,
-    InfoResponse, ListQuery, ListResponse, RegisterTriggerRequest, RevokeShareRequest,
-    SearchRequest, SearchResponse, SearchResult, ShareListResponse, SimpleResponse, StoreRequest,
-    StoreResponse, TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
+    BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, ConsolidateQuery,
+    ConsolidateResponse, ConsolidationStatusResponse, GrantShareRequest, InfoResponse, ListQuery,
+    ListResponse, RegisterTriggerRequest, RevokeShareRequest, SearchRequest, SearchResponse,
+    SearchResult, ShareListResponse, SimpleResponse, StoreRequest, StoreResponse,
+    TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
 };
 use super::ready::{ReadyResponse, ReadyState};
 
@@ -35,6 +37,7 @@ pub struct AppState {
     pub repl_state: Option<Arc<crate::replication::ReplicationState>>,
     pub ready_state: Arc<ReadyState>,
     pub metrics: Arc<dyn Metrics>,
+    pub consolidation_interval_ms: u64,
 }
 
 /// Build the axum Router with all routes, auth middleware, and shared state.
@@ -48,6 +51,7 @@ pub fn app(
     repl_state: Option<Arc<crate::replication::ReplicationState>>,
     ready_state: Arc<ReadyState>,
     metrics: Arc<dyn Metrics>,
+    consolidation_interval_ms: u64,
 ) -> Router {
     let state = AppState {
         engine,
@@ -58,6 +62,7 @@ pub fn app(
         repl_state,
         ready_state,
         metrics,
+        consolidation_interval_ms,
     };
 
     // Public routes (no auth)
@@ -88,6 +93,8 @@ pub fn app(
         .route("/trigger/{id}/fire", post(fire_trigger))
         .route("/trigger/{id}/enable", post(enable_trigger))
         .route("/trigger/{id}/disable", post(disable_trigger))
+        .route("/consolidate/{namespace}", post(consolidate))
+        .route("/consolidate/status", get(consolidation_status))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -868,4 +875,58 @@ async fn disable_trigger(
         )
             .into_response()
     }
+}
+
+// --- Consolidation handlers ---
+
+async fn consolidate(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    Query(query): Query<ConsolidateQuery>,
+) -> impl IntoResponse {
+    let mgr = state.engine.consolidation_manager();
+    if !mgr.is_enabled() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "consolidation is disabled"})),
+        )
+            .into_response();
+    }
+
+    let rules = mgr.rules();
+    let filtered: Vec<_> = match query.rule_type.as_deref() {
+        Some("promote") => rules
+            .into_iter()
+            .filter(|r| matches!(r, ConsolidationRule::Promote { .. }))
+            .collect(),
+        Some("compress") => rules
+            .into_iter()
+            .filter(|r| matches!(r, ConsolidationRule::Compress { .. }))
+            .collect(),
+        _ => rules,
+    };
+
+    let result =
+        crate::store::consolidation::run_consolidation(&state.engine, &namespace, &filtered);
+
+    // Update metadata
+    let mut meta = mgr
+        .get_meta(&namespace)
+        .unwrap_or_default();
+    meta.last_run_ms = crate::time::now_ms();
+    meta.total_promoted += result.promoted as u64;
+    meta.total_compressed += result.compressed as u64;
+    mgr.update_meta(&namespace, meta);
+
+    let response: ConsolidateResponse = result.into();
+    (StatusCode::OK, axum::Json(serde_json::json!(response))).into_response()
+}
+
+async fn consolidation_status(State(state): State<AppState>) -> impl IntoResponse {
+    let mgr = state.engine.consolidation_manager();
+    axum::Json(ConsolidationStatusResponse {
+        enabled: mgr.is_enabled(),
+        rules_count: mgr.rules().len(),
+        interval_ms: state.consolidation_interval_ms,
+    })
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
+use basalt::store::{ConsolidationManager, KvEngine};
 
 use axum::serve;
 use reqwest::{Client, StatusCode};
@@ -40,6 +40,7 @@ async fn start_server(
         None,
         Arc::new(ReadyState::new_ready()),
         basalt::metrics::create_metrics(),
+        300_000,
     );
 
     let handle = tokio::spawn(async move {

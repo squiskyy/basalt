@@ -9,8 +9,8 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
+use basalt::store::{ConsolidationManager, KvEngine};
 
 use axum::serve;
 use reqwest::{Client, StatusCode};
@@ -41,6 +41,7 @@ async fn start_server(
         None,
         Arc::new(ReadyState::new_ready()),
         basalt::metrics::create_metrics(),
+        300_000,
     );
 
     let handle = tokio::spawn(async move {
@@ -572,7 +573,11 @@ async fn test_snapshot_with_db_path_returns_200() {
 #[tokio::test]
 async fn test_507_insufficient_storage() {
     // Create a tiny engine: 1 shard, max 2 entries
-    let engine = Arc::new(KvEngine::with_max_entries(1, 2, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::with_max_entries(
+        1,
+        2,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
     let auth = Arc::new(AuthStore::new());
     let (base, _handle) = start_server(engine, auth, None).await;
     let c = client();
