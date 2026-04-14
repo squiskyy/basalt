@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::http::auth::AuthStore;
-use basalt::store::engine::KvEngine;
 
 // ---------------------------------------------------------------------------
 // RESP helpers
@@ -89,7 +89,7 @@ pub fn find_crlf(buf: &[u8]) -> Option<usize> {
 
 /// Create a new KvEngine with 4 shards.
 pub fn make_engine() -> Arc<KvEngine> {
-    Arc::new(KvEngine::new(4))
+    Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())))
 }
 
 /// Create an AuthStore with no tokens (auth disabled).

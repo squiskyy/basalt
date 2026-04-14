@@ -1,8 +1,13 @@
-use basalt::store::{KvEngine, MemoryType};
+use basalt::store::{ConsolidationManager, KvEngine, MemoryType};
+use std::sync::Arc;
+
+fn make_engine(shards: usize) -> KvEngine {
+    KvEngine::new(shards, Arc::new(ConsolidationManager::disabled()))
+}
 
 #[test]
 fn test_set_get_basic() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     engine
         .set("hello", b"world".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -15,7 +20,7 @@ fn test_set_get_basic() {
 
 #[test]
 fn test_set_get_with_ttl() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     // Set with a TTL of 1 ms — should expire almost immediately
     engine
         .set(
@@ -43,7 +48,7 @@ fn test_set_get_with_ttl() {
 
 #[test]
 fn test_delete() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     engine
         .set("to_delete", b"value".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -54,7 +59,7 @@ fn test_delete() {
 
 #[test]
 fn test_namespace_via_prefix() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     // Use "namespace:key" internal format
     engine
         .set("session:abc", b"data1".to_vec(), None, MemoryType::Semantic)
@@ -78,7 +83,7 @@ fn test_namespace_via_prefix() {
 
 #[test]
 fn test_delete_prefix() {
-    let engine = KvEngine::new(8);
+    let engine = make_engine(8);
     engine
         .set("ns:a", b"1".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -106,7 +111,7 @@ fn test_delete_prefix() {
 
 #[test]
 fn test_get_with_meta() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     engine
         .set(
             "meta_key",
@@ -156,7 +161,7 @@ fn test_episodic_has_ttl() {
     assert!(MemoryType::Procedural.default_ttl_ms().is_none());
 
     // Verify that using the default TTL with the engine works
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     let ttl = MemoryType::Episodic.default_ttl_ms();
     engine
         .set(

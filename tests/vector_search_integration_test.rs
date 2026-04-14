@@ -10,7 +10,7 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
 
 use axum::serve;
@@ -53,7 +53,7 @@ async fn start_server(
 
 /// Convenience: start a server with no auth and no db_path.
 async fn start_default_server() -> (String, tokio::task::JoinHandle<()>, Arc<KvEngine>) {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::new());
     let (base, handle) = start_server(engine.clone(), auth, None).await;
     (base, handle, engine)

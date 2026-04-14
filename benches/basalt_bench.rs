@@ -2,9 +2,14 @@
 use basalt::store::engine::KvEngine;
 use basalt::store::memory_type::MemoryType;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use std::sync::Arc;
+
+fn make_engine(shards: usize) -> KvEngine {
+    KvEngine::new(shards, Arc::new(basalt::store::ConsolidationManager::disabled()))
+}
 
 fn bench_set(c: &mut Criterion) {
-    let engine = KvEngine::new(64);
+    let engine = make_engine(64);
     let mut group = c.benchmark_group("set");
 
     for size in [16, 128, 1024, 8192].iter() {
@@ -28,7 +33,7 @@ fn bench_set(c: &mut Criterion) {
 }
 
 fn bench_get(c: &mut Criterion) {
-    let engine = KvEngine::new(64);
+    let engine = make_engine(64);
 
     // Pre-populate 100K keys
     for i in 0..100_000 {
@@ -50,7 +55,7 @@ fn bench_get(c: &mut Criterion) {
 }
 
 fn bench_mixed_workload(c: &mut Criterion) {
-    let engine = KvEngine::new(64);
+    let engine = make_engine(64);
 
     // Pre-populate 50K keys
     for i in 0..50_000 {
@@ -84,7 +89,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
 }
 
 fn bench_namespace_scan(c: &mut Criterion) {
-    let engine = KvEngine::new(64);
+    let engine = make_engine(64);
 
     // 10 agents, 1000 memories each
     for agent in 0..10u64 {
@@ -110,7 +115,7 @@ fn bench_namespace_scan(c: &mut Criterion) {
 }
 
 fn bench_set_with_memory_type(c: &mut Criterion) {
-    let engine = KvEngine::new(64);
+    let engine = make_engine(64);
     let mut group = c.benchmark_group("set_with_type");
 
     group.bench_function("episodic", |b| {
@@ -164,7 +169,7 @@ fn bench_delete_prefix(c: &mut Criterion) {
     group.bench_function("100_keys", |b| {
         b.iter_batched(
             || {
-                let engine = KvEngine::new(64);
+                let engine = make_engine(64);
                 for i in 0..100 {
                     let key = format!("bench:del:{}", i);
                     engine.set(&key, b"data".to_vec(), None, MemoryType::Semantic);

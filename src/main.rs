@@ -209,6 +209,7 @@ async fn main() {
                 cfg.server.max_entries,
                 cfg.server.compression_threshold,
                 policy,
+                Arc::new(store::ConsolidationManager::disabled()),
             ),
             None => {
                 eprintln!(

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
 
 use axum::serve;
@@ -55,7 +55,7 @@ async fn start_server(
 
 /// Convenience: start a server with no auth and no db_path.
 async fn start_default_server() -> (String, tokio::task::JoinHandle<()>, Arc<KvEngine>) {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::new());
     let (base, handle) = start_server(engine.clone(), auth, None).await;
     (base, handle, engine)
@@ -438,7 +438,7 @@ async fn test_batch_get() {
 
 #[tokio::test]
 async fn test_auth_unauthenticated_returns_401() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::from_list(vec![(
         "bsk-secret".to_string(),
         vec!["*".to_string()],
@@ -462,7 +462,7 @@ async fn test_auth_unauthenticated_returns_401() {
 
 #[tokio::test]
 async fn test_auth_wrong_namespace_returns_403() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::from_list(vec![(
         "bsk-ns-a".to_string(),
         vec!["ns-a".to_string()],
@@ -487,7 +487,7 @@ async fn test_auth_wrong_namespace_returns_403() {
 
 #[tokio::test]
 async fn test_auth_correct_token_namespace_returns_200() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::from_list(vec![(
         "bsk-ns-a".to_string(),
         vec!["ns-a".to_string()],
@@ -536,7 +536,7 @@ async fn test_snapshot_without_db_path_returns_412() {
 
 #[tokio::test]
 async fn test_snapshot_with_db_path_returns_200() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::new());
     let db_dir = std::env::temp_dir().join(format!("basalt_test_snapshot_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&db_dir);
@@ -572,7 +572,7 @@ async fn test_snapshot_with_db_path_returns_200() {
 #[tokio::test]
 async fn test_507_insufficient_storage() {
     // Create a tiny engine: 1 shard, max 2 entries
-    let engine = Arc::new(KvEngine::with_max_entries(1, 2));
+    let engine = Arc::new(KvEngine::with_max_entries(1, 2, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::new());
     let (base, _handle) = start_server(engine, auth, None).await;
     let c = client();
@@ -611,7 +611,7 @@ async fn test_507_insufficient_storage() {
 
 #[tokio::test]
 async fn test_auth_wildcard_token() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::from_list(vec![(
         "bsk-admin".to_string(),
         vec!["*".to_string()],
@@ -636,7 +636,7 @@ async fn test_auth_wildcard_token() {
 
 #[tokio::test]
 async fn test_health_and_info_no_auth_required() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::from_list(vec![(
         "bsk-secret".to_string(),
         vec!["*".to_string()],

@@ -74,7 +74,7 @@ mod io_uring_feature_gate_tests {
         };
 
         // Verify we can create a CommandHandler
-        let engine = std::sync::Arc::new(basalt::store::engine::KvEngine::new(4));
+        let engine = std::sync::Arc::new(basalt::store::engine::KvEngine::new(4, std::sync::Arc::new(basalt::store::ConsolidationManager::disabled())));
         let _handler = CommandHandler::new(engine, None);
 
         // Verify RespValue variants exist

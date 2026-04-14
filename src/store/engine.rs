@@ -1,3 +1,4 @@
+use crate::store::consolidation::ConsolidationManager;
 use crate::store::decay::DecayConfigStore;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, EvictionPolicy, Shard, ShardFullError};
@@ -6,6 +7,7 @@ use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,6 +63,8 @@ pub struct KvEngine {
     decay_config: DecayConfigStore,
     /// Summarization trigger registry.
     trigger_manager: Arc<TriggerManager>,
+    /// Memory consolidation rule manager.
+    consolidation_manager: Arc<ConsolidationManager>,
 }
 
 /// A key structured as `namespace:key`, enforcing the convention at the type level.
@@ -142,13 +146,17 @@ impl KvEngine {
     /// The actual shard count will be rounded up to the next power of 2.
     /// Each shard gets a default max_entries of 1,000,000, default compression
     /// threshold of 1024 bytes, and default eviction policy (reject).
-    pub fn new(shard_count: usize) -> Self {
-        Self::with_max_entries(shard_count, 1_000_000)
+    pub fn new(shard_count: usize, consolidation_manager: Arc<ConsolidationManager>) -> Self {
+        Self::with_max_entries(shard_count, 1_000_000, consolidation_manager)
     }
 
     /// Create a new KvEngine with the given target shard count and
     /// max entries per shard.
-    pub fn with_max_entries(shard_count: usize, max_entries: usize) -> Self {
+    pub fn with_max_entries(
+        shard_count: usize,
+        max_entries: usize,
+        consolidation_manager: Arc<ConsolidationManager>,
+    ) -> Self {
         let count = next_power_of_2(shard_count.max(1));
         let shards = (0..count)
             .map(|_| Shard::with_max_entries(max_entries))
@@ -164,6 +172,7 @@ impl KvEngine {
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
+            consolidation_manager,
         }
     }
 
@@ -175,6 +184,7 @@ impl KvEngine {
         shard_count: usize,
         max_entries: usize,
         compression_threshold: usize,
+        consolidation_manager: Arc<ConsolidationManager>,
     ) -> Self {
         let count = next_power_of_2(shard_count.max(1));
         let shards = (0..count)
@@ -191,6 +201,7 @@ impl KvEngine {
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
+            consolidation_manager,
         }
     }
 
@@ -201,6 +212,7 @@ impl KvEngine {
         max_entries: usize,
         compression_threshold: usize,
         eviction_policy: EvictionPolicy,
+        consolidation_manager: Arc<ConsolidationManager>,
     ) -> Self {
         let count = next_power_of_2(shard_count.max(1));
         let shards = (0..count)
@@ -219,6 +231,7 @@ impl KvEngine {
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
+            consolidation_manager,
         }
     }
 
@@ -229,6 +242,7 @@ impl KvEngine {
         compression_threshold: usize,
         eviction_policy: EvictionPolicy,
         decay_config: DecayConfigStore,
+        consolidation_manager: Arc<ConsolidationManager>,
     ) -> Self {
         let count = next_power_of_2(shard_count.max(1));
         let shards = (0..count)
@@ -247,6 +261,7 @@ impl KvEngine {
             hash_state: RandomState::new(),
             decay_config,
             trigger_manager: Arc::new(TriggerManager::new()),
+            consolidation_manager,
         }
     }
 
@@ -678,6 +693,25 @@ impl KvEngine {
         &self.trigger_manager
     }
 
+    /// Return the consolidation manager for memory consolidation rules.
+    pub fn consolidation_manager(&self) -> &Arc<ConsolidationManager> {
+        &self.consolidation_manager
+    }
+
+    /// Collect all distinct namespaces currently present across all shards.
+    /// A namespace is the portion of a key before the first `:` (or the full key
+    /// if no `:` is present).
+    pub fn active_namespaces(&self) -> Vec<String> {
+        let mut namespaces = HashSet::new();
+        for shard in &self.shards {
+            for key in shard.keys_prefix("") {
+                let ns = namespace_of_key(&key).to_string();
+                namespaces.insert(ns);
+            }
+        }
+        namespaces.into_iter().collect()
+    }
+
     /// Check if a trigger condition is met for a namespace and return matching entries.
     /// Returns Some(entries) if the condition is met, None otherwise.
     pub fn check_trigger_condition(
@@ -902,7 +936,7 @@ impl KvEngine {
 
 impl Default for KvEngine {
     fn default() -> Self {
-        Self::new(16)
+        Self::new(16, Arc::new(ConsolidationManager::disabled()))
     }
 }
 
@@ -929,7 +963,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_engine_reap_all_expired() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         // Insert entries: some expired (TTL=0 means expires_at=now, so is_expired is true),
         // some live (no TTL)
         engine
@@ -955,14 +989,14 @@ mod tests {
 
     #[test]
     fn test_engine_max_entries() {
-        let engine = KvEngine::with_max_entries(4, 1_000_000);
+        let engine = KvEngine::with_max_entries(4, 1_000_000, Arc::new(ConsolidationManager::disabled()));
         assert_eq!(engine.max_entries(), 1_000_000);
     }
 
     #[test]
     fn test_engine_set_returns_err_at_capacity() {
         // 1 shard (power of 2 = 1), max 3 entries
-        let engine = KvEngine::with_max_entries(1, 3);
+        let engine = KvEngine::with_max_entries(1, 3, Arc::new(ConsolidationManager::disabled()));
         assert!(
             engine
                 .set("k1", b"v1".to_vec(), None, MemoryType::Semantic)
@@ -998,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_engine_compression_large_value() {
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10);
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10, Arc::new(ConsolidationManager::disabled()));
 
         // Value > threshold and compressible
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes
@@ -1019,7 +1053,7 @@ mod tests {
     #[test]
     fn test_engine_compression_disabled() {
         // threshold = 0 disables compression
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 0);
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 0, Arc::new(ConsolidationManager::disabled()));
 
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
         engine
@@ -1032,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_engine_count_prefix() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:a", b"1".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1049,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_engine_count_prefix_skips_expired() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:live", b"1".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1061,7 +1095,7 @@ mod tests {
 
     #[test]
     fn test_engine_scan_prefix_with_compression() {
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10);
+        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10, Arc::new(ConsolidationManager::disabled()));
 
         let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
         engine
@@ -1086,7 +1120,7 @@ mod tests {
     #[test]
     fn test_namespace_version_independent() {
         // Verify that modifying one namespace does not increment the version of another
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set_with_embedding(
                 "ns1:a",
@@ -1124,7 +1158,7 @@ mod tests {
 
     #[test]
     fn test_clear_removes_all_data() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("key1", b"val1".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1212,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_set_creates_with_relevance_1() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:key1", b"val".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1228,7 +1262,7 @@ mod tests {
 
     #[test]
     fn test_get_increments_access_count() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:key1", b"val".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1242,7 +1276,7 @@ mod tests {
 
     #[test]
     fn test_get_with_meta_returns_relevance() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:key1", b"val".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1259,7 +1293,7 @@ mod tests {
 
     #[test]
     fn test_pin_unpin() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:key1", b"val".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1284,7 +1318,7 @@ mod tests {
 
     #[test]
     fn test_scan_prefix_sorted_by_relevance() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         // Insert entries, then manipulate relevance
         engine
             .set("ns:a", b"val_a".to_vec(), None, MemoryType::Semantic)
@@ -1302,7 +1336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reap_all_low_relevance() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         // Create a custom decay config with very fast decay for testing
         let fast_decay = crate::store::decay::DecayConfig {
             lambda: 100.0, // extremely fast decay
@@ -1358,7 +1392,7 @@ mod tests {
 
     #[test]
     fn test_set_force_full_preserves_metadata() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         let old_time = 1_000_000;
         engine.set_force_full(
             "ns:restored",
@@ -1396,7 +1430,7 @@ mod tests {
 
     #[test]
     fn test_scan_prefix_includes_relevance() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         engine
             .set("ns:key1", b"val1".to_vec(), None, MemoryType::Semantic)
             .unwrap();
@@ -1416,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_decay_config_per_namespace() {
-        let engine = KvEngine::new(4);
+        let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
         let custom = crate::store::decay::DecayConfig {
             lambda: 1.0,
             read_boost: 0.5,

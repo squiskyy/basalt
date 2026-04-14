@@ -8,7 +8,7 @@ use std::sync::Arc;
 use basalt::http::auth::AuthStore;
 use basalt::http::ready::ReadyState;
 use basalt::http::server::app;
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::memory_type::MemoryType;
 use basalt::store::share::ShareStore;
 
@@ -53,7 +53,7 @@ async fn start_server(
 
 /// Convenience: start a server with no auth and no db_path.
 async fn start_default_server() -> (String, tokio::task::JoinHandle<()>, Arc<KvEngine>) {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let auth = Arc::new(AuthStore::new());
     let (base, handle) = start_server(engine.clone(), auth, None).await;
     (base, handle, engine)
@@ -69,7 +69,7 @@ fn client() -> Client {
 
 #[test]
 fn test_set_with_embedding_and_search() {
-    let engine = KvEngine::new(4);
+    let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
 
     // Store entries with embeddings in the "vectors" namespace
     engine
@@ -129,7 +129,7 @@ fn test_set_with_embedding_and_search() {
 
 #[test]
 fn test_search_empty_namespace() {
-    let engine = KvEngine::new(4);
+    let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
 
     // Search in a namespace with no entries
     let results = engine.search_embedding("empty", &[1.0, 0.0], 10);
@@ -141,7 +141,7 @@ fn test_search_empty_namespace() {
 
 #[test]
 fn test_search_no_embeddings_in_namespace() {
-    let engine = KvEngine::new(4);
+    let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
 
     // Store entries WITHOUT embeddings
     engine
@@ -160,7 +160,7 @@ fn test_search_no_embeddings_in_namespace() {
 
 #[test]
 fn test_search_respects_top_k() {
-    let engine = KvEngine::new(4);
+    let engine = KvEngine::new(4, Arc::new(ConsolidationManager::disabled()));
 
     // Store 5 entries with embeddings
     for i in 0..5u32 {
@@ -370,7 +370,7 @@ fn test_vsearch_command() {
     use basalt::resp::commands::CommandHandler;
     use basalt::resp::parser::Command;
 
-    let handler = CommandHandler::new(Arc::new(KvEngine::new(4)), None);
+    let handler = CommandHandler::new(Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled()))), None);
 
     // Store entries with embeddings using set_with_embedding through the engine
     let _engine = &handler;
@@ -407,7 +407,7 @@ fn test_vsearch_with_results() {
     use basalt::resp::commands::CommandHandler;
     use basalt::resp::parser::{Command, RespValue};
 
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     // Store entries with embeddings
     engine

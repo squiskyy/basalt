@@ -9,7 +9,7 @@ use basalt::http::auth::AuthStore;
 use basalt::resp::commands::{CommandHandler, ShareHandler};
 use basalt::resp::parser::{RespValue, parse_pipeline};
 use basalt::resp::session::{ClientSession, SessionAction};
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ fn make_command(name: &str, args: &[&str]) -> RespValue {
 
 /// Create a CommandHandler backed by a fresh KvEngine with 4 shards.
 fn make_handler() -> CommandHandler {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     CommandHandler::new(engine, None)
 }
 

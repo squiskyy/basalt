@@ -9,6 +9,10 @@ pub mod trigger;
 pub mod vector;
 
 pub use decay::{DecayConfig, DecayConfigStore};
+pub use consolidation::{
+    ConsolidationDetail, ConsolidationManager, ConsolidationMeta, ConsolidationResult,
+    ConsolidationRule, ConflictPolicy, GroupBy, SummaryStrategy,
+};
 pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine, NamespacedKey};
 pub use memory_type::MemoryType;
 pub use persistence::{

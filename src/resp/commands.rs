@@ -1258,7 +1258,7 @@ mod tests {
     use super::*;
 
     fn make_handler() -> CommandHandler {
-        CommandHandler::new(Arc::new(KvEngine::new(4)), None)
+        CommandHandler::new(Arc::new(KvEngine::new(4, Arc::new(crate::store::ConsolidationManager::disabled()))), None)
     }
 
     #[test]

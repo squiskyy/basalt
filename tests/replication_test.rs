@@ -1,6 +1,6 @@
 use basalt::replication::wal::{Wal, WalEntry, WalOp, deserialize_entry, serialize_entry};
 use basalt::replication::{ReplicationRole, ReplicationState};
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::memory_type::MemoryType;
 use std::sync::Arc;
 
@@ -196,7 +196,7 @@ fn test_wal_sequence_numbers() {
 
 #[test]
 fn test_replication_state_primary() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // New primary state should have Primary role
@@ -212,7 +212,7 @@ fn test_replication_state_primary() {
 
 #[test]
 fn test_replication_state_record_set() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     state.record_set(b"mykey", b"myval", MemoryType::Semantic, Some(5000));
@@ -236,7 +236,7 @@ fn test_replication_state_record_set() {
 
 #[test]
 fn test_replication_state_record_delete() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     state.record_delete(b"mykey");
@@ -404,7 +404,7 @@ fn test_ttl_large_value_roundtrip() {
 
 #[test]
 fn test_record_set_none_ttl_stores_zero() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let repl_state = ReplicationState::new_primary(engine, 100);
     // record_set with None TTL must store ttl_ms=0 in the WAL entry
     repl_state.record_set(b"key1", b"val1", MemoryType::Semantic, None);
@@ -418,7 +418,7 @@ fn test_record_set_none_ttl_stores_zero() {
 
 #[test]
 fn test_record_set_some_ttl_stores_value() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let repl_state = ReplicationState::new_primary(engine, 100);
     // record_set with Some(TTL) must store that TTL in the WAL entry
     repl_state.record_set(b"key2", b"val2", MemoryType::Episodic, Some(10000));
@@ -436,7 +436,7 @@ fn test_record_set_some_ttl_stores_value() {
 
 #[test]
 fn test_node_id_is_generated() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
     // node_id should be a 16-char hex string
     let node_id = state.node_id();
@@ -449,8 +449,8 @@ fn test_node_id_is_generated() {
 
 #[test]
 fn test_node_id_is_unique() {
-    let engine1 = Arc::new(KvEngine::new(4));
-    let engine2 = Arc::new(KvEngine::new(4));
+    let engine1 = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let engine2 = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state1 = ReplicationState::new_primary(engine1, 100);
     let state2 = ReplicationState::new_primary(engine2, 100);
     assert_ne!(
@@ -462,14 +462,14 @@ fn test_node_id_is_unique() {
 
 #[test]
 fn test_epoch_starts_at_zero() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
     assert_eq!(state.current_epoch(), 0);
 }
 
 #[test]
 fn test_epoch_increment() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
     let new_epoch = state.increment_epoch();
     assert_eq!(new_epoch, 1);
@@ -481,7 +481,7 @@ fn test_epoch_increment() {
 
 #[test]
 fn test_epoch_set() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
     state.set_epoch(5);
     assert_eq!(state.current_epoch(), 5);
@@ -489,7 +489,7 @@ fn test_epoch_set() {
 
 #[test]
 fn test_lease_tracking() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // Initially, no lease received
@@ -506,7 +506,7 @@ fn test_lease_tracking() {
 
 #[test]
 fn test_lease_expiry_detection() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // No lease received yet - should NOT be expired
@@ -525,7 +525,7 @@ fn test_lease_expiry_detection() {
 
 #[test]
 fn test_promote_to_primary() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // Set up as replica with primary epoch 2
@@ -546,7 +546,7 @@ fn test_promote_to_primary() {
 
 #[test]
 fn test_demote_to_replica() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // Start as primary with epoch 0
@@ -569,7 +569,7 @@ fn test_demote_to_replica() {
 fn test_failover_config() {
     use basalt::replication::FailoverConfig;
 
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // Default config should be disabled
@@ -592,7 +592,7 @@ fn test_failover_config() {
 
 #[test]
 fn test_info_string_includes_failover_fields() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 100);
 
     // Primary info should include node_id and epoch

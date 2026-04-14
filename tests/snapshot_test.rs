@@ -1,6 +1,12 @@
 use basalt::store::{
-    KvEngine, MemoryType, collect_entries, load_latest_snapshot, snapshot, snapshot_with_threshold,
+    ConsolidationManager, KvEngine, MemoryType, collect_entries, load_latest_snapshot, snapshot,
+    snapshot_with_threshold,
 };
+use std::sync::Arc;
+
+fn make_engine(shards: usize) -> KvEngine {
+    KvEngine::new(shards, Arc::new(ConsolidationManager::disabled()))
+}
 
 /// Basic snapshot round-trip: set data, snapshot, new engine, restore, verify.
 #[test]
@@ -9,7 +15,7 @@ fn test_snapshot_roundtrip_basic() {
     let db_path = dir.path();
 
     // Engine 1: store data
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     engine
         .set("user:1", b"Alice".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -30,7 +36,7 @@ fn test_snapshot_roundtrip_basic() {
     assert!(result.is_ok(), "snapshot should succeed: {:?}", result);
 
     // Engine 2: restore from snapshot
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2);
     assert!(loaded.is_ok(), "load should succeed: {:?}", loaded);
     assert_eq!(loaded.unwrap(), 3, "should load 3 entries");
@@ -47,7 +53,7 @@ fn test_snapshot_roundtrip_all_memory_types() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(8);
+    let engine = make_engine(8);
 
     // Episodic with TTL
     engine
@@ -84,7 +90,7 @@ fn test_snapshot_roundtrip_all_memory_types() {
     assert!(result.is_ok(), "snapshot failed: {:?}", result);
 
     // Restore into new engine
-    let engine2 = KvEngine::new(8);
+    let engine2 = make_engine(8);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(loaded, 3);
 
@@ -128,7 +134,7 @@ fn test_snapshot_expired_entries_not_restored() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Set an entry with a very short TTL (1ms)
     engine
@@ -161,7 +167,7 @@ fn test_snapshot_expired_entries_not_restored() {
     assert!(result.is_ok(), "snapshot failed: {:?}", result);
 
     // Restore into new engine
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
 
     // Only the persistent entry should be loaded; the expired one should be skipped
@@ -181,14 +187,14 @@ fn test_snapshot_roundtrip_empty() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Snapshot an empty engine
     let result = snapshot(db_path, &engine, 1);
     assert!(result.is_ok(), "snapshot of empty engine should succeed");
 
     // Restore into new engine
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(loaded, 0, "empty snapshot should load 0 entries");
 
@@ -202,7 +208,7 @@ fn test_snapshot_roundtrip_many_entries() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(16);
+    let engine = make_engine(16);
     let num_entries = 500;
 
     for i in 0..num_entries {
@@ -222,7 +228,7 @@ fn test_snapshot_roundtrip_many_entries() {
     assert!(result.is_ok(), "snapshot with many entries should succeed");
 
     // Restore
-    let engine2 = KvEngine::new(16);
+    let engine2 = make_engine(16);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(
         loaded, num_entries,
@@ -250,7 +256,7 @@ fn test_snapshot_multiple_and_restore_latest() {
     let db_path = dir.path();
 
     // First snapshot with 2 entries
-    let engine1 = KvEngine::new(4);
+    let engine1 = make_engine(4);
     engine1
         .set("a", b"1".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -263,7 +269,7 @@ fn test_snapshot_multiple_and_restore_latest() {
     std::thread::sleep(std::time::Duration::from_millis(10));
 
     // Second snapshot with 3 entries (different engine instance, same path)
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     engine2
         .set("a", b"1".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -276,7 +282,7 @@ fn test_snapshot_multiple_and_restore_latest() {
     snapshot(db_path, &engine2, 5).unwrap();
 
     // Restore: should get the LATEST snapshot (3 entries)
-    let engine3 = KvEngine::new(4);
+    let engine3 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine3).unwrap();
     assert_eq!(loaded, 3, "should load latest snapshot with 3 entries");
 
@@ -288,7 +294,7 @@ fn test_snapshot_multiple_and_restore_latest() {
 /// Test collect_entries helper.
 #[test]
 fn test_collect_entries() {
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     engine
         .set("k1", b"v1".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -315,7 +321,7 @@ fn test_snapshot_binary_values() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Binary values (including all byte values 0-255)
     let binary_val: Vec<u8> = (0u8..=255).collect();
@@ -331,7 +337,7 @@ fn test_snapshot_binary_values() {
     // Snapshot and restore
     snapshot(db_path, &engine, 1).unwrap();
 
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     load_latest_snapshot(db_path, &engine2).unwrap();
 
     assert_eq!(engine2.get("bin:data"), Some(binary_val));
@@ -345,7 +351,7 @@ fn test_snapshot_restore_into_nonempty_engine() {
     let db_path = dir.path();
 
     // Create and snapshot engine with some data
-    let engine1 = KvEngine::new(4);
+    let engine1 = make_engine(4);
     engine1
         .set(
             "shared",
@@ -365,7 +371,7 @@ fn test_snapshot_restore_into_nonempty_engine() {
     snapshot(db_path, &engine1, 1).unwrap();
 
     // Create engine2 with some pre-existing data
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     engine2
         .set("shared", b"original".to_vec(), None, MemoryType::Semantic)
         .unwrap();
@@ -396,7 +402,7 @@ fn test_snapshot_namespace_keys() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(8);
+    let engine = make_engine(8);
     engine
         .set("session:abc:1", b"s1".to_vec(), None, MemoryType::Episodic)
         .unwrap();
@@ -415,7 +421,7 @@ fn test_snapshot_namespace_keys() {
 
     snapshot(db_path, &engine, 1).unwrap();
 
-    let engine2 = KvEngine::new(8);
+    let engine2 = make_engine(8);
     load_latest_snapshot(db_path, &engine2).unwrap();
 
     // Verify namespace-scoped scans work after restore
@@ -439,7 +445,7 @@ fn test_snapshot_compression_large_values() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Create a large compressible value (>1KB)
     let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes, highly compressible
@@ -457,7 +463,7 @@ fn test_snapshot_compression_large_values() {
     assert!(result.is_ok(), "snapshot should succeed: {:?}", result);
 
     // Restore into new engine
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(loaded, 2);
 
@@ -485,7 +491,7 @@ fn test_snapshot_no_compression_small_values() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Small values well below threshold
     engine
@@ -498,7 +504,7 @@ fn test_snapshot_no_compression_small_values() {
     snapshot_with_threshold(db_path, &engine, 1, 1024).unwrap();
 
     // Restore and verify
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(loaded, 2);
     assert_eq!(engine2.get("k1"), Some(b"hello".to_vec()));
@@ -569,7 +575,7 @@ fn test_snapshot_backward_compat_v1() {
     std::fs::write(&snapshot_path, &data).unwrap();
 
     // Load into engine
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine).unwrap();
     assert_eq!(loaded, 1);
 
@@ -586,7 +592,7 @@ fn test_snapshot_compression_disabled() {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let db_path = dir.path();
 
-    let engine = KvEngine::new(4);
+    let engine = make_engine(4);
 
     // Large value that would normally be compressed
     let large_value: Vec<u8> = "X".repeat(5000).into_bytes();
@@ -598,7 +604,7 @@ fn test_snapshot_compression_disabled() {
     snapshot_with_threshold(db_path, &engine, 1, 0).unwrap();
 
     // Restore
-    let engine2 = KvEngine::new(4);
+    let engine2 = make_engine(4);
     let loaded = load_latest_snapshot(db_path, &engine2).unwrap();
     assert_eq!(loaded, 1);
     assert_eq!(engine2.get("big:key"), Some(large_value));

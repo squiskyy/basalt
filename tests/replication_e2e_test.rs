@@ -15,7 +15,7 @@
 
 use basalt::replication::wal::{WalOp, deserialize_entry, serialize_entry};
 use basalt::replication::{ReplicationRole, ReplicationState};
-use basalt::store::engine::KvEngine;
+use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::memory_type::MemoryType;
 use std::sync::Arc;
 
@@ -27,8 +27,8 @@ use std::sync::Arc;
 /// deserialize on replica, apply to replica engine, verify data matches.
 #[test]
 fn test_e2e_replication_set_sync() {
-    let primary_engine = Arc::new(KvEngine::new(4));
-    let replica_engine = Arc::new(KvEngine::new(4));
+    let primary_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let replica_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     let primary_state = ReplicationState::new_primary(primary_engine.clone(), 1000);
 
@@ -103,8 +103,8 @@ fn test_e2e_replication_set_sync() {
 /// replicate WAL, verify key is absent on replica.
 #[test]
 fn test_e2e_replication_delete_sync() {
-    let primary_engine = Arc::new(KvEngine::new(4));
-    let replica_engine = Arc::new(KvEngine::new(4));
+    let primary_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let replica_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     let primary_state = ReplicationState::new_primary(primary_engine.clone(), 1000);
 
@@ -163,8 +163,8 @@ fn test_e2e_replication_delete_sync() {
 /// Test replication of DELETE_PREFIX operations.
 #[test]
 fn test_e2e_replication_delete_prefix_sync() {
-    let primary_engine = Arc::new(KvEngine::new(4));
-    let replica_engine = Arc::new(KvEngine::new(4));
+    let primary_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let replica_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     let primary_state = ReplicationState::new_primary(primary_engine.clone(), 1000);
 
@@ -239,8 +239,8 @@ fn test_e2e_replication_delete_prefix_sync() {
 /// then stream WAL entries, and verify replica matches primary.
 #[test]
 fn test_e2e_replication_snapshot_plus_wal() {
-    let primary_engine = Arc::new(KvEngine::new(4));
-    let replica_engine = Arc::new(KvEngine::new(4));
+    let primary_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let replica_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     let primary_state = ReplicationState::new_primary(primary_engine.clone(), 1000);
 
@@ -334,8 +334,8 @@ fn test_e2e_replication_snapshot_plus_wal() {
 /// embeddings, replica receives them via WAL, and search works on replica.
 #[test]
 fn test_e2e_replication_with_embeddings() {
-    let primary_engine = Arc::new(KvEngine::new(4));
-    let replica_engine = Arc::new(KvEngine::new(4));
+    let primary_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
+    let replica_engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
 
     let primary_state = ReplicationState::new_primary(primary_engine.clone(), 1000);
 
@@ -424,7 +424,7 @@ fn test_e2e_replication_with_embeddings() {
 /// Test that a ReplicationState starts as Primary with correct defaults.
 #[test]
 fn test_e2e_replication_state_initial() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 500);
 
     assert_eq!(state.role(), ReplicationRole::Primary);
@@ -436,7 +436,7 @@ fn test_e2e_replication_state_initial() {
 /// Test that recording multiple operations advances the replication offset.
 #[test]
 fn test_e2e_replication_offset_advances() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     let state = ReplicationState::new_primary(engine, 1000);
 
     assert_eq!(state.replication_offset(), 0);
@@ -457,7 +457,7 @@ fn test_e2e_replication_offset_advances() {
 /// Test WAL circular buffer with replication offset tracking.
 #[test]
 fn test_e2e_replication_wal_circular_with_offset() {
-    let engine = Arc::new(KvEngine::new(4));
+    let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
     // Small WAL (max 5 entries) to test circular behavior
     let state = ReplicationState::new_primary(engine, 5);
 

@@ -473,9 +473,10 @@ mod tests {
     #[test]
     fn test_record_set_none_ttl_stores_zero() {
         use crate::replication::ReplicationState;
+        use crate::store::consolidation::ConsolidationManager;
         use crate::store::engine::KvEngine;
         use std::sync::Arc;
-        let engine = Arc::new(KvEngine::new(4));
+        let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
         let repl_state = ReplicationState::new_primary(engine, 100);
         repl_state.record_set(b"key1", b"val1", MemoryType::Semantic, None);
         let entries = repl_state.wal().entries_from(1);
@@ -490,9 +491,10 @@ mod tests {
     #[test]
     fn test_record_set_some_ttl_stores_value() {
         use crate::replication::ReplicationState;
+        use crate::store::consolidation::ConsolidationManager;
         use crate::store::engine::KvEngine;
         use std::sync::Arc;
-        let engine = Arc::new(KvEngine::new(4));
+        let engine = Arc::new(KvEngine::new(4, Arc::new(ConsolidationManager::disabled())));
         let repl_state = ReplicationState::new_primary(engine, 100);
         repl_state.record_set(b"key2", b"val2", MemoryType::Episodic, Some(10000));
         let entries = repl_state.wal().entries_from(1);
