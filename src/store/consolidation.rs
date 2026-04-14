@@ -7,10 +7,12 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::client::LlmClient;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
 use crate::time::now_ms;
@@ -215,6 +217,9 @@ impl ConsolidationManager {
 
 /// Run consolidation for a single namespace using the provided rules.
 /// Returns a ConsolidationResult summarizing what happened.
+///
+/// This is the synchronous version that falls back to concat_dedupe for
+/// LlmSummary strategies. Use `run_consolidation_with_llm` for async LLM support.
 pub fn run_consolidation(
     engine: &KvEngine,
     namespace: &str,
@@ -260,6 +265,62 @@ pub fn run_consolidation(
                     *delete_source,
                     &mut result,
                 );
+            }
+        }
+    }
+    result
+}
+
+/// Run consolidation with LLM support for the llm_summary strategy.
+/// If llm_client is None or disabled, falls back to concat for LLM summaries.
+pub async fn run_consolidation_with_llm(
+    engine: &KvEngine,
+    namespace: &str,
+    rules: &[ConsolidationRule],
+    llm_client: Option<Arc<LlmClient>>,
+) -> ConsolidationResult {
+    let mut result = ConsolidationResult::new();
+    for rule in rules {
+        match rule {
+            ConsolidationRule::Promote {
+                min_occurrences,
+                key_prefix,
+                target_type,
+                conflict_policy,
+                ..
+            } => {
+                run_promote_rule(
+                    engine,
+                    namespace,
+                    *min_occurrences,
+                    key_prefix,
+                    *target_type,
+                    *conflict_policy,
+                    &mut result,
+                );
+            }
+            ConsolidationRule::Compress {
+                min_episodes,
+                group_by,
+                summary_strategy,
+                target_key,
+                target_type,
+                delete_source,
+                ..
+            } => {
+                run_compress_rule_with_llm(
+                    engine,
+                    namespace,
+                    *min_episodes,
+                    *group_by,
+                    *summary_strategy,
+                    target_key,
+                    *target_type,
+                    *delete_source,
+                    &mut result,
+                    llm_client.as_ref(),
+                )
+                .await;
             }
         }
     }
@@ -394,6 +455,139 @@ fn run_compress_rule(
     delete_source: bool,
     result: &mut ConsolidationResult,
 ) {
+    let groups = group_episodic_entries(engine, namespace, group_by);
+
+    for (group_key, entries) in groups {
+        if entries.len() < min_episodes {
+            continue;
+        }
+
+        // Build summary
+        let summary = match summary_strategy {
+            SummaryStrategy::Concat => concat_dedupe(&entries),
+            SummaryStrategy::Dedupe => {
+                let unique: HashSet<Vec<u8>> = entries.iter().map(|(_, v)| v.clone()).collect();
+                let parts: Vec<String> = unique
+                    .iter()
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .collect();
+                parts.join("; ")
+            }
+            SummaryStrategy::LlmSummary => {
+                // LLM summary not available in sync path; fall back to concat
+                concat_dedupe(&entries)
+            }
+        };
+
+        let final_key = target_key.replace("{prefix}", &group_key);
+        let target_internal = format!("{}:{}", namespace, final_key);
+
+        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
+
+        if delete_source {
+            for (src_key, _) in &entries {
+                engine.delete(src_key);
+            }
+        }
+
+        result.details.push(ConsolidationDetail {
+            action: "compress".to_string(),
+            from: format!("{} episodes in group '{}'", entries.len(), group_key),
+            to: target_internal,
+            occurrences: entries.len(),
+        });
+        result.compressed += 1;
+    }
+}
+
+/// Async variant of run_compress_rule with LLM summarization support.
+/// For LlmSummary strategy, calls the LLM client if available and enabled;
+/// otherwise falls back to concat_dedupe.
+async fn run_compress_rule_with_llm(
+    engine: &KvEngine,
+    namespace: &str,
+    min_episodes: usize,
+    group_by: GroupBy,
+    summary_strategy: SummaryStrategy,
+    target_key: &str,
+    target_type: MemoryType,
+    delete_source: bool,
+    result: &mut ConsolidationResult,
+    llm_client: Option<&Arc<LlmClient>>,
+) {
+    let groups = group_episodic_entries(engine, namespace, group_by);
+
+    for (group_key, entries) in groups {
+        if entries.len() < min_episodes {
+            continue;
+        }
+
+        // Build summary
+        let summary = match summary_strategy {
+            SummaryStrategy::Concat => concat_dedupe(&entries),
+            SummaryStrategy::Dedupe => {
+                let unique: HashSet<Vec<u8>> = entries.iter().map(|(_, v)| v.clone()).collect();
+                let parts: Vec<String> = unique
+                    .iter()
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .collect();
+                parts.join("; ")
+            }
+            SummaryStrategy::LlmSummary => {
+                let values: Vec<String> = entries
+                    .iter()
+                    .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+                    .collect();
+                let context = format!("Consolidating episodic memories in group '{}'", group_key);
+                match llm_client {
+                    Some(client) if client.is_enabled() => {
+                        match client.summarize(&values, &context).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "LLM summarization failed for group '{}': {}; falling back to concat",
+                                    group_key,
+                                    e
+                                );
+                                concat_dedupe(&entries)
+                            }
+                        }
+                    }
+                    _ => {
+                        // No LLM client or client is disabled; fall back to concat
+                        concat_dedupe(&entries)
+                    }
+                }
+            }
+        };
+
+        let final_key = target_key.replace("{prefix}", &group_key);
+        let target_internal = format!("{}:{}", namespace, final_key);
+
+        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
+
+        if delete_source {
+            for (src_key, _) in &entries {
+                engine.delete(src_key);
+            }
+        }
+
+        result.details.push(ConsolidationDetail {
+            action: "compress".to_string(),
+            from: format!("{} episodes in group '{}'", entries.len(), group_key),
+            to: target_internal,
+            occurrences: entries.len(),
+        });
+        result.compressed += 1;
+    }
+}
+
+/// Scan episodic entries in a namespace and group them by the chosen strategy.
+fn group_episodic_entries(
+    engine: &KvEngine,
+    namespace: &str,
+    group_by: GroupBy,
+) -> HashMap<String, Vec<(String, Vec<u8>)>> {
     let scan_prefix = format!("{}:", namespace);
     let entries = engine.scan_prefix(&scan_prefix);
 
@@ -423,48 +617,7 @@ fn run_compress_rule(
         };
         groups.entry(group_key).or_default().push((full_key, value));
     }
-
-    for (group_key, entries) in groups {
-        if entries.len() < min_episodes {
-            continue;
-        }
-
-        // Build summary
-        let summary = match summary_strategy {
-            SummaryStrategy::Concat => concat_dedupe(&entries),
-            SummaryStrategy::Dedupe => {
-                let unique: HashSet<Vec<u8>> = entries.iter().map(|(_, v)| v.clone()).collect();
-                let parts: Vec<String> = unique
-                    .iter()
-                    .map(|v| String::from_utf8_lossy(v).into_owned())
-                    .collect();
-                parts.join("; ")
-            }
-            SummaryStrategy::LlmSummary => {
-                // LLM summary not implemented; fall back to concat
-                concat_dedupe(&entries)
-            }
-        };
-
-        let final_key = target_key.replace("{prefix}", &group_key);
-        let target_internal = format!("{}:{}", namespace, final_key);
-
-        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
-
-        if delete_source {
-            for (src_key, _) in &entries {
-                engine.delete(src_key);
-            }
-        }
-
-        result.details.push(ConsolidationDetail {
-            action: "compress".to_string(),
-            from: format!("{} episodes in group '{}'", entries.len(), group_key),
-            to: target_internal,
-            occurrences: entries.len(),
-        });
-        result.compressed += 1;
-    }
+    groups
 }
 
 /// Deduplicate values and join with newline separator.
