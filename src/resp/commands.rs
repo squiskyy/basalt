@@ -198,12 +198,16 @@ fn trigger_info_to_resp(info: &crate::store::trigger::TriggerInfo) -> RespValue 
         RespValue::BulkString(Some(info.cooldown_ms.to_string().into_bytes())),
     ];
     if let Some(last) = info.last_fired_ms {
-        fields.push(RespValue::BulkString(Some("last_fired_ms".to_string().into_bytes())));
+        fields.push(RespValue::BulkString(Some(
+            "last_fired_ms".to_string().into_bytes(),
+        )));
         fields.push(RespValue::BulkString(Some(last.to_string().into_bytes())));
     }
     if let Some(ref action) = info.action_config {
         let action_json = serde_json::to_string(action).unwrap_or_default();
-        fields.push(RespValue::BulkString(Some("action".to_string().into_bytes())));
+        fields.push(RespValue::BulkString(Some(
+            "action".to_string().into_bytes(),
+        )));
         fields.push(RespValue::BulkString(Some(action_json.into_bytes())));
     }
     RespValue::Array(Some(fields))
@@ -919,7 +923,7 @@ impl CommandHandler {
                 return RespValue::Error(
                     "ERR TRIGGER requires a subcommand: ADD|DEL|LIST|FIRE|ENABLE|DISABLE|INFO"
                         .to_string(),
-                )
+                );
             }
         };
         match sub.as_str() {

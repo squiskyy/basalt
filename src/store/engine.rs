@@ -6,9 +6,9 @@ use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Metadata returned alongside a value when using `get_with_meta`.
 #[derive(Debug, Clone)]
@@ -686,7 +686,10 @@ impl KvEngine {
         now_ms: u64,
     ) -> Option<Vec<TriggerEntry>> {
         match condition {
-            TriggerCondition::MinEntries { namespace, threshold } => {
+            TriggerCondition::MinEntries {
+                namespace,
+                threshold,
+            } => {
                 let prefix = format!("{}:", namespace);
                 let count = self.count_prefix(&prefix);
                 if count >= *threshold {
@@ -695,7 +698,10 @@ impl KvEngine {
                     None
                 }
             }
-            TriggerCondition::MaxAge { namespace, max_age_ms } => {
+            TriggerCondition::MaxAge {
+                namespace,
+                max_age_ms,
+            } => {
                 let prefix = format!("{}:", namespace);
                 let cutoff = now_ms.saturating_sub(*max_age_ms);
                 let entries = self.collect_trigger_entries(&prefix, Some(cutoff), now_ms);

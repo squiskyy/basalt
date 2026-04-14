@@ -43,15 +43,9 @@ pub struct TriggerEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerCondition {
     /// Fire when namespace entry count >= threshold.
-    MinEntries {
-        namespace: String,
-        threshold: usize,
-    },
+    MinEntries { namespace: String, threshold: usize },
     /// Fire when oldest entry in namespace exceeds max_age_ms.
-    MaxAge {
-        namespace: String,
-        max_age_ms: u64,
-    },
+    MaxAge { namespace: String, max_age_ms: u64 },
     /// Fire when entries matching a key prefix reach threshold.
     MatchCount {
         namespace: String,
@@ -218,10 +212,10 @@ impl TriggerManager {
         if !t.enabled {
             return None;
         }
-        if let Some(last) = t.last_fired_ms {
-            if now_ms < last + t.cooldown_ms {
-                return None;
-            }
+        if let Some(last) = t.last_fired_ms
+            && now_ms < last + t.cooldown_ms
+        {
+            return None;
         }
         t.last_fired_ms = Some(now_ms);
         Some(TriggerContext {

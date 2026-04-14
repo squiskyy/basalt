@@ -19,8 +19,8 @@ use super::auth::{AuthStore, auth_middleware};
 use super::models::{
     BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, GrantShareRequest,
     InfoResponse, ListQuery, ListResponse, RegisterTriggerRequest, RevokeShareRequest,
-    SearchRequest, SearchResponse, SearchResult, ShareListResponse, SimpleResponse,
-    StoreRequest, StoreResponse, TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
+    SearchRequest, SearchResponse, SearchResult, ShareListResponse, SimpleResponse, StoreRequest,
+    StoreResponse, TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
 };
 use super::ready::{ReadyResponse, ReadyState};
 
@@ -764,10 +764,7 @@ async fn delete_trigger(
     }
 }
 
-async fn fire_trigger(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn fire_trigger(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     let mgr = state.engine.trigger_manager();
     let info = match mgr.get(&id) {
         Some(i) => i,
@@ -776,21 +773,22 @@ async fn fire_trigger(
                 StatusCode::NOT_FOUND,
                 axum::Json(serde_json::json!({"error": "trigger not found"})),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let now_ms = now_ms();
-    match state.engine.check_trigger_condition(&info.condition, now_ms) {
+    match state
+        .engine
+        .check_trigger_condition(&info.condition, now_ms)
+    {
         Some(entries) => {
             let count = entries.len();
             if let Some(ctx) = mgr.force_fire(&id, entries, now_ms) {
                 // Execute the action if configured
                 if let Some(config) = mgr.get_action_config(&id) {
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            crate::store::trigger::execute_webhook(&config, ctx).await
-                        {
+                        if let Err(e) = crate::store::trigger::execute_webhook(&config, ctx).await {
                             tracing::warn!("trigger webhook failed: id={}, error={}", id, e);
                         }
                     });
