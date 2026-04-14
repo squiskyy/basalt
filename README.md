@@ -102,7 +102,139 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 - **io_uring** - Linux-only io_uring backend for the RESP server (feature flag)
 - **Relevance decay** - Exponential relevance scoring that decays over time; read/write boosts keep hot memories alive, pinned entries stay at 1.0, low-relevance entries GC'd automatically
 - **Summarization triggers** - Automatic memory compression when conditions are met (entry count, age, pattern match), with webhook and callback actions
+- **Memory consolidation** - Promote episodic memories to semantic, compress related episodes, configurable rules with conflict policies and summary strategies
 - **LLM integration** - Optional background LLM inference for summarization, consolidation, and relevance scoring (OpenAI, Anthropic, or custom endpoints)
+
+## Memory Consolidation
+
+Consolidation is the process of promoting episodic memories to semantic ones and compressing related episodes into summarized entries. Without it, an agent's episodic store grows unbounded and fills with low-value observations. Consolidation keeps the store lean while preserving learned knowledge.
+
+### How it works
+
+- **Promote** - An episodic memory that meets a rule's conditions is copied into a semantic key. The original episodic entry can be deleted or left to expire via TTL.
+- **Compress** - Multiple episodic entries matching a pattern are merged into a single summarized entry (semantic or episodic, depending on configuration). The source entries are removed after compression succeeds.
+
+### Configuration
+
+Add a `[consolidation]` table to your TOML config:
+
+```toml
+[consolidation]
+# How often the background sweep runs (milliseconds). 0 disables automatic consolidation.
+consolidation_interval_ms = 60_000
+
+[[consolidation.rules]]
+type = "promote"
+namespace = "agent-42"
+pattern = "obs:*"          # keys matching this glob
+target_type = "semantic"   # destination memory type
+conflict = "version"       # skip | overwrite | version
+summary = "concat"         # concat | dedupe | llm_summary
+
+[[consolidation.rules]]
+type = "compress"
+namespace = "agent-42"
+pattern = "chat:*"
+min_count = 5              # compress only when this many entries match
+target_type = "semantic"
+conflict = "skip"
+summary = "llm_summary"
+```
+
+### Promote rule example
+
+Promote any episodic observation prefixed `obs:` into a permanent semantic fact:
+
+```toml
+[[consolidation.rules]]
+type = "promote"
+namespace = "agent-42"
+pattern = "obs:*"
+target_type = "semantic"
+conflict = "version"
+summary = "concat"
+```
+
+When the sweep runs, each matching episodic key `obs:7` is promoted to a semantic key with the same value. If a semantic key already exists, the `version` conflict policy appends a version suffix (`obs:7#v2`).
+
+### Compress rule example
+
+Compress chat transcript fragments into a single summary once there are at least 10:
+
+```toml
+[[consolidation.rules]]
+type = "compress"
+namespace = "agent-42"
+pattern = "chat:*"
+min_count = 10
+target_type = "semantic"
+conflict = "overwrite"
+summary = "llm_summary"
+```
+
+All matching episodic entries are collected, their values are merged using the configured summary strategy, and the result is stored as one semantic entry. The source entries are then deleted.
+
+### Conflict policies
+
+When a target key already exists, the conflict policy decides what to do:
+
+| Policy | Behavior |
+|---|---|
+| **skip** | Do not write; leave the existing entry untouched |
+| **overwrite** | Replace the existing entry with the new value |
+| **version** | Write to a versioned key (e.g. `fact:earth#v2`) so no data is lost |
+
+### Summary strategies
+
+The summary strategy controls how multiple values are merged during compression (and how a single value is prepared during promotion if needed):
+
+| Strategy | Behavior |
+|---|---|
+| **concat** | Concatenate all values with a newline separator |
+| **dedupe** | Concatenate and remove duplicate lines |
+| **llm_summary** | Send values to the configured LLM endpoint and store the returned summary |
+
+The `llm_summary` strategy requires LLM integration to be configured (see [docs/llm.md](docs/llm.md)).
+
+### HTTP API
+
+```bash
+# Run consolidation on a namespace (type defaults to "promote" if omitted)
+curl -X POST http://localhost:7380/consolidate/agent-42?type=promote
+curl -X POST http://localhost:7380/consolidate/agent-42?type=compress
+
+# Check consolidation status for all namespaces
+curl http://localhost:7380/consolidate/status
+```
+
+### RESP API
+
+```
+CONSOLIDATE <namespace> [promote|compress]
+CONSOLIDATE STATUS
+```
+
+Example:
+
+```
+> CONSOLIDATE agent-42 promote
+:3          # integer reply: number of entries promoted
+
+> CONSOLIDATE agent-42 compress
+:1          # integer reply: number of compressed groups
+
+> CONSOLIDATE STATUS
+*2          # array: one entry per namespace
+*3
+$8
+agent-42
+:3          # last promote count
+:1          # last compress count
+```
+
+### Background sweep
+
+When `consolidation_interval_ms > 0`, a background task wakes on the configured interval and runs all matching rules for every namespace. The sweep processes entries in small batches and yields cooperatively between batches so it does not block foreground reads or writes. If a sweep is still running when the next interval fires, the new invocation is skipped (no concurrent sweeps for the same namespace).
 
 ## Architecture
 
