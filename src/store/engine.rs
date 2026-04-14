@@ -1,12 +1,14 @@
 use crate::store::decay::DecayConfigStore;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, EvictionPolicy, Shard, ShardFullError};
+use crate::store::trigger::{TriggerCondition, TriggerEntry, TriggerManager};
 use crate::store::vector::{HnswIndex, VectorSearchResult};
 use crate::time::now_ms;
 use ahash::RandomState;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Metadata returned alongside a value when using `get_with_meta`.
 #[derive(Debug, Clone)]
@@ -57,6 +59,8 @@ pub struct KvEngine {
     hash_state: RandomState,
     /// Per-namespace relevance decay configuration.
     decay_config: DecayConfigStore,
+    /// Summarization trigger registry.
+    trigger_manager: Arc<TriggerManager>,
 }
 
 /// A key structured as `namespace:key`, enforcing the convention at the type level.
@@ -159,6 +163,7 @@ impl KvEngine {
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
+            trigger_manager: Arc::new(TriggerManager::new()),
         }
     }
 
@@ -185,6 +190,7 @@ impl KvEngine {
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
+            trigger_manager: Arc::new(TriggerManager::new()),
         }
     }
 
@@ -212,6 +218,7 @@ impl KvEngine {
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
+            trigger_manager: Arc::new(TriggerManager::new()),
         }
     }
 
@@ -239,6 +246,7 @@ impl KvEngine {
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
             decay_config,
+            trigger_manager: Arc::new(TriggerManager::new()),
         }
     }
 
@@ -663,6 +671,93 @@ impl KvEngine {
     /// Return the decay config store for per-namespace configuration.
     pub fn decay_config(&self) -> &DecayConfigStore {
         &self.decay_config
+    }
+
+    /// Return the trigger manager for registering and managing summarization triggers.
+    pub fn trigger_manager(&self) -> &Arc<TriggerManager> {
+        &self.trigger_manager
+    }
+
+    /// Check if a trigger condition is met for a namespace and return matching entries.
+    /// Returns Some(entries) if the condition is met, None otherwise.
+    pub fn check_trigger_condition(
+        &self,
+        condition: &TriggerCondition,
+        now_ms: u64,
+    ) -> Option<Vec<TriggerEntry>> {
+        match condition {
+            TriggerCondition::MinEntries { namespace, threshold } => {
+                let prefix = format!("{}:", namespace);
+                let count = self.count_prefix(&prefix);
+                if count >= *threshold {
+                    Some(self.collect_trigger_entries(&prefix, None, now_ms))
+                } else {
+                    None
+                }
+            }
+            TriggerCondition::MaxAge { namespace, max_age_ms } => {
+                let prefix = format!("{}:", namespace);
+                let cutoff = now_ms.saturating_sub(*max_age_ms);
+                let entries = self.collect_trigger_entries(&prefix, Some(cutoff), now_ms);
+                if entries.is_empty() {
+                    None
+                } else {
+                    Some(entries)
+                }
+            }
+            TriggerCondition::MatchCount {
+                namespace,
+                key_prefix,
+                threshold,
+            } => {
+                let full_prefix = format!("{}:{}", namespace, key_prefix);
+                let count = self.count_prefix(&full_prefix);
+                if count >= *threshold {
+                    Some(self.collect_trigger_entries(&full_prefix, None, now_ms))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Collect TriggerEntry objects for entries matching a prefix.
+    /// If cutoff_ms is set, only include entries with created_at_ms < cutoff.
+    fn collect_trigger_entries(
+        &self,
+        prefix: &str,
+        cutoff_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Vec<TriggerEntry> {
+        let entries = self.scan_prefix_entries(prefix);
+        entries
+            .into_iter()
+            .filter(|(_, entry)| {
+                if let Some(cutoff) = cutoff_ms {
+                    entry.created_at_ms < cutoff
+                } else {
+                    true
+                }
+            })
+            .map(|(key, entry)| {
+                let ns = namespace_of_key(&key);
+                let dc = self.decay_config.get(ns);
+                let relevance = dc.current_relevance(
+                    entry.relevance,
+                    entry.created_at_ms,
+                    entry.pinned,
+                    now_ms,
+                );
+                TriggerEntry {
+                    key,
+                    value: String::from_utf8_lossy(&entry.value).to_string(),
+                    memory_type: format!("{:?}", entry.memory_type).to_lowercase(),
+                    relevance,
+                    created_at_ms: entry.created_at_ms,
+                    access_count: entry.access_count,
+                }
+            })
+            .collect()
     }
 
     /// Pin an entry so its relevance stays at 1.0 and never decays.
