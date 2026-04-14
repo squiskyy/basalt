@@ -100,6 +100,7 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 - **Replication** - Asynchronous primary-replica with WAL streaming
 - **Compression** - Runtime LZ4 compression for large values (configurable threshold)
 - **io_uring** - Linux-only io_uring backend for the RESP server (feature flag)
+- **Relevance decay** - Exponential relevance scoring that decays over time; read/write boosts keep hot memories alive, pinned entries stay at 1.0, low-relevance entries GC'd automatically
 - **LLM integration** - Optional background LLM inference for summarization, consolidation, and relevance scoring (OpenAI, Anthropic, or custom endpoints)
 
 ## Architecture
