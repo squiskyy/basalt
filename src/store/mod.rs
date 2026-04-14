@@ -4,6 +4,7 @@ pub mod memory_type;
 pub mod persistence;
 pub mod shard;
 pub mod share;
+pub mod trigger;
 pub mod vector;
 
 pub use decay::{DecayConfig, DecayConfigStore};
@@ -14,4 +15,8 @@ pub use persistence::{
     start_snapshot_loop, start_snapshot_loop_with_threshold,
 };
 pub use shard::{Entry, EvictionPolicy, ShardFullError};
+pub use trigger::{
+    TriggerActionConfig, TriggerCondition, TriggerContext, TriggerEntry, TriggerInfo,
+    TriggerManager, execute_webhook, trigger_from_config,
+};
 pub use vector::{HnswIndex, VectorSearchResult};
