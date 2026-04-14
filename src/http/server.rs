@@ -18,8 +18,9 @@ use crate::time::now_ms;
 use super::auth::{AuthStore, auth_middleware};
 use super::models::{
     BatchGetRequest, BatchGetResponse, BatchStoreRequest, BatchStoreResponse, GrantShareRequest,
-    InfoResponse, ListQuery, ListResponse, RevokeShareRequest, SearchRequest, SearchResponse,
-    SearchResult, ShareListResponse, SimpleResponse, StoreRequest, StoreResponse,
+    InfoResponse, ListQuery, ListResponse, RegisterTriggerRequest, RevokeShareRequest,
+    SearchRequest, SearchResponse, SearchResult, ShareListResponse, SimpleResponse,
+    StoreRequest, StoreResponse, TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
 };
 use super::ready::{ReadyResponse, ReadyState};
 
@@ -81,6 +82,12 @@ pub fn app(
         .route("/share", delete(revoke_share))
         .route("/share", get(list_granted))
         .route("/shared-with-me", get(list_shared_with_me))
+        .route("/trigger", post(register_trigger))
+        .route("/trigger", get(list_triggers))
+        .route("/trigger/{id}", delete(delete_trigger))
+        .route("/trigger/{id}/fire", post(fire_trigger))
+        .route("/trigger/{id}/enable", post(enable_trigger))
+        .route("/trigger/{id}/disable", post(disable_trigger))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -697,4 +704,170 @@ fn extract_bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
+}
+
+// --- Trigger Handlers ---
+
+async fn register_trigger(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<RegisterTriggerRequest>,
+) -> impl IntoResponse {
+    let trigger = crate::store::trigger::trigger_from_config(
+        req.id.clone(),
+        req.condition,
+        req.action,
+        req.cooldown_ms,
+    );
+    match state.engine.trigger_manager().register(trigger) {
+        Ok(()) => {
+            let info = state.engine.trigger_manager().get(&req.id).unwrap();
+            (StatusCode::OK, axum::Json(TriggerInfoResponse::from(info))).into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_triggers(State(state): State<AppState>) -> impl IntoResponse {
+    let triggers: Vec<TriggerInfoResponse> = state
+        .engine
+        .trigger_manager()
+        .list()
+        .into_iter()
+        .map(TriggerInfoResponse::from)
+        .collect();
+    (StatusCode::OK, axum::Json(TriggerListResponse { triggers })).into_response()
+}
+
+async fn delete_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.engine.trigger_manager().unregister(&id) {
+        (
+            StatusCode::OK,
+            axum::Json(SimpleResponse {
+                ok: true,
+                deleted: None,
+            }),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "trigger not found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn fire_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let mgr = state.engine.trigger_manager();
+    let info = match mgr.get(&id) {
+        Some(i) => i,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "trigger not found"})),
+            )
+                .into_response()
+        }
+    };
+
+    let now_ms = now_ms();
+    match state.engine.check_trigger_condition(&info.condition, now_ms) {
+        Some(entries) => {
+            let count = entries.len();
+            if let Some(ctx) = mgr.force_fire(&id, entries, now_ms) {
+                // Execute the action if configured
+                if let Some(config) = mgr.get_action_config(&id) {
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            crate::store::trigger::execute_webhook(&config, ctx).await
+                        {
+                            tracing::warn!("trigger webhook failed: id={}, error={}", id, e);
+                        }
+                    });
+                    (
+                        StatusCode::OK,
+                        axum::Json(TriggerFireResponse {
+                            ok: true,
+                            matching_entries: count,
+                            message: Some("trigger fired, webhook dispatched".to_string()),
+                        }),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        axum::Json(TriggerFireResponse {
+                            ok: true,
+                            matching_entries: count,
+                            message: Some(
+                                "trigger fired, no action_config set (in-process only)".to_string(),
+                            ),
+                        }),
+                    )
+                        .into_response()
+                }
+            } else {
+                (
+                    StatusCode::OK,
+                    axum::Json(TriggerFireResponse {
+                        ok: false,
+                        matching_entries: count,
+                        message: Some("trigger is disabled".to_string()),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+        None => (
+            StatusCode::OK,
+            axum::Json(TriggerFireResponse {
+                ok: false,
+                matching_entries: 0,
+                message: Some("condition not met, no matching entries".to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn enable_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.engine.trigger_manager().set_enabled(&id, true) {
+        let info = state.engine.trigger_manager().get(&id).unwrap();
+        (StatusCode::OK, axum::Json(TriggerInfoResponse::from(info))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "trigger not found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn disable_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.engine.trigger_manager().set_enabled(&id, false) {
+        let info = state.engine.trigger_manager().get(&id).unwrap();
+        (StatusCode::OK, axum::Json(TriggerInfoResponse::from(info))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "trigger not found"})),
+        )
+            .into_response()
+    }
 }

@@ -145,3 +145,63 @@ pub struct RevokeShareRequest {
 pub struct ShareListResponse {
     pub policies: Vec<SharePolicy>,
 }
+
+// --- Trigger Models ---
+
+/// Request body for registering a summarization trigger.
+#[derive(Debug, Deserialize)]
+pub struct RegisterTriggerRequest {
+    pub id: String,
+    pub condition: crate::store::trigger::TriggerCondition,
+    /// Optional action configuration (webhook URL or log).
+    /// If omitted, the trigger only fires in-process callbacks.
+    #[serde(default)]
+    pub action: Option<crate::store::trigger::TriggerActionConfig>,
+    /// Minimum time between fires in milliseconds. Defaults to 60000 (1 minute).
+    #[serde(default = "default_trigger_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+fn default_trigger_cooldown_ms() -> u64 {
+    60_000
+}
+
+/// Response body for trigger info.
+#[derive(Debug, Serialize)]
+pub struct TriggerInfoResponse {
+    pub id: String,
+    pub condition: crate::store::trigger::TriggerCondition,
+    pub action: Option<crate::store::trigger::TriggerActionConfig>,
+    pub enabled: bool,
+    pub cooldown_ms: u64,
+    pub last_fired_ms: Option<u64>,
+}
+
+impl From<crate::store::trigger::TriggerInfo> for TriggerInfoResponse {
+    fn from(info: crate::store::trigger::TriggerInfo) -> Self {
+        TriggerInfoResponse {
+            id: info.id,
+            condition: info.condition,
+            action: info.action_config,
+            enabled: info.enabled,
+            cooldown_ms: info.cooldown_ms,
+            last_fired_ms: info.last_fired_ms,
+        }
+    }
+}
+
+/// Response body for listing triggers.
+#[derive(Debug, Serialize)]
+pub struct TriggerListResponse {
+    pub triggers: Vec<TriggerInfoResponse>,
+}
+
+/// Response body for manual trigger fire.
+#[derive(Debug, Serialize)]
+pub struct TriggerFireResponse {
+    pub ok: bool,
+    /// Number of matching entries when the trigger fired.
+    pub matching_entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
