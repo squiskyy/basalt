@@ -215,7 +215,11 @@ async fn list_memories(
     let _timer = crate::metrics::RequestTimer::new(state.metrics.clone(), "list", &namespace);
     state.metrics.record_read(&namespace);
     let prefix = NamespacedKey::new(&namespace, "").prefix();
-    let entries = state.engine.scan_prefix(&prefix);
+    let entries = if query.sort_by.as_deref() == Some("relevance") {
+        state.engine.scan_prefix_sorted(&prefix)
+    } else {
+        state.engine.scan_prefix(&prefix)
+    };
 
     let prefix_stripped = &prefix;
     let memories: Vec<StoreResponse> = entries
@@ -246,6 +250,7 @@ async fn list_memories(
             value: String::from_utf8_lossy(&value).to_string(),
             r#type: Some(meta.memory_type.to_string()),
             ttl_ms: meta.ttl_remaining_ms,
+            relevance: Some(meta.relevance),
         })
         .collect();
 
@@ -268,6 +273,7 @@ async fn get_memory(
                 value: String::from_utf8_lossy(&value).to_string(),
                 r#type: Some(meta.memory_type.to_string()),
                 ttl_ms: meta.ttl_remaining_ms,
+                relevance: Some(meta.relevance),
             };
             (StatusCode::OK, axum::Json(resp)).into_response()
         }
@@ -404,6 +410,7 @@ async fn batch_get(
                     value: String::from_utf8_lossy(&value).to_string(),
                     r#type: Some(meta.memory_type.to_string()),
                     ttl_ms: meta.ttl_remaining_ms,
+                    relevance: Some(meta.relevance),
                 });
             }
             None => {

@@ -31,6 +31,8 @@ pub struct StoreResponse {
     pub r#type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relevance: Option<f64>,
 }
 
 /// Request body for batch retrieving multiple keys.
@@ -86,6 +88,8 @@ pub struct ListQuery {
     pub r#type: Option<MemoryType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_by: Option<String>,
 }
 
 /// Request body for vector similarity search.

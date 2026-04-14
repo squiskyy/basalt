@@ -1,3 +1,4 @@
+use crate::store::decay::DecayConfigStore;
 use crate::store::memory_type::MemoryType;
 use crate::store::shard::{Entry, EvictionPolicy, Shard, ShardFullError};
 use crate::store::vector::{HnswIndex, VectorSearchResult};
@@ -13,6 +14,9 @@ pub struct EntryMeta {
     pub memory_type: MemoryType,
     /// TTL remaining in milliseconds. `None` means the entry has no expiry.
     pub ttl_remaining_ms: Option<u64>,
+    /// Effective relevance score in [0.0, 1.0].
+    /// Computed at query time as: decay(stored_relevance, age) + access_count * read_boost.
+    pub relevance: f64,
 }
 
 /// Metadata returned alongside a value when using `scan_prefix_with_embeddings`.
@@ -23,6 +27,9 @@ pub struct EntryMetaWithEmbedding {
     pub ttl_remaining_ms: Option<u64>,
     /// Optional embedding vector for semantic similarity search.
     pub embedding: Option<Vec<f32>>,
+    /// Effective relevance score in [0.0, 1.0].
+    /// Computed at query time as: decay(stored_relevance, age) + access_count * read_boost.
+    pub relevance: f64,
 }
 
 /// The core sharded KV engine.
@@ -48,6 +55,8 @@ pub struct KvEngine {
     /// gets a unique random seed so that hash collisions cannot be
     /// predicted by an attacker.
     hash_state: RandomState,
+    /// Per-namespace relevance decay configuration.
+    decay_config: DecayConfigStore,
 }
 
 /// A key structured as `namespace:key`, enforcing the convention at the type level.
@@ -149,6 +158,7 @@ impl KvEngine {
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
+            decay_config: DecayConfigStore::default(),
         }
     }
 
@@ -174,6 +184,7 @@ impl KvEngine {
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
+            decay_config: DecayConfigStore::default(),
         }
     }
 
@@ -200,6 +211,34 @@ impl KvEngine {
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
+            decay_config: DecayConfigStore::default(),
+        }
+    }
+
+    /// Create a new KvEngine with custom decay configuration.
+    pub fn with_decay_config(
+        shard_count: usize,
+        max_entries: usize,
+        compression_threshold: usize,
+        eviction_policy: EvictionPolicy,
+        decay_config: DecayConfigStore,
+    ) -> Self {
+        let count = next_power_of_2(shard_count.max(1));
+        let shards = (0..count)
+            .map(|_| {
+                Shard::with_eviction_policy(max_entries, compression_threshold, eviction_policy)
+            })
+            .collect();
+        KvEngine {
+            shards,
+            shard_mask: count - 1,
+            max_entries,
+            compression_threshold,
+            eviction_policy,
+            vector_indexes: Mutex::new(HashMap::new()),
+            namespace_versions: Mutex::new(HashMap::new()),
+            hash_state: RandomState::new(),
+            decay_config,
         }
     }
 
@@ -240,7 +279,34 @@ impl KvEngine {
         ttl_ms: Option<u64>,
         memory_type: MemoryType,
     ) -> Result<(), ShardFullError> {
-        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
+        let ns = namespace_of_key(key);
+        let decay = self.decay_config.get(ns);
+
+        // If updating, boost existing relevance; otherwise start at 1.0
+        let (relevance, created_at_ms, access_count, pinned) = {
+            let idx = self.shard_index(key);
+            match self.shards[idx].get_entry_untouched(key) {
+                Some(existing) => {
+                    let decayed = decay.current_relevance(
+                        existing.relevance,
+                        existing.created_at_ms,
+                        existing.pinned,
+                        now,
+                    );
+                    let boosted = decay.apply_write_boost(decayed, existing.pinned);
+                    (
+                        boosted,
+                        existing.created_at_ms,
+                        existing.access_count.saturating_add(1),
+                        existing.pinned,
+                    )
+                }
+                None => (1.0, now, 0, false),
+            }
+        };
+
         let entry = Entry {
             value,
             compressed: false, // Shard::set will compress if needed
@@ -248,6 +314,10 @@ impl KvEngine {
             memory_type,
             embedding: None,
             last_accessed_ms: 0, // overwritten by Shard::set
+            relevance,
+            created_at_ms,
+            access_count,
+            pinned,
         };
         let idx = self.shard_index(key);
         let result = self.shards[idx].set(key.to_string(), entry);
@@ -273,7 +343,33 @@ impl KvEngine {
         memory_type: MemoryType,
         embedding: Option<Vec<f32>>,
     ) -> Result<(), ShardFullError> {
-        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
+        let ns = namespace_of_key(key);
+        let decay = self.decay_config.get(ns);
+
+        let (relevance, created_at_ms, access_count, pinned) = {
+            let idx = self.shard_index(key);
+            match self.shards[idx].get_entry_untouched(key) {
+                Some(existing) => {
+                    let decayed = decay.current_relevance(
+                        existing.relevance,
+                        existing.created_at_ms,
+                        existing.pinned,
+                        now,
+                    );
+                    let boosted = decay.apply_write_boost(decayed, existing.pinned);
+                    (
+                        boosted,
+                        existing.created_at_ms,
+                        existing.access_count.saturating_add(1),
+                        existing.pinned,
+                    )
+                }
+                None => (1.0, now, 0, false),
+            }
+        };
+
         let entry = Entry {
             value,
             compressed: false,
@@ -281,6 +377,10 @@ impl KvEngine {
             memory_type,
             embedding,
             last_accessed_ms: 0, // overwritten by Shard::set
+            relevance,
+            created_at_ms,
+            access_count,
+            pinned,
         };
         let idx = self.shard_index(key);
         let result = self.shards[idx].set(key.to_string(), entry);
@@ -303,7 +403,8 @@ impl KvEngine {
         ttl_ms: Option<u64>,
         memory_type: MemoryType,
     ) {
-        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
         let entry = Entry {
             value,
             compressed: false, // Shard::set_force will compress if needed
@@ -311,6 +412,43 @@ impl KvEngine {
             memory_type,
             embedding: None,
             last_accessed_ms: 0, // overwritten by Shard::set_force
+            relevance: 1.0,
+            created_at_ms: now,
+            access_count: 0,
+            pinned: false,
+        };
+        let idx = self.shard_index(key);
+        self.shards[idx].set_force(key.to_string(), entry);
+    }
+
+    /// Force-set a key with full metadata, ignoring shard capacity limits.
+    /// Used during snapshot restore to preserve relevance, created_at, access_count, and pinned state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_force_full(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        ttl_ms: Option<u64>,
+        memory_type: MemoryType,
+        embedding: Option<Vec<f32>>,
+        relevance: f64,
+        created_at_ms: u64,
+        access_count: u64,
+        pinned: bool,
+    ) {
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
+        let entry = Entry {
+            value,
+            compressed: false,
+            expires_at,
+            memory_type,
+            embedding,
+            last_accessed_ms: 0, // overwritten by Shard::set_force
+            relevance,
+            created_at_ms,
+            access_count,
+            pinned,
         };
         let idx = self.shard_index(key);
         self.shards[idx].set_force(key.to_string(), entry);
@@ -327,7 +465,8 @@ impl KvEngine {
         memory_type: MemoryType,
         embedding: Option<Vec<f32>>,
     ) {
-        let expires_at = ttl_ms.map(|ttl| now_ms() + ttl);
+        let now = now_ms();
+        let expires_at = ttl_ms.map(|ttl| now + ttl);
         let entry = Entry {
             value,
             compressed: false,
@@ -335,6 +474,10 @@ impl KvEngine {
             memory_type,
             embedding,
             last_accessed_ms: 0, // overwritten by Shard::set_force
+            relevance: 1.0,
+            created_at_ms: now,
+            access_count: 0,
+            pinned: false,
         };
         let idx = self.shard_index(key);
         self.shards[idx].set_force(key.to_string(), entry);
@@ -347,16 +490,23 @@ impl KvEngine {
         self.shards[idx].get(key)
     }
 
-    /// Get the value along with metadata (memory type and remaining TTL).
+    /// Get the value along with metadata (memory type, remaining TTL, relevance).
     /// Values are transparently decompressed if they were compressed at rest.
     pub fn get_with_meta(&self, key: &str) -> Option<(Vec<u8>, EntryMeta)> {
         let idx = self.shard_index(key);
         let entry = self.shards[idx].get_entry(key)?;
         let now = now_ms();
+        let ns = namespace_of_key(key);
+        let decay = self.decay_config.get(ns);
+        let effective_relevance =
+            decay.current_relevance(entry.relevance, entry.created_at_ms, entry.pinned, now)
+                + entry.access_count as f64 * decay.read_boost;
+        let relevance = effective_relevance.clamp(0.0, 1.0);
         let ttl_remaining_ms = entry.expires_at.map(|exp| exp.saturating_sub(now));
         let meta = EntryMeta {
             memory_type: entry.memory_type,
             ttl_remaining_ms,
+            relevance,
         };
         Some((entry.value, meta))
     }
@@ -379,10 +529,20 @@ impl KvEngine {
         let mut results = Vec::new();
         for shard in &self.shards {
             for (key, entry) in shard.scan_prefix(prefix) {
+                let ns = namespace_of_key(&key);
+                let decay = self.decay_config.get(ns);
+                let effective_relevance = decay.current_relevance(
+                    entry.relevance,
+                    entry.created_at_ms,
+                    entry.pinned,
+                    now,
+                ) + entry.access_count as f64 * decay.read_boost;
+                let relevance = effective_relevance.clamp(0.0, 1.0);
                 let ttl_remaining_ms = entry.expires_at.map(|exp| exp.saturating_sub(now));
                 let meta = EntryMeta {
                     memory_type: entry.memory_type,
                     ttl_remaining_ms,
+                    relevance,
                 };
                 results.push((key, entry.value, meta));
             }
@@ -402,15 +562,47 @@ impl KvEngine {
         let mut results = Vec::new();
         for shard in &self.shards {
             for (key, entry) in shard.scan_prefix(prefix) {
+                let ns = namespace_of_key(&key);
+                let decay = self.decay_config.get(ns);
+                let effective_relevance = decay.current_relevance(
+                    entry.relevance,
+                    entry.created_at_ms,
+                    entry.pinned,
+                    now,
+                ) + entry.access_count as f64 * decay.read_boost;
+                let relevance = effective_relevance.clamp(0.0, 1.0);
                 let ttl_remaining_ms = entry.expires_at.map(|exp| exp.saturating_sub(now));
                 let meta = EntryMetaWithEmbedding {
                     memory_type: entry.memory_type,
                     ttl_remaining_ms,
                     embedding: entry.embedding,
+                    relevance,
                 };
                 results.push((key, entry.value, meta));
             }
         }
+        results
+    }
+
+    /// Scan all entries whose keys start with `prefix` across all shards,
+    /// returning the raw Entry objects (for internal use like snapshots).
+    pub fn scan_prefix_entries(&self, prefix: &str) -> Vec<(String, Entry)> {
+        let mut results = Vec::new();
+        for shard in &self.shards {
+            results.extend(shard.scan_prefix(prefix));
+        }
+        results
+    }
+
+    /// Scan entries and sort by effective relevance (descending).
+    /// Entries with higher relevance come first.
+    pub fn scan_prefix_sorted(&self, prefix: &str) -> Vec<(String, Vec<u8>, EntryMeta)> {
+        let mut results = self.scan_prefix(prefix);
+        results.sort_by(|a, b| {
+            b.2.relevance
+                .partial_cmp(&a.2.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -449,6 +641,61 @@ impl KvEngine {
             tokio::task::yield_now().await;
         }
         total
+    }
+
+    /// Reap all entries whose relevance has fallen below the floor threshold
+    /// across all shards. Uses the default decay config.
+    ///
+    /// Staggers across shards by yielding (tokio::task::yield_now) between
+    /// shards to avoid latency spikes. Returns the total number of reaped entries.
+    /// Pinned entries are never reaped.
+    pub async fn reap_all_low_relevance(&self) -> usize {
+        let now = now_ms();
+        let defaults = self.decay_config.defaults();
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard.reap_low_relevance(defaults.relevance_floor, defaults.lambda, now);
+            tokio::task::yield_now().await;
+        }
+        total
+    }
+
+    /// Return the decay config store for per-namespace configuration.
+    pub fn decay_config(&self) -> &DecayConfigStore {
+        &self.decay_config
+    }
+
+    /// Pin an entry so its relevance stays at 1.0 and never decays.
+    /// Returns true if the entry existed.
+    pub fn pin(&self, key: &str) -> bool {
+        let idx = self.shard_index(key);
+        self.shards[idx].set_pinned(key, true)
+    }
+
+    /// Unpin an entry so its relevance can decay normally.
+    /// Returns true if the entry existed.
+    pub fn unpin(&self, key: &str) -> bool {
+        let idx = self.shard_index(key);
+        self.shards[idx].set_pinned(key, false)
+    }
+
+    /// Get entry metadata without touching access stats (for relevance queries).
+    /// Returns (relevance, access_count, pinned, created_at_ms) or None.
+    pub fn get_relevance_info(&self, key: &str) -> Option<(f64, u64, bool, u64)> {
+        let idx = self.shard_index(key);
+        let entry = self.shards[idx].get_entry_untouched(key)?;
+        let ns = namespace_of_key(key);
+        let decay = self.decay_config.get(ns);
+        let now = now_ms();
+        let effective =
+            decay.current_relevance(entry.relevance, entry.created_at_ms, entry.pinned, now)
+                + entry.access_count as f64 * decay.read_boost;
+        Some((
+            effective.clamp(0.0, 1.0),
+            entry.access_count,
+            entry.pinned,
+            entry.created_at_ms,
+        ))
     }
 
     /// Return the number of shards.

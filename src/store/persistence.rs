@@ -50,9 +50,12 @@ use tracing::{debug, error, info, warn};
 const MAGIC: &[u8; 7] = b"BASALT\x00";
 
 /// Current snapshot format version.
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
-/// Version 4 (current: supports embedding vectors with CRC32 checksums).
+/// Version 5 (current: supports relevance decay fields with CRC32 checksums).
+const VERSION_5: u8 = 5;
+
+/// Version 4 (supports embedding vectors with CRC32 checksums).
 const VERSION_4: u8 = 4;
 
 /// Version 3 (supports embedding vectors, no checksums).
@@ -84,6 +87,30 @@ pub struct SnapshotEntry {
     pub expires_at: Option<u64>,
     /// Optional embedding vector for semantic similarity search.
     pub embedding: Option<Vec<f32>>,
+    /// Relevance score in [0.0, 1.0]. Default 1.0 for entries without relevance data.
+    pub relevance: f64,
+    /// UNIX timestamp in milliseconds when this entry was created.
+    pub created_at_ms: u64,
+    /// Number of times this entry has been accessed.
+    pub access_count: u64,
+    /// If true, relevance stays at 1.0 and never decays.
+    pub pinned: bool,
+}
+
+impl Default for SnapshotEntry {
+    fn default() -> Self {
+        SnapshotEntry {
+            key: String::new(),
+            value: Vec::new(),
+            memory_type: MemoryType::Semantic,
+            expires_at: None,
+            embedding: None,
+            relevance: 1.0,
+            created_at_ms: 0,
+            access_count: 0,
+            pinned: false,
+        }
+    }
 }
 
 /// Write a snapshot to disk atomically.
@@ -219,6 +246,35 @@ pub fn write_snapshot(
             }
         }
 
+        // V5: Write relevance fields after embedding data
+        // relevance: f64 (8 bytes LE)
+        let relevance_bytes = entry.relevance.to_le_bytes();
+        f.write_all(&relevance_bytes)
+            .map_err(|e| format!("write relevance: {e}"))?;
+        entry_hasher.update(&relevance_bytes);
+        footer_hasher.update(&relevance_bytes);
+
+        // created_at_ms: u64 (8 bytes LE)
+        let created_at_bytes = entry.created_at_ms.to_le_bytes();
+        f.write_all(&created_at_bytes)
+            .map_err(|e| format!("write created_at_ms: {e}"))?;
+        entry_hasher.update(&created_at_bytes);
+        footer_hasher.update(&created_at_bytes);
+
+        // access_count: u64 (8 bytes LE)
+        let access_count_bytes = entry.access_count.to_le_bytes();
+        f.write_all(&access_count_bytes)
+            .map_err(|e| format!("write access_count: {e}"))?;
+        entry_hasher.update(&access_count_bytes);
+        footer_hasher.update(&access_count_bytes);
+
+        // pinned: u8 (1 byte, 0 or 1)
+        let pinned_byte = if entry.pinned { 1u8 } else { 0u8 };
+        f.write_all(&[pinned_byte])
+            .map_err(|e| format!("write pinned: {e}"))?;
+        entry_hasher.update(&[pinned_byte]);
+        footer_hasher.update(&[pinned_byte]);
+
         // Write per-entry CRC32 (LE)
         let entry_crc = entry_hasher.finalize();
         let entry_crc_bytes = entry_crc.to_le_bytes();
@@ -276,34 +332,37 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut version = [0u8; 1];
     f.read_exact(&mut version)
         .map_err(|e| format!("read version: {e}"))?;
-    if version[0] != VERSION_4
+    if version[0] != VERSION_5
+        && version[0] != VERSION_4
         && version[0] != VERSION_3
         && version[0] != VERSION_2
         && version[0] != VERSION_1
     {
         return Err(format!(
-            "unsupported snapshot version {} in {} (expected {}, {}, {}, or {})",
+            "unsupported snapshot version {} in {} (expected {}, {}, {}, {}, or {})",
             version[0],
             path.display(),
             VERSION_1,
             VERSION_2,
             VERSION_3,
-            VERSION_4
+            VERSION_4,
+            VERSION_5
         ));
     }
     let ver = version[0];
     let is_v1 = ver == VERSION_1;
-    let is_v4 = ver == VERSION_4;
-    let is_v3_or_v4 = ver == VERSION_3 || ver == VERSION_4;
+    let is_v5 = ver == VERSION_5;
+    let is_v4_or_v5 = ver == VERSION_4 || ver == VERSION_5;
+    let is_v3_or_later = ver >= VERSION_3;
 
-    // For v4, we track all bytes read for footer CRC validation
-    let mut footer_hasher = if is_v4 {
+    // For v4/v5, we track all bytes read for footer CRC validation
+    let mut footer_hasher = if is_v4_or_v5 {
         Some(crc32fast::Hasher::new())
     } else {
         None
     };
 
-    if is_v4 {
+    if is_v4_or_v5 {
         // Update footer hasher with magic + version
         footer_hasher.as_mut().unwrap().update(MAGIC);
         footer_hasher.as_mut().unwrap().update(&version);
@@ -312,7 +371,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut count_bytes = [0u8; 8];
     f.read_exact(&mut count_bytes)
         .map_err(|e| format!("read entry count: {e}"))?;
-    if is_v4 {
+    if is_v4_or_v5 {
         footer_hasher.as_mut().unwrap().update(&count_bytes);
     }
     let entry_count = u64::from_le_bytes(count_bytes) as usize;
@@ -321,14 +380,14 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
     let mut skipped_count: usize = 0;
 
     for i in 0..entry_count {
-        // For v4, we need to track entry bytes to compute and verify per-entry CRC
+        // For v4/v5, we need to track entry bytes to compute and verify per-entry CRC
         let mut entry_buf: Vec<u8> = Vec::new();
 
         // key_len
         let mut len_bytes = [0u8; 4];
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read key_len at entry {i}: {e}"))?;
-        if is_v4 {
+        if is_v4_or_v5 {
             entry_buf.extend_from_slice(&len_bytes);
         }
         let key_len = u32::from_le_bytes(len_bytes) as usize;
@@ -337,7 +396,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut key_bytes = vec![0u8; key_len];
         f.read_exact(&mut key_bytes)
             .map_err(|e| format!("read key at entry {i}: {e}"))?;
-        if is_v4 {
+        if is_v4_or_v5 {
             entry_buf.extend_from_slice(&key_bytes);
         }
         let key = String::from_utf8(key_bytes)
@@ -350,7 +409,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut flags_byte = [0u8; 1];
             f.read_exact(&mut flags_byte)
                 .map_err(|e| format!("read flags at entry {i}: {e}"))?;
-            if is_v4 {
+            if is_v4_or_v5 {
                 entry_buf.extend_from_slice(&flags_byte);
             }
             flags_byte[0]
@@ -359,7 +418,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         // val_len
         f.read_exact(&mut len_bytes)
             .map_err(|e| format!("read val_len at entry {i}: {e}"))?;
-        if is_v4 {
+        if is_v4_or_v5 {
             entry_buf.extend_from_slice(&len_bytes);
         }
         let val_len = u32::from_le_bytes(len_bytes) as usize;
@@ -368,7 +427,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut stored_value = vec![0u8; val_len];
         f.read_exact(&mut stored_value)
             .map_err(|e| format!("read value at entry {i}: {e}"))?;
-        if is_v4 {
+        if is_v4_or_v5 {
             entry_buf.extend_from_slice(&stored_value);
         }
 
@@ -383,7 +442,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         let mut mt_byte = [0u8; 1];
         f.read_exact(&mut mt_byte)
             .map_err(|e| format!("read memory_type at entry {i}: {e}"))?;
-        if is_v4 {
+        if is_v4_or_v5 {
             entry_buf.extend_from_slice(&mt_byte);
         }
         let memory_type = MemoryType::from_u8(mt_byte[0]).ok_or_else(|| {
@@ -394,14 +453,14 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             )
         })?;
 
-        // In v3/v4, read embedding_flag before expires_at
+        // In v3+, read embedding_flag before expires_at
         // In v1/v2, no embedding data
-        let entry_result = if is_v3_or_v4 {
+        let entry_result = if is_v3_or_later {
             // embedding_flag: 0 = no embedding, 1 = has embedding
             let mut emb_flag_byte = [0u8; 1];
             f.read_exact(&mut emb_flag_byte)
                 .map_err(|e| format!("read embedding_flag at entry {i}: {e}"))?;
-            if is_v4 {
+            if is_v4_or_v5 {
                 entry_buf.extend_from_slice(&emb_flag_byte);
             }
             let emb_flag = emb_flag_byte[0];
@@ -410,7 +469,7 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
-            if is_v4 {
+            if is_v4_or_v5 {
                 entry_buf.extend_from_slice(&exp_bytes);
             }
             let expires_at_raw = u64::from_le_bytes(exp_bytes);
@@ -425,14 +484,14 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 let mut dim_bytes = [0u8; 4];
                 f.read_exact(&mut dim_bytes)
                     .map_err(|e| format!("read embedding dim at entry {i}: {e}"))?;
-                if is_v4 {
+                if is_v4_or_v5 {
                     entry_buf.extend_from_slice(&dim_bytes);
                 }
                 let dim = u32::from_le_bytes(dim_bytes) as usize;
                 let mut emb_data = vec![0u8; dim * 4];
                 f.read_exact(&mut emb_data)
                     .map_err(|e| format!("read embedding data at entry {i}: {e}"))?;
-                if is_v4 {
+                if is_v4_or_v5 {
                     entry_buf.extend_from_slice(&emb_data);
                 }
                 let mut embedding = Vec::with_capacity(dim);
@@ -457,19 +516,67 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 ));
             };
 
+            // V5: Read relevance fields after embedding data
+            let (relevance, created_at_ms, access_count, pinned) = if is_v5 {
+                // relevance: f64 (8 bytes LE)
+                let mut rel_bytes = [0u8; 8];
+                f.read_exact(&mut rel_bytes)
+                    .map_err(|e| format!("read relevance at entry {i}: {e}"))?;
+                if is_v4_or_v5 {
+                    entry_buf.extend_from_slice(&rel_bytes);
+                }
+                let relevance = f64::from_le_bytes(rel_bytes);
+
+                // created_at_ms: u64 (8 bytes LE)
+                let mut cat_bytes = [0u8; 8];
+                f.read_exact(&mut cat_bytes)
+                    .map_err(|e| format!("read created_at_ms at entry {i}: {e}"))?;
+                if is_v4_or_v5 {
+                    entry_buf.extend_from_slice(&cat_bytes);
+                }
+                let created_at_ms = u64::from_le_bytes(cat_bytes);
+
+                // access_count: u64 (8 bytes LE)
+                let mut ac_bytes = [0u8; 8];
+                f.read_exact(&mut ac_bytes)
+                    .map_err(|e| format!("read access_count at entry {i}: {e}"))?;
+                if is_v4_or_v5 {
+                    entry_buf.extend_from_slice(&ac_bytes);
+                }
+                let access_count = u64::from_le_bytes(ac_bytes);
+
+                // pinned: u8 (1 byte, 0 or 1)
+                let mut pin_byte = [0u8; 1];
+                f.read_exact(&mut pin_byte)
+                    .map_err(|e| format!("read pinned at entry {i}: {e}"))?;
+                if is_v4_or_v5 {
+                    entry_buf.extend_from_slice(&pin_byte);
+                }
+                let pinned = pin_byte[0] != 0;
+
+                (relevance, created_at_ms, access_count, pinned)
+            } else {
+                // v3/v4: default relevance fields
+                (1.0, 0, 0, false)
+            };
+
             Ok::<SnapshotEntry, String>(SnapshotEntry {
                 key,
                 value,
                 memory_type,
                 expires_at,
                 embedding: emb,
+                relevance,
+                created_at_ms,
+                access_count,
+                pinned,
             })
         } else {
             // v1/v2: no embedding flag, read expires_at directly
             let mut exp_bytes = [0u8; 8];
             f.read_exact(&mut exp_bytes)
                 .map_err(|e| format!("read expires_at at entry {i}: {e}"))?;
-            if is_v4 {
+            if is_v4_or_v5 {
                 entry_buf.extend_from_slice(&exp_bytes);
             }
 
@@ -486,13 +593,17 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
                 memory_type,
                 expires_at,
                 embedding: None,
+                relevance: 1.0,
+                created_at_ms: 0,
+                access_count: 0,
+                pinned: false,
             })
         };
 
         let entry = entry_result?;
 
-        // For v4, read and verify per-entry CRC32
-        if is_v4 {
+        // For v4/v5, read and verify per-entry CRC32
+        if is_v4_or_v5 {
             let mut entry_crc_bytes = [0u8; 4];
             f.read_exact(&mut entry_crc_bytes)
                 .map_err(|e| format!("read entry_crc at entry {i}: {e}"))?;
@@ -520,8 +631,8 @@ pub fn read_snapshot(path: &Path) -> Result<Vec<SnapshotEntry>, String> {
         entries.push(entry);
     }
 
-    // For v4, read and verify footer CRC32
-    if is_v4 {
+    // For v4/v5, read and verify footer CRC32
+    if is_v4_or_v5 {
         let mut footer_crc_bytes = [0u8; 4];
         if let Err(e) = f.read_exact(&mut footer_crc_bytes) {
             warn!(
@@ -654,34 +765,29 @@ pub fn load_latest_snapshot(
                 continue;
             }
             let ttl_ms = exp - now;
-            if entry.embedding.is_some() {
-                engine.set_force_with_embedding(
-                    &entry.key,
-                    entry.value.clone(),
-                    Some(ttl_ms),
-                    entry.memory_type,
-                    entry.embedding.clone(),
-                );
-            } else {
-                engine.set_force(
-                    &entry.key,
-                    entry.value.clone(),
-                    Some(ttl_ms),
-                    entry.memory_type,
-                );
-            }
+            engine.set_force_full(
+                &entry.key,
+                entry.value.clone(),
+                Some(ttl_ms),
+                entry.memory_type,
+                entry.embedding.clone(),
+                entry.relevance,
+                entry.created_at_ms,
+                entry.access_count,
+                entry.pinned,
+            );
         } else {
-            if entry.embedding.is_some() {
-                engine.set_force_with_embedding(
-                    &entry.key,
-                    entry.value.clone(),
-                    None,
-                    entry.memory_type,
-                    entry.embedding.clone(),
-                );
-            } else {
-                engine.set_force(&entry.key, entry.value.clone(), None, entry.memory_type);
-            }
+            engine.set_force_full(
+                &entry.key,
+                entry.value.clone(),
+                None,
+                entry.memory_type,
+                entry.embedding.clone(),
+                entry.relevance,
+                entry.created_at_ms,
+                entry.access_count,
+                entry.pinned,
+            );
         }
         loaded += 1;
     }
@@ -695,18 +801,23 @@ pub fn load_latest_snapshot(
 }
 
 /// Collect all live entries from the KV engine for a snapshot,
-/// including their embedding vectors.
+/// including their embedding vectors and relevance fields.
 pub fn collect_entries(engine: &crate::store::engine::KvEngine) -> Vec<SnapshotEntry> {
-    // Scan all keys (empty prefix matches everything), including embeddings
-    let results = engine.scan_prefix_with_embeddings("");
-    results
+    // Scan all keys (empty prefix matches everything), getting full Entry objects
+    // so we can preserve relevance, created_at_ms, access_count, and pinned.
+    let entries = engine.scan_prefix_entries("");
+    entries
         .into_iter()
-        .map(|(key, value, meta)| SnapshotEntry {
+        .map(|(key, entry)| SnapshotEntry {
             key,
-            value,
-            memory_type: meta.memory_type,
-            expires_at: meta.ttl_remaining_ms.map(|ttl| now_ms() + ttl),
-            embedding: meta.embedding,
+            value: entry.decompressed_value(),
+            memory_type: entry.memory_type,
+            expires_at: entry.expires_at,
+            embedding: entry.embedding,
+            relevance: entry.relevance,
+            created_at_ms: entry.created_at_ms,
+            access_count: entry.access_count,
+            pinned: entry.pinned,
         })
         .collect()
 }
@@ -824,6 +935,7 @@ mod tests {
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "ns:mem2".to_string(),
@@ -831,6 +943,7 @@ mod tests {
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(9999999999999),
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "ns:mem3".to_string(),
@@ -838,6 +951,7 @@ mod tests {
                 memory_type: MemoryType::Procedural,
                 expires_at: Some(12345),
                 embedding: None,
+                ..Default::default()
             },
         ];
 
@@ -984,6 +1098,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: None,
             embedding: None,
+            ..Default::default()
         }];
 
         // Write with threshold of 1024
@@ -1029,6 +1144,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: None,
             embedding: None,
+            ..Default::default()
         }];
 
         // Write with threshold of 1024
@@ -1193,6 +1309,7 @@ mod tests {
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
                 embedding: Some(embedding1.clone()),
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "emb:2".to_string(),
@@ -1200,6 +1317,7 @@ mod tests {
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(88888),
                 embedding: Some(embedding2.clone()),
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "noemb:3".to_string(),
@@ -1207,6 +1325,7 @@ mod tests {
                 memory_type: MemoryType::Procedural,
                 expires_at: Some(99999),
                 embedding: None,
+                ..Default::default()
             },
         ];
 
@@ -1278,6 +1397,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: Some(12345678),
             embedding: Some(embedding.clone()),
+            ..Default::default()
         }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
@@ -1311,6 +1431,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: None,
             embedding: None,
+            ..Default::default()
         }];
 
         // threshold=0 disables compression
@@ -1374,6 +1495,7 @@ mod tests {
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "v4:key2".to_string(),
@@ -1381,6 +1503,7 @@ mod tests {
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(9999999999999),
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "v4:key3".to_string(),
@@ -1388,6 +1511,7 @@ mod tests {
                 memory_type: MemoryType::Procedural,
                 expires_at: Some(12345),
                 embedding: None,
+                ..Default::default()
             },
         ];
 
@@ -1436,6 +1560,7 @@ mod tests {
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "bad:2".to_string(),
@@ -1443,6 +1568,7 @@ mod tests {
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(55555),
                 embedding: None,
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "good:3".to_string(),
@@ -1450,6 +1576,7 @@ mod tests {
                 memory_type: MemoryType::Procedural,
                 expires_at: None,
                 embedding: None,
+                ..Default::default()
             },
         ];
 
@@ -1490,6 +1617,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: None,
             embedding: None,
+            ..Default::default()
         }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
@@ -1520,6 +1648,7 @@ mod tests {
             memory_type: MemoryType::Semantic,
             expires_at: None,
             embedding: None,
+            ..Default::default()
         }];
 
         let path = write_snapshot(&dir, &entries, 1000, 1024).unwrap();
@@ -1766,6 +1895,7 @@ mod tests {
                 memory_type: MemoryType::Semantic,
                 expires_at: None,
                 embedding: Some(embedding1.clone()),
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "emb:2".to_string(),
@@ -1773,6 +1903,7 @@ mod tests {
                 memory_type: MemoryType::Episodic,
                 expires_at: Some(88888),
                 embedding: Some(embedding2.clone()),
+                ..Default::default()
             },
             SnapshotEntry {
                 key: "noemb:3".to_string(),
@@ -1780,6 +1911,7 @@ mod tests {
                 memory_type: MemoryType::Procedural,
                 expires_at: Some(99999),
                 embedding: None,
+                ..Default::default()
             },
         ];
 

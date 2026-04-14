@@ -50,6 +50,17 @@ pub struct Entry {
     pub embedding: Option<Vec<f32>>,
     /// Last access time (UNIX millis). Updated on read for LRU eviction.
     pub last_accessed_ms: u64,
+    /// Relevance score in [0.0, 1.0]. Starts at 1.0 and decays over time.
+    /// Entries without relevance metadata (loaded from old snapshots) default to 1.0.
+    pub relevance: f64,
+    /// UNIX timestamp in milliseconds when this entry was created.
+    /// Used to compute age for relevance decay.
+    pub created_at_ms: u64,
+    /// Number of times this entry has been accessed (read or written).
+    /// Used for access-frequency boosting in relevance computation.
+    pub access_count: u64,
+    /// If true, relevance stays at 1.0 and never decays.
+    pub pinned: bool,
 }
 
 impl Entry {
@@ -74,15 +85,21 @@ impl Entry {
         }
     }
 
-    /// Create a new entry with current time as last_accessed_ms.
+    /// Create a new entry with current time as last_accessed_ms and created_at_ms.
+    /// Relevance starts at 1.0, access_count at 0, and pinned is false.
     pub fn new(value: Vec<u8>, expires_at: Option<u64>, memory_type: MemoryType) -> Self {
+        let now = now_ms();
         Entry {
             value,
             compressed: false,
             expires_at,
             memory_type,
             embedding: None,
-            last_accessed_ms: now_ms(),
+            last_accessed_ms: now,
+            relevance: 1.0,
+            created_at_ms: now,
+            access_count: 0,
+            pinned: false,
         }
     }
 }
@@ -246,6 +263,10 @@ impl Shard {
                 memory_type: entry.memory_type,
                 embedding: entry.embedding,
                 last_accessed_ms: now,
+                relevance: entry.relevance,
+                created_at_ms: entry.created_at_ms,
+                access_count: entry.access_count,
+                pinned: entry.pinned,
             }
         } else {
             Entry {
@@ -281,6 +302,10 @@ impl Shard {
                 memory_type: entry.memory_type,
                 embedding: entry.embedding,
                 last_accessed_ms: now,
+                relevance: entry.relevance,
+                created_at_ms: entry.created_at_ms,
+                access_count: entry.access_count,
+                pinned: entry.pinned,
             }
         } else {
             Entry {
@@ -341,11 +366,16 @@ impl Shard {
             memory_type: entry.memory_type,
             embedding: entry.embedding,
             last_accessed_ms: entry.last_accessed_ms,
+            relevance: entry.relevance,
+            created_at_ms: entry.created_at_ms,
+            access_count: entry.access_count,
+            pinned: entry.pinned,
         })
     }
 
     /// Internal: get the raw entry (possibly compressed) from the map.
-    /// Also updates last_accessed_ms for LRU eviction tracking.
+    /// Also updates last_accessed_ms for LRU eviction tracking and
+    /// increments access_count for relevance boosting.
     fn get_entry_raw(&self, key: &str) -> Option<Entry> {
         let pin = self.map.pin();
         let entry = pin.get(key)?;
@@ -364,11 +394,51 @@ impl Shard {
             if needs_touch {
                 let mut updated = cloned.clone();
                 updated.last_accessed_ms = now;
+                updated.access_count = updated.access_count.saturating_add(1);
                 // Use set-force semantics: just insert, count already correct
                 let pin2 = self.map.pin();
                 pin2.insert(key.to_string(), updated);
             }
             Some(cloned)
+        }
+    }
+
+    /// Get the raw entry without touching access time or incrementing access_count.
+    /// Used for read-before-write operations (e.g., relevance boost on update)
+    /// where we don't want to modify the existing entry's stats before replacing it.
+    pub fn get_entry_untouched(&self, key: &str) -> Option<Entry> {
+        let pin = self.map.pin();
+        let entry = pin.get(key)?;
+        let now = now_ms();
+        if entry.is_expired(now) {
+            None
+        } else {
+            Some(entry.clone())
+        }
+    }
+
+    /// Update the pinned status of an entry. Returns true if the entry existed.
+    pub fn set_pinned(&self, key: &str, pinned: bool) -> bool {
+        let pin = self.map.pin();
+        if let Some(entry) = pin.get(key) {
+            let now = now_ms();
+            if entry.is_expired(now) {
+                drop(pin);
+                self.delete(key);
+                return false;
+            }
+            let mut updated = entry.clone();
+            updated.pinned = pinned;
+            if pinned {
+                updated.relevance = 1.0;
+            }
+            updated.last_accessed_ms = now;
+            drop(pin);
+            let pin2 = self.map.pin();
+            pin2.insert(key.to_string(), updated);
+            true
+        } else {
+            false
         }
     }
 
@@ -418,6 +488,10 @@ impl Shard {
                         memory_type: v.memory_type,
                         embedding: v.embedding.clone(),
                         last_accessed_ms: v.last_accessed_ms,
+                        relevance: v.relevance,
+                        created_at_ms: v.created_at_ms,
+                        access_count: v.access_count,
+                        pinned: v.pinned,
                     },
                 ));
             }
@@ -468,6 +542,40 @@ impl Shard {
         self.len() == 0
     }
 
+    /// Reap all entries whose relevance has fallen below the floor threshold.
+    /// Uses the provided decay config to compute current relevance.
+    /// Returns the number of entries reaped.
+    /// Pinned entries are never reaped.
+    pub fn reap_low_relevance(&self, relevance_floor: f64, lambda: f64, now_ms: u64) -> usize {
+        let pin = self.map.pin();
+        let low_relevance_keys: Vec<String> = pin
+            .iter()
+            .filter(|(_, v)| {
+                if v.pinned {
+                    return false;
+                }
+                if v.is_expired(now_ms) {
+                    return false; // expired entries are reaped separately
+                }
+                let age_hours = if now_ms > v.created_at_ms {
+                    (now_ms - v.created_at_ms) as f64 / 3_600_000.0
+                } else {
+                    0.0
+                };
+                let decayed = v.relevance * (-lambda * age_hours).exp();
+                decayed < relevance_floor
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        drop(pin);
+
+        let reaped = low_relevance_keys.len();
+        for key in &low_relevance_keys {
+            self.delete(key);
+        }
+        reaped
+    }
+
     /// Remove all entries whose keys start with `prefix`.
     /// Returns the number of entries removed.
     pub fn delete_prefix(&self, prefix: &str) -> usize {
@@ -500,13 +608,18 @@ mod tests {
 
     /// Helper to create an Entry without the compressed field (defaults to false).
     fn make_entry(value: Vec<u8>, expires_at: Option<u64>, memory_type: MemoryType) -> Entry {
+        let now = now_ms();
         Entry {
             value,
             compressed: false,
             expires_at,
             memory_type,
             embedding: None,
-            last_accessed_ms: now_ms(),
+            last_accessed_ms: now,
+            relevance: 1.0,
+            created_at_ms: now,
+            access_count: 0,
+            pinned: false,
         }
     }
 

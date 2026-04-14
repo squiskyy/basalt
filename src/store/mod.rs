@@ -1,3 +1,4 @@
+pub mod decay;
 pub mod engine;
 pub mod memory_type;
 pub mod persistence;
@@ -5,6 +6,7 @@ pub mod shard;
 pub mod share;
 pub mod vector;
 
+pub use decay::{DecayConfig, DecayConfigStore};
 pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine, NamespacedKey};
 pub use memory_type::MemoryType;
 pub use persistence::{
