@@ -5,7 +5,10 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 use std::sync::Arc;
 
 fn make_engine(shards: usize) -> KvEngine {
-    KvEngine::new(shards, Arc::new(basalt::store::ConsolidationManager::disabled()))
+    KvEngine::new(
+        shards,
+        Arc::new(basalt::store::ConsolidationManager::disabled()),
+    )
 }
 
 fn bench_set(c: &mut Criterion) {

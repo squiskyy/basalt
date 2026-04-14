@@ -8,11 +8,11 @@ pub mod share;
 pub mod trigger;
 pub mod vector;
 
-pub use decay::{DecayConfig, DecayConfigStore};
 pub use consolidation::{
-    ConsolidationDetail, ConsolidationManager, ConsolidationMeta, ConsolidationResult,
-    ConsolidationRule, ConflictPolicy, GroupBy, SummaryStrategy,
+    ConflictPolicy, ConsolidationDetail, ConsolidationManager, ConsolidationMeta,
+    ConsolidationResult, ConsolidationRule, GroupBy, SummaryStrategy,
 };
+pub use decay::{DecayConfig, DecayConfigStore};
 pub use engine::{EntryMeta, EntryMetaWithEmbedding, KvEngine, NamespacedKey};
 pub use memory_type::MemoryType;
 pub use persistence::{

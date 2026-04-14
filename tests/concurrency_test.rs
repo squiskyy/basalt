@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Verify no panics and correct final state.
 #[tokio::test]
 async fn test_concurrent_set_get_delete() {
-    let engine = Arc::new(KvEngine::new(16, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::new(
+        16,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
     let num_tasks = 128;
     let ops_per_task = 50;
 
@@ -56,7 +59,10 @@ async fn test_concurrent_set_get_delete() {
 /// Test concurrent reads and writes to the SAME keys from many tasks.
 #[tokio::test]
 async fn test_concurrent_same_key_rw() {
-    let engine = Arc::new(KvEngine::new(16, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::new(
+        16,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
     let num_tasks = 100;
     let num_rounds = 200;
 
@@ -113,7 +119,10 @@ async fn test_concurrent_same_key_rw() {
 /// Test concurrent namespace operations (scan_prefix, delete_prefix) interleaved with set/get.
 #[tokio::test]
 async fn test_concurrent_namespace_operations() {
-    let engine = Arc::new(KvEngine::new(16, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::new(
+        16,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
 
     // Pre-populate two namespaces
     for i in 0..50 {
@@ -203,7 +212,10 @@ async fn test_concurrent_namespace_operations() {
 /// Set entries with very short TTL, then verify expired entries don't cause panics.
 #[tokio::test]
 async fn test_concurrent_ttl_expiry() {
-    let engine = Arc::new(KvEngine::new(16, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::new(
+        16,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
     let num_tasks = 64;
     let ops_per_task = 30;
 
@@ -296,7 +308,10 @@ async fn test_concurrent_ttl_expiry() {
 /// Stress test: many concurrent set/get/delete across many shards with mixed memory types.
 #[tokio::test]
 async fn test_concurrent_mixed_memory_types() {
-    let engine = Arc::new(KvEngine::new(32, Arc::new(ConsolidationManager::disabled())));
+    let engine = Arc::new(KvEngine::new(
+        32,
+        Arc::new(ConsolidationManager::disabled()),
+    ));
     let num_tasks = 100;
 
     let mut handles = Vec::new();

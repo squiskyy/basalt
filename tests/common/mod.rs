@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::http::auth::AuthStore;
+use basalt::store::{ConsolidationManager, KvEngine};
 
 // ---------------------------------------------------------------------------
 // RESP helpers

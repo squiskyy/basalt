@@ -15,50 +15,34 @@ use serde::{Deserialize, Serialize};
 use crate::llm::client::LlmClient;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
-use crate::time::now_ms;
 
 /// Policy for resolving conflicts when a consolidation target already exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
+    #[default]
     Skip,
     Overwrite,
     Version,
 }
 
-impl Default for ConflictPolicy {
-    fn default() -> Self {
-        ConflictPolicy::Skip
-    }
-}
-
 /// Strategy for producing a summary when compressing episodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SummaryStrategy {
+    #[default]
     Concat,
     LlmSummary,
     Dedupe,
 }
 
-impl Default for SummaryStrategy {
-    fn default() -> Self {
-        SummaryStrategy::Concat
-    }
-}
-
 /// How to group entries for the Compress rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GroupBy {
+    #[default]
     KeyPrefix,
     Namespace,
-}
-
-impl Default for GroupBy {
-    fn default() -> Self {
-        GroupBy::KeyPrefix
-    }
 }
 
 /// A single consolidation rule.
@@ -142,7 +126,7 @@ impl Default for ConsolidationResult {
 }
 
 /// Per-namespace metadata tracked across consolidation runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConsolidationMeta {
     #[serde(default)]
     pub last_run_ms: u64,
@@ -150,16 +134,6 @@ pub struct ConsolidationMeta {
     pub total_promoted: u64,
     #[serde(default)]
     pub total_compressed: u64,
-}
-
-impl Default for ConsolidationMeta {
-    fn default() -> Self {
-        ConsolidationMeta {
-            last_run_ms: 0,
-            total_promoted: 0,
-            total_compressed: 0,
-        }
-    }
 }
 
 /// Manages consolidation rules and per-namespace metadata.
@@ -380,45 +354,45 @@ fn run_promote_rule(
 
         // Check for conflict with existing semantic entry
         let existing = engine.get_with_meta(&target_internal);
-        if let Some((_, meta)) = &existing {
-            if meta.memory_type == MemoryType::Semantic {
-                match conflict_policy {
-                    ConflictPolicy::Skip => {
-                        result.skipped += 1;
-                        continue;
-                    }
-                    ConflictPolicy::Overwrite => { /* proceed to overwrite below */ }
-                    ConflictPolicy::Version => {
-                        // Find next available version
-                        let mut version = 2u32;
-                        loop {
-                            let versioned_suffix = format!("fact:{}_v{}", suffix, version);
-                            let versioned_internal = format!("{}:{}", namespace, versioned_suffix);
-                            if engine.get(&versioned_internal).is_none() {
-                                // Use this versioned key instead
-                                let _ = engine.set(
-                                    &versioned_internal,
-                                    entries.last().unwrap().1.clone(),
-                                    None,
-                                    target_type,
-                                );
-                                // Delete all source episodic entries
-                                for (src_key, _) in &entries {
-                                    engine.delete(src_key);
-                                }
-                                result.details.push(ConsolidationDetail {
-                                    action: "promote".to_string(),
-                                    from: format!("{} episodic entries", entries.len()),
-                                    to: versioned_internal,
-                                    occurrences: entries.len(),
-                                });
-                                result.promoted += 1;
-                                break;
+        if let Some((_, meta)) = &existing
+            && meta.memory_type == MemoryType::Semantic
+        {
+            match conflict_policy {
+                ConflictPolicy::Skip => {
+                    result.skipped += 1;
+                    continue;
+                }
+                ConflictPolicy::Overwrite => { /* proceed to overwrite below */ }
+                ConflictPolicy::Version => {
+                    // Find next available version
+                    let mut version = 2u32;
+                    loop {
+                        let versioned_suffix = format!("fact:{}_v{}", suffix, version);
+                        let versioned_internal = format!("{}:{}", namespace, versioned_suffix);
+                        if engine.get(&versioned_internal).is_none() {
+                            // Use this versioned key instead
+                            let _ = engine.set(
+                                &versioned_internal,
+                                entries.last().unwrap().1.clone(),
+                                None,
+                                target_type,
+                            );
+                            // Delete all source episodic entries
+                            for (src_key, _) in &entries {
+                                engine.delete(src_key);
                             }
-                            version += 1;
+                            result.details.push(ConsolidationDetail {
+                                action: "promote".to_string(),
+                                from: format!("{} episodic entries", entries.len()),
+                                to: versioned_internal,
+                                occurrences: entries.len(),
+                            });
+                            result.promoted += 1;
+                            break;
                         }
-                        continue;
+                        version += 1;
                     }
+                    continue;
                 }
             }
         }
@@ -444,6 +418,7 @@ fn run_promote_rule(
 
 /// Handle a single Compress rule: scan episodic entries, group them,
 /// and produce summary entries for groups that meet the episode threshold.
+#[allow(clippy::too_many_arguments)]
 fn run_compress_rule(
     engine: &KvEngine,
     namespace: &str,
@@ -503,6 +478,7 @@ fn run_compress_rule(
 /// Async variant of run_compress_rule with LLM summarization support.
 /// For LlmSummary strategy, calls the LLM client if available and enabled;
 /// otherwise falls back to concat_dedupe.
+#[allow(clippy::too_many_arguments)]
 async fn run_compress_rule_with_llm(
     engine: &KvEngine,
     namespace: &str,

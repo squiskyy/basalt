@@ -910,9 +910,7 @@ async fn consolidate(
         crate::store::consolidation::run_consolidation(&state.engine, &namespace, &filtered);
 
     // Update metadata
-    let mut meta = mgr
-        .get_meta(&namespace)
-        .unwrap_or_default();
+    let mut meta = mgr.get_meta(&namespace).unwrap_or_default();
     meta.last_run_ms = crate::time::now_ms();
     meta.total_promoted += result.promoted as u64;
     meta.total_compressed += result.compressed as u64;

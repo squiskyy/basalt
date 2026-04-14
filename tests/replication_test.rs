@@ -1,7 +1,7 @@
 use basalt::replication::wal::{Wal, WalEntry, WalOp, deserialize_entry, serialize_entry};
 use basalt::replication::{ReplicationRole, ReplicationState};
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::memory_type::MemoryType;
+use basalt::store::{ConsolidationManager, KvEngine};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------

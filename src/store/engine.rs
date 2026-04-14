@@ -989,7 +989,8 @@ mod tests {
 
     #[test]
     fn test_engine_max_entries() {
-        let engine = KvEngine::with_max_entries(4, 1_000_000, Arc::new(ConsolidationManager::disabled()));
+        let engine =
+            KvEngine::with_max_entries(4, 1_000_000, Arc::new(ConsolidationManager::disabled()));
         assert_eq!(engine.max_entries(), 1_000_000);
     }
 
@@ -1032,7 +1033,12 @@ mod tests {
 
     #[test]
     fn test_engine_compression_large_value() {
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10, Arc::new(ConsolidationManager::disabled()));
+        let engine = KvEngine::with_max_entries_and_compression(
+            4,
+            1_000_000,
+            10,
+            Arc::new(ConsolidationManager::disabled()),
+        );
 
         // Value > threshold and compressible
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes(); // 2048 bytes
@@ -1053,7 +1059,12 @@ mod tests {
     #[test]
     fn test_engine_compression_disabled() {
         // threshold = 0 disables compression
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 0, Arc::new(ConsolidationManager::disabled()));
+        let engine = KvEngine::with_max_entries_and_compression(
+            4,
+            1_000_000,
+            0,
+            Arc::new(ConsolidationManager::disabled()),
+        );
 
         let large_value: Vec<u8> = "ABCDEFGH".repeat(256).into_bytes();
         engine
@@ -1095,7 +1106,12 @@ mod tests {
 
     #[test]
     fn test_engine_scan_prefix_with_compression() {
-        let engine = KvEngine::with_max_entries_and_compression(4, 1_000_000, 10, Arc::new(ConsolidationManager::disabled()));
+        let engine = KvEngine::with_max_entries_and_compression(
+            4,
+            1_000_000,
+            10,
+            Arc::new(ConsolidationManager::disabled()),
+        );
 
         let big_val: Vec<u8> = "ABCDEF".repeat(256).into_bytes();
         engine

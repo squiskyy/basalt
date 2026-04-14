@@ -9,8 +9,8 @@ use basalt::http::auth::AuthStore;
 use basalt::resp::commands::{CommandHandler, ShareHandler};
 use basalt::resp::parser::{RespValue, parse_pipeline};
 use basalt::resp::session::{ClientSession, SessionAction};
-use basalt::store::{ConsolidationManager, KvEngine};
 use basalt::store::share::ShareStore;
+use basalt::store::{ConsolidationManager, KvEngine};
 
 // ---------------------------------------------------------------------------
 // Helpers

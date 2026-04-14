@@ -1110,16 +1110,11 @@ impl CommandHandler {
             _ => rules,
         };
 
-        let result = crate::store::consolidation::run_consolidation(
-            &self.engine,
-            &namespace,
-            &filtered,
-        );
+        let result =
+            crate::store::consolidation::run_consolidation(&self.engine, &namespace, &filtered);
 
         // Update meta
-        let mut meta = mgr
-            .get_meta(&namespace)
-            .unwrap_or_default();
+        let mut meta = mgr.get_meta(&namespace).unwrap_or_default();
         meta.last_run_ms = now_ms();
         meta.total_promoted += result.promoted as u64;
         meta.total_compressed += result.compressed as u64;

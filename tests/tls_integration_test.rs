@@ -13,8 +13,8 @@ mod tls_rustls_tests {
     use basalt::replication::ReplicationState;
     use basalt::resp::server::run_with_replication_and_tls;
     use basalt::resp::tls::TlsAcceptor;
-    use basalt::store::{ConsolidationManager, KvEngine};
     use basalt::store::share::ShareStore;
+    use basalt::store::{ConsolidationManager, KvEngine};
     use rcgen::{CertificateParams, KeyPair, SanType};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_rustls::TlsConnector;
@@ -214,7 +214,10 @@ mod tls_rustls_tests {
         let (cert_pem, key_pem) = generate_self_signed_cert();
         let (_tempdir, cert_path, key_path) = write_cert_key_files(&cert_pem, &key_pem);
 
-        let engine = Arc::new(KvEngine::new(64, Arc::new(ConsolidationManager::disabled())));
+        let engine = Arc::new(KvEngine::new(
+            64,
+            Arc::new(ConsolidationManager::disabled()),
+        ));
         let (port, _handle) = start_tls_resp_server(engine, &cert_path, &key_path).await;
 
         let mut stream = connect_tls(port).await;
@@ -236,7 +239,10 @@ mod tls_rustls_tests {
         let (cert_pem, key_pem) = generate_self_signed_cert();
         let (_tempdir, cert_path, key_path) = write_cert_key_files(&cert_pem, &key_pem);
 
-        let engine = Arc::new(KvEngine::new(64, Arc::new(ConsolidationManager::disabled())));
+        let engine = Arc::new(KvEngine::new(
+            64,
+            Arc::new(ConsolidationManager::disabled()),
+        ));
         let (port, _handle) = start_tls_resp_server(engine, &cert_path, &key_path).await;
 
         let mut stream = connect_tls(port).await;
@@ -266,7 +272,10 @@ mod tls_rustls_tests {
         let (cert_pem, key_pem) = generate_self_signed_cert();
         let (_tempdir, cert_path, key_path) = write_cert_key_files(&cert_pem, &key_pem);
 
-        let engine = Arc::new(KvEngine::new(64, Arc::new(ConsolidationManager::disabled())));
+        let engine = Arc::new(KvEngine::new(
+            64,
+            Arc::new(ConsolidationManager::disabled()),
+        ));
         let (port, _handle) = start_tls_resp_server(engine, &cert_path, &key_path).await;
 
         let mut stream = connect_tls(port).await;
