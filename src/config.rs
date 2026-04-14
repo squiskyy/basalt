@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub decay_reap_interval_ms: u64,
     /// Default decay lambda (rate parameter). Default: ln(2)/24 (~0.0289) for 24h halflife.
     pub decay_default_lambda: f64,
+    /// How often (ms) to check trigger conditions and fire matching triggers. 0 = disabled.
+    pub trigger_sweep_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -87,6 +89,7 @@ impl Default for ServerConfig {
             tls_key: None,
             decay_reap_interval_ms: 0,
             decay_default_lambda: std::f64::consts::LN_2 / 24.0,
+            trigger_sweep_interval_ms: 30_000,
         }
     }
 }
@@ -200,6 +203,8 @@ struct ServerFile {
     decay_reap_interval_ms: Option<u64>,
     #[serde(default)]
     decay_default_lambda: Option<f64>,
+    #[serde(default)]
+    trigger_sweep_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -291,6 +296,10 @@ impl Config {
                 .server
                 .decay_default_lambda
                 .unwrap_or(server_defaults.decay_default_lambda),
+            trigger_sweep_interval_ms: file
+                .server
+                .trigger_sweep_interval_ms
+                .unwrap_or(server_defaults.trigger_sweep_interval_ms),
         };
 
         let auth = AuthConfig {

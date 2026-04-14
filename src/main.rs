@@ -470,6 +470,53 @@ async fn main() {
         info!("decay reap: disabled (interval = 0)");
     }
 
+    // Start trigger sweep loop if configured
+    if cfg.server.trigger_sweep_interval_ms > 0 {
+        let sweep_engine = engine.clone();
+        let sweep_interval = cfg.server.trigger_sweep_interval_ms;
+        let mut sweep_shutdown = shutdown_rx.clone();
+        info!("trigger sweep: enabled, every {}ms", sweep_interval);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(sweep_interval)) => {
+                        let triggers = sweep_engine.trigger_manager().list();
+                        let now_ms = basalt::time::now_ms();
+                        for info in triggers {
+                            if !info.enabled {
+                                continue;
+                            }
+                            if let Some(entries) = sweep_engine.check_trigger_condition(&info.condition, now_ms) {
+                                if let Some(ctx) = sweep_engine.trigger_manager().try_fire(&info.id, entries, now_ms) {
+                                    let action_config = sweep_engine.trigger_manager().get_action_config(&info.id);
+                                    let action = sweep_engine.trigger_manager().get_action(&info.id);
+                                    if let Some(config) = action_config {
+                                        let id = info.id.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = store::trigger::execute_webhook(&config, ctx).await {
+                                                tracing::warn!("trigger webhook failed: id={}, error={}", id, e);
+                                            }
+                                        });
+                                    } else if let Some(action_fn) = action {
+                                        tokio::spawn(async move {
+                                            action_fn(ctx).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = sweep_shutdown.changed() => {
+                        tracing::info!("trigger sweep shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        info!("trigger sweep: disabled (interval = 0)");
+    }
+
     // Start both servers concurrently
     let http_engine = engine.clone();
     let http_auth = auth.clone();
