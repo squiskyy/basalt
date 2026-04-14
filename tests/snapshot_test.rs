@@ -507,11 +507,13 @@ fn test_snapshot_no_compression_small_values() {
     // Read the raw file and verify the flags byte for each entry has bit 0 unset
     let snapshot_file = basalt::store::persistence::find_latest_snapshot(db_path).unwrap();
     let raw = std::fs::read(&snapshot_file).unwrap();
-    // Verify it's a v4 snapshot
-    assert_eq!(raw[7], 4, "snapshot should be version 4");
+    // Verify it's a v5 snapshot
+    assert_eq!(raw[7], 5, "snapshot should be version 5");
     // Header: 7 magic + 1 version + 8 count = 16 bytes
-    // v4 per entry: 4 key_len + key + 1 flags + 4 val_len + val + 1 memory_type
-    //              + 1 embedding_flag + 8 expires_at + 4 entry_crc
+    // v5 per entry: 4 key_len + key + 1 flags + 4 val_len + val + 1 memory_type
+    //              + 1 embedding_flag + 8 expires_at
+    //              + 8 relevance (f64) + 8 created_at_ms + 8 access_count + 1 pinned
+    //              + 4 entry_crc
     let header_size = 16;
     let mut offset = header_size;
     for _ in 0..2 {
@@ -533,7 +535,9 @@ fn test_snapshot_no_compression_small_values() {
         let emb_flag = raw[offset];
         assert_eq!(emb_flag, 0, "small value entry should have no embedding");
         offset += 1 + 8; // skip embedding_flag + expires_at
-        offset += 4; // skip entry_crc (v4 format)
+        // v5 fields: relevance (8) + created_at_ms (8) + access_count (8) + pinned (1) = 25 bytes
+        offset += 25;
+        offset += 4; // skip entry_crc
     }
 }
 
