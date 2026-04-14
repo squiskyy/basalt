@@ -518,6 +518,51 @@ async fn main() {
         info!("trigger sweep: disabled (interval = 0)");
     }
 
+    // Start consolidation sweep loop if configured
+    if cfg.server.consolidation_interval_ms > 0 {
+        let con_engine = engine.clone();
+        let con_interval = cfg.server.consolidation_interval_ms;
+        let mut con_shutdown = shutdown_rx.clone();
+        info!("consolidation sweep: enabled, every {}ms", con_interval);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(con_interval)) => {
+                        let namespaces = con_engine.active_namespaces();
+                        let rules = con_engine.consolidation_manager().rules();
+                        for namespace in &namespaces {
+                            let result = store::consolidation::run_consolidation_with_llm(
+                                &con_engine,
+                                namespace,
+                                &rules,
+                                None,
+                            ).await;
+                            if result.promoted > 0 || result.compressed > 0 {
+                                info!(
+                                    "consolidation sweep: namespace={}, promoted={}, compressed={}, skipped={}",
+                                    namespace, result.promoted, result.compressed, result.skipped,
+                                );
+                            }
+                            let mut meta = con_engine.consolidation_manager().get_meta(namespace)
+                                .unwrap_or_default();
+                            meta.last_run_ms = basalt::time::now_ms();
+                            meta.total_promoted += result.promoted as u64;
+                            meta.total_compressed += result.compressed as u64;
+                            con_engine.consolidation_manager().update_meta(namespace, meta);
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    _ = con_shutdown.changed() => {
+                        tracing::info!("consolidation sweep shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        info!("consolidation sweep: disabled (interval = 0)");
+    }
+
     // Start both servers concurrently
     let http_engine = engine.clone();
     let http_auth = auth.clone();
