@@ -436,6 +436,40 @@ async fn main() {
         info!("expired-entry sweep: disabled (interval = 0)");
     }
 
+    // Apply default decay lambda from config
+    {
+        let default_config = engine.decay_config().defaults();
+        let mut defaults = default_config.clone();
+        defaults.lambda = cfg.server.decay_default_lambda;
+        engine.decay_config().set("_default", defaults);
+    }
+
+    // Start decay reap loop if configured
+    if cfg.server.decay_reap_interval_ms > 0 {
+        let decay_engine = engine.clone();
+        let decay_interval = cfg.server.decay_reap_interval_ms;
+        let mut decay_shutdown = shutdown_rx.clone();
+        info!("decay reap enabled: every {}ms", decay_interval);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(decay_interval)) => {
+                        let reaped = decay_engine.reap_all_low_relevance().await;
+                        if reaped > 0 {
+                            tracing::debug!("decay reap: removed {reaped} low-relevance entries");
+                        }
+                    }
+                    _ = decay_shutdown.changed() => {
+                        tracing::info!("decay reap shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    } else {
+        info!("decay reap: disabled (interval = 0)");
+    }
+
     // Start both servers concurrently
     let http_engine = engine.clone();
     let http_auth = auth.clone();

@@ -56,6 +56,10 @@ pub struct ServerConfig {
     pub tls_cert: Option<String>,
     /// Path to TLS private key file (PEM format). Requires a TLS feature flag.
     pub tls_key: Option<String>,
+    /// How often (ms) to reap low-relevance entries. 0 = disabled.
+    pub decay_reap_interval_ms: u64,
+    /// Default decay lambda (rate parameter). Default: ln(2)/24 (~0.0289) for 24h halflife.
+    pub decay_default_lambda: f64,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +85,8 @@ impl Default for ServerConfig {
             replica_peers: Vec::new(),
             tls_cert: None,
             tls_key: None,
+            decay_reap_interval_ms: 0,
+            decay_default_lambda: std::f64::consts::LN_2 / 24.0,
         }
     }
 }
@@ -190,6 +196,10 @@ struct ServerFile {
     tls_cert: Option<String>,
     #[serde(default)]
     tls_key: Option<String>,
+    #[serde(default)]
+    decay_reap_interval_ms: Option<u64>,
+    #[serde(default)]
+    decay_default_lambda: Option<f64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -273,6 +283,14 @@ impl Config {
             replica_peers: file.server.replica_peers.unwrap_or_default(),
             tls_cert: file.server.tls_cert,
             tls_key: file.server.tls_key,
+            decay_reap_interval_ms: file
+                .server
+                .decay_reap_interval_ms
+                .unwrap_or(server_defaults.decay_reap_interval_ms),
+            decay_default_lambda: file
+                .server
+                .decay_default_lambda
+                .unwrap_or(server_defaults.decay_default_lambda),
         };
 
         let auth = AuthConfig {

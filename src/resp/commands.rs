@@ -817,7 +817,9 @@ impl CommandHandler {
                 "lambda" => match val_str.parse::<f64>() {
                     Ok(v) => lambda = v,
                     Err(_) => {
-                        return RespValue::Error(format!("ERR invalid value for lambda: {val_str}"));
+                        return RespValue::Error(format!(
+                            "ERR invalid value for lambda: {val_str}"
+                        ));
                     }
                 },
                 "read_boost" => match val_str.parse::<f64>() {
