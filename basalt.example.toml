@@ -29,6 +29,17 @@ shard_count = 64
 # Set to 0 to disable background sweeping (expired entries still cleaned on read).
 # sweep_interval_ms = 30000
 
+# How often to reap low-relevance entries (milliseconds). Default: 0 (disabled)
+# Set > 0 to enable automatic cleanup of entries below the relevance floor.
+# decay_reap_interval_ms = 30000
+
+# Default decay lambda (rate parameter). Default: ln(2)/24 (~0.0289) for 24h halflife.
+# decay_default_lambda = 0.02888
+
+# How often to check trigger conditions and fire matching triggers (milliseconds).
+# Default: 30000 (30s). Set to 0 to disable trigger sweep.
+# trigger_sweep_interval_ms = 30000
+
 # Maximum entries per shard. Default: 1000000
 # When a shard is at capacity, new keys are rejected.
 # Updates to existing keys always succeed.

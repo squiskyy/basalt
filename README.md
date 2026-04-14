@@ -101,6 +101,7 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 - **Compression** - Runtime LZ4 compression for large values (configurable threshold)
 - **io_uring** - Linux-only io_uring backend for the RESP server (feature flag)
 - **Relevance decay** - Exponential relevance scoring that decays over time; read/write boosts keep hot memories alive, pinned entries stay at 1.0, low-relevance entries GC'd automatically
+- **Summarization triggers** - Automatic memory compression when conditions are met (entry count, age, pattern match), with webhook and callback actions
 - **LLM integration** - Optional background LLM inference for summarization, consolidation, and relevance scoring (OpenAI, Anthropic, or custom endpoints)
 
 ## Architecture
@@ -150,6 +151,7 @@ See `basalt.example.toml` for all options. Full reference: [docs/configuration.m
 | Snapshots & persistence | [docs/persistence.md](docs/persistence.md) |
 | Primary-replica replication | [docs/replication.md](docs/replication.md) |
 | Vector search | [docs/vector-search.md](docs/vector-search.md) |
+| Summarization triggers | [docs/triggers.md](docs/triggers.md) |
 | LLM inference | [docs/llm.md](docs/llm.md) |
 | Benchmarks & tuning | [docs/performance.md](docs/performance.md) |
 | Building, Docker, systemd | [docs/deployment.md](docs/deployment.md) |
