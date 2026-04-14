@@ -59,3 +59,35 @@ shard_count = 64
 # You can also set tokens directly via CLI args:
 #   basalt --auth "bsk-admin:*" --auth "bsk-agent1:agent-1,shared"
 # CLI tokens override file tokens with the same value.
+
+[llm]
+# LLM provider: "openai", "anthropic", or "custom".
+# "custom" uses the OpenAI-compatible API format with a custom base_url.
+# Empty or omitted = LLM features disabled.
+# provider = "openai"
+
+# API key for the LLM provider.
+# api_key = "sk-..."
+
+# Model to use (provider-specific defaults apply if omitted).
+# OpenAI: "gpt-4o-mini" (default), "gpt-4o", "gpt-3.5-turbo"
+# Anthropic: "claude-sonnet-4-20250514" (default), "claude-haiku-4-20250414"
+# model = "gpt-4o-mini"
+
+# Base URL override (for OpenAI-compatible endpoints).
+# Use this with provider = "custom" to point at Ollama, vLLM, LiteLLM, etc.
+# OpenAI default: https://api.openai.com/v1
+# Anthropic default: https://api.anthropic.com
+# base_url = "http://localhost:11434/v1"
+
+# API version header (Anthropic only, default: "2023-06-01").
+# api_version = "2023-06-01"
+
+# Request timeout in milliseconds (default: 30000).
+# timeout_ms = 30000
+
+# Default max tokens for completions (default: 1024).
+# default_max_tokens = 1024
+
+# Default temperature for completions (default: 0.3).
+# default_temperature = 0.3

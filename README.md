@@ -100,6 +100,7 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 - **Replication** - Asynchronous primary-replica with WAL streaming
 - **Compression** - Runtime LZ4 compression for large values (configurable threshold)
 - **io_uring** - Linux-only io_uring backend for the RESP server (feature flag)
+- **LLM integration** - Optional background LLM inference for summarization, consolidation, and relevance scoring (OpenAI, Anthropic, or custom endpoints)
 
 ## Architecture
 
@@ -147,7 +148,8 @@ See `basalt.example.toml` for all options. Full reference: [docs/configuration.m
 | Auth & namespace scoping | [docs/auth.md](docs/auth.md) |
 | Snapshots & persistence | [docs/persistence.md](docs/persistence.md) |
 | Primary-replica replication | [docs/replication.md](docs/replication.md) |
-| HNSW vector search | [docs/vector-search.md](docs/vector-search.md) |
+| Vector search | [docs/vector-search.md](docs/vector-search.md) |
+| LLM inference | [docs/llm.md](docs/llm.md) |
 | Benchmarks & tuning | [docs/performance.md](docs/performance.md) |
 | Building, Docker, systemd | [docs/deployment.md](docs/deployment.md) |
 | Testing & contributing | [docs/development.md](docs/development.md) |

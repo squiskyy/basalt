@@ -11,6 +11,7 @@ use tracing::warn;
 pub struct Config {
     pub server: ServerConfig,
     pub auth: AuthConfig,
+    pub llm: LlmConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,50 @@ pub struct AuthConfig {
     pub tokens: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    /// LLM provider: "openai", "anthropic", or "custom".
+    /// Empty = LLM disabled.
+    pub provider: String,
+    /// API key for the LLM provider.
+    pub api_key: String,
+    /// Model to use (provider-specific).
+    pub model: String,
+    /// Base URL override (for OpenAI-compatible endpoints like Ollama, vLLM).
+    /// Empty = use provider default.
+    pub base_url: String,
+    /// API version header (Anthropic only).
+    pub api_version: String,
+    /// Request timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Default max tokens for completions.
+    pub default_max_tokens: u32,
+    /// Default temperature for completions.
+    pub default_temperature: f32,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            api_version: "2023-06-01".into(),
+            timeout_ms: 30_000,
+            default_max_tokens: 1024,
+            default_temperature: 0.3,
+        }
+    }
+}
+
+impl LlmConfig {
+    /// Check if LLM is enabled (provider is set).
+    pub fn is_enabled(&self) -> bool {
+        !self.provider.is_empty()
+    }
+}
+
 /// TOML-deserializable config structure.
 /// Uses Option fields so missing keys fall back to defaults.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -100,6 +145,8 @@ struct ConfigFile {
     server: ServerFile,
     #[serde(default)]
     auth: AuthFile,
+    #[serde(default)]
+    llm: LlmFile,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -149,6 +196,26 @@ struct ServerFile {
 struct AuthFile {
     #[serde(default)]
     tokens_file: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct LlmFile {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_version: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    default_max_tokens: Option<u32>,
+    #[serde(default)]
+    default_temperature: Option<f32>,
 }
 
 impl Config {
@@ -213,7 +280,25 @@ impl Config {
             tokens: Vec::new(),
         };
 
-        Ok(Config { server, auth })
+        let llm_defaults = LlmConfig::default();
+        let llm = LlmConfig {
+            provider: file.llm.provider.unwrap_or_default(),
+            api_key: file.llm.api_key.unwrap_or_default(),
+            model: file.llm.model.unwrap_or_default(),
+            base_url: file.llm.base_url.unwrap_or_default(),
+            api_version: file.llm.api_version.unwrap_or(llm_defaults.api_version),
+            timeout_ms: file.llm.timeout_ms.unwrap_or(llm_defaults.timeout_ms),
+            default_max_tokens: file
+                .llm
+                .default_max_tokens
+                .unwrap_or(llm_defaults.default_max_tokens),
+            default_temperature: file
+                .llm
+                .default_temperature
+                .unwrap_or(llm_defaults.default_temperature),
+        };
+
+        Ok(Config { server, auth, llm })
     }
 
     /// Apply CLI arg overrides on top of the loaded config.
@@ -242,6 +327,10 @@ impl Config {
         replica_peers: Option<Vec<String>>,
         tls_cert: Option<String>,
         tls_key: Option<String>,
+        llm_provider: Option<String>,
+        llm_api_key: Option<String>,
+        llm_model: Option<String>,
+        llm_base_url: Option<String>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -304,6 +393,18 @@ impl Config {
         }
         if let Some(v) = tls_key {
             self.server.tls_key = Some(v);
+        }
+        if let Some(v) = llm_provider {
+            self.llm.provider = v;
+        }
+        if let Some(v) = llm_api_key {
+            self.llm.api_key = v;
+        }
+        if let Some(v) = llm_model {
+            self.llm.model = v;
+        }
+        if let Some(v) = llm_base_url {
+            self.llm.base_url = v;
         }
     }
 
@@ -517,6 +618,10 @@ http_port = 9999
             None,          // replica_peers
             None,          // tls_cert
             None,          // tls_key
+            None,          // llm_provider
+            None,          // llm_api_key
+            None,          // llm_model
+            None,          // llm_base_url
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);

@@ -115,6 +115,22 @@ struct Args {
     /// Overrides tokens_file from config file.
     #[arg(long, value_name = "FILE")]
     auth_file: Option<String>,
+
+    /// LLM provider: "openai", "anthropic", or "custom" (overrides config file, empty = disabled)
+    #[arg(long, value_name = "PROVIDER")]
+    llm_provider: Option<String>,
+
+    /// LLM API key (overrides config file)
+    #[arg(long, value_name = "KEY")]
+    llm_api_key: Option<String>,
+
+    /// LLM model to use (overrides config file)
+    #[arg(long, value_name = "MODEL")]
+    llm_model: Option<String>,
+
+    /// LLM base URL override for OpenAI-compatible endpoints (overrides config file)
+    #[arg(long, value_name = "URL")]
+    llm_base_url: Option<String>,
 }
 
 #[tokio::main]
@@ -172,6 +188,10 @@ async fn main() {
         }),
         args.tls_cert,
         args.tls_key,
+        args.llm_provider,
+        args.llm_api_key,
+        args.llm_model,
+        args.llm_base_url,
     );
 
     // Resolve auth tokens from file + CLI
@@ -204,6 +224,87 @@ async fn main() {
 
     // Create readiness state: not ready during snapshot restore
     let ready_state = Arc::new(http::ready::ReadyState::new("restoring_snapshot"));
+
+    // Construct LLM client from config
+    let llm_client = if cfg.llm.is_enabled() {
+        match cfg.llm.provider.as_str() {
+            "openai" | "custom" => {
+                let base_url = if cfg.llm.base_url.is_empty() {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    cfg.llm.base_url.clone()
+                };
+                if cfg.llm.provider == "custom" && base_url == "https://api.openai.com/v1" {
+                    eprintln!("error: LLM provider is 'custom' but no base_url configured");
+                    std::process::exit(1);
+                }
+                let openai_config = basalt::llm::OpenAiConfig {
+                    api_key: cfg.llm.api_key.clone(),
+                    model: if cfg.llm.model.is_empty() {
+                        "gpt-4o-mini".into()
+                    } else {
+                        cfg.llm.model.clone()
+                    },
+                    base_url,
+                    timeout_ms: cfg.llm.timeout_ms,
+                    default_max_tokens: cfg.llm.default_max_tokens,
+                    default_temperature: cfg.llm.default_temperature,
+                };
+                match basalt::llm::OpenAiProvider::new(openai_config) {
+                    Ok(provider) => {
+                        info!(
+                            "LLM: enabled (provider={}, model={}, base_url={})",
+                            cfg.llm.provider, cfg.llm.model, cfg.llm.base_url
+                        );
+                        basalt::llm::LlmClient::with_provider(Arc::new(provider))
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to create LLM client: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "anthropic" => {
+                let anthropic_config = basalt::llm::AnthropicConfig {
+                    api_key: cfg.llm.api_key.clone(),
+                    model: if cfg.llm.model.is_empty() {
+                        "claude-sonnet-4-20250514".into()
+                    } else {
+                        cfg.llm.model.clone()
+                    },
+                    base_url: if cfg.llm.base_url.is_empty() {
+                        "https://api.anthropic.com".to_string()
+                    } else {
+                        cfg.llm.base_url.clone()
+                    },
+                    api_version: cfg.llm.api_version.clone(),
+                    timeout_ms: cfg.llm.timeout_ms,
+                    default_max_tokens: cfg.llm.default_max_tokens,
+                    default_temperature: cfg.llm.default_temperature,
+                };
+                match basalt::llm::AnthropicProvider::new(anthropic_config) {
+                    Ok(provider) => {
+                        info!("LLM: enabled (provider=anthropic, model={})", cfg.llm.model);
+                        basalt::llm::LlmClient::with_provider(Arc::new(provider))
+                    }
+                    Err(e) => {
+                        eprintln!("error: failed to create LLM client: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            other => {
+                eprintln!(
+                    "error: unknown LLM provider: '{other}' (use 'openai', 'anthropic', or 'custom')"
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        info!("LLM: disabled (no provider configured)");
+        basalt::llm::LlmClient::disabled()
+    };
+    let _llm_client = Arc::new(llm_client);
 
     // Load snapshot if db_path is configured
     if let Some(ref db_path) = cfg.server.db_path {
