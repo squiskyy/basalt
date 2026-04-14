@@ -1,3 +1,4 @@
+pub mod consolidation;
 pub mod decay;
 pub mod engine;
 pub mod memory_type;
