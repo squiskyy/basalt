@@ -1,6 +1,6 @@
 # Summarization Triggers
 
-Summarization triggers automatically fire when defined conditions are met, allowing you to compress or process memories before they expire. This is useful for summarizing old episodic memories into semantic entries, triggering webhooks when namespaces grow too large, or logging trigger events for monitoring.
+Summarization triggers automatically fire when defined conditions are met, allowing you to compress or process memories before they expire. Built into the Basalt binary - no external cron or scheduler needed. This is useful for summarizing old episodic memories into semantic entries, triggering webhooks when namespaces grow too large, or logging trigger events for monitoring.
 
 ## Overview
 

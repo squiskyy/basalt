@@ -2,7 +2,7 @@
 name = "basalt"
 version = "0.1.0"
 edition = "2024"
-description = "Ultra-high performance KV store for AI memory"
+description = "Single-binary memory stack for AI platforms - KV store with semantic search, consolidation, and dual-protocol access"
 license = "MIT"
 
 [features]

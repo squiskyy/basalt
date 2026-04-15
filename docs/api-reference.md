@@ -1,6 +1,6 @@
 # API Reference
 
-Basalt exposes two protocols: an HTTP REST API (port 7380) and a RESP2 protocol (port 6380) compatible with Redis clients.
+Basalt exposes two protocols: an HTTP REST API (port 7380) for agents and a RESP2 protocol (port 6380) compatible with Redis clients. Both access the same memory store - no external services needed.
 
 ## HTTP REST API
 

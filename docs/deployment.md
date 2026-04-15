@@ -1,6 +1,6 @@
 # Deployment
 
-Guide for building, running, and deploying Basalt in production.
+Guide for building, running, and deploying Basalt in production. Basalt ships as a single binary with no external dependencies - just the executable and an optional config file.
 
 ## Building
 
@@ -92,7 +92,7 @@ Create `/etc/systemd/system/basalt.service`:
 
 ```ini
 [Unit]
-Description=Basalt KV Store
+Description=Basalt Memory Stack for AI Platforms
 After=network.target
 
 [Service]
@@ -137,7 +137,7 @@ journalctl -u basalt -f
 ### Dockerfile
 
 ```dockerfile
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release

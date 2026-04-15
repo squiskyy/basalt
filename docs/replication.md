@@ -1,6 +1,6 @@
 # Replication
 
-Basalt supports primary-replica asynchronous replication. This allows you to scale reads and provide high availability by maintaining copies of your data across multiple nodes.
+Basalt supports primary-replica asynchronous replication - high availability built into the single binary, no external orchestrator needed. This allows you to scale reads and provide failover by maintaining copies of your data across multiple nodes.
 
 ## Overview
 

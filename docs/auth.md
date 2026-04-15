@@ -1,6 +1,6 @@
 # Authentication
 
-Basalt supports optional bearer token authentication scoped to namespaces. When no tokens are configured, all requests are allowed (auth disabled).
+Basalt supports optional bearer token authentication scoped to namespaces. When no tokens are configured, all requests are allowed (auth disabled). This makes Basalt safe to deploy in multi-agent environments where each AI agent needs isolated access to its own memories.
 
 ## Overview
 

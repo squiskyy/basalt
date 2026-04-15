@@ -1,6 +1,6 @@
 # Configuration
 
-Basalt can be configured via CLI flags, a TOML config file, or both. CLI flags always override config file values.
+Basalt can be configured via CLI flags, a TOML config file, or both. CLI flags always override config file values. A single binary with a single config file - no external services to configure.
 
 ## Quick Start
 

@@ -1,6 +1,6 @@
 # Vector Search
 
-Basalt supports semantic similarity search using HNSW (Hierarchical Navigable Small World) approximate nearest neighbor indexes. This enables finding memories by embedding vector proximity, which is useful for AI agents that generate embeddings from text.
+Basalt includes built-in semantic similarity search using HNSW (Hierarchical Navigable Small World) approximate nearest neighbor indexes - no separate vector database required. This enables finding memories by embedding vector proximity, which is essential for AI agents that work with embeddings.
 
 ## Overview
 

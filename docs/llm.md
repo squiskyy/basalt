@@ -1,6 +1,6 @@
 # LLM Inference
 
-Basalt can optionally integrate with LLM providers for background inference tasks like memory summarization, consolidation, and relevance scoring.
+Basalt can optionally integrate with LLM providers for background inference tasks like memory summarization, consolidation, and relevance scoring. When no LLM is configured, these features are disabled and Basalt operates as a standalone memory stack.
 
 ## When LLM is Needed
 

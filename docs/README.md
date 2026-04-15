@@ -1,6 +1,6 @@
 # Basalt Documentation
 
-Ultra-high performance key-value store purpose-built for AI agent memory.
+A single-binary memory stack for AI platforms. No Redis, no vector DB, no external services - just `basalt` and a config file.
 
 ## Guides
 

@@ -4,7 +4,7 @@ Guide for building, testing, and contributing to Basalt.
 
 ## Prerequisites
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.94+ (edition 2024)
 - A C compiler (for some dependencies)
 - Linux recommended (io_uring feature is Linux-only)
 

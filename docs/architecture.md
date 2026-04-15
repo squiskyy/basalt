@@ -1,6 +1,6 @@
 # Architecture
 
-Basalt is a dual-protocol key-value store purpose-built for AI agent memory. This document covers the internal architecture, data flow, and design decisions.
+Basalt is a single-binary memory stack for AI platforms. It combines a high-performance KV store, semantic vector search, memory consolidation, and relevance decay into one deployable unit with no external dependencies. This document covers the internal architecture, data flow, and design decisions.
 
 ## High-Level Overview
 

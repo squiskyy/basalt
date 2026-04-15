@@ -1,6 +1,6 @@
 # Performance
 
-Basalt is designed for ultra-high performance in AI agent memory workloads. This document covers benchmark results, tuning parameters, and architecture decisions that contribute to performance.
+Basalt is designed for ultra-high performance in AI agent memory workloads. As a single-binary memory stack with no external service dependencies, it eliminates network hops and serialization overhead that plague multi-service architectures. This document covers benchmark results, tuning parameters, and architecture decisions that contribute to performance.
 
 ## Benchmark Results
 

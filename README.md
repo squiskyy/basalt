@@ -4,28 +4,33 @@
 
 # Basalt
 
-Ultra-high performance key-value store purpose-built for AI agent memory.
+A single-binary memory stack for AI platforms. Purpose-built KV store with semantic search, consolidation, and dual-protocol access - no external dependencies, no Redis, no vector DB needed.
+
+**One binary. Two protocols. Zero dependencies.**
 
 Dual-protocol: **HTTP REST API** (port 7380) for agents + **RESP2** (port 6380) for Redis-compatible tooling and benchmarks.
 
 ## Why Basalt?
 
-Redis and Memcached are general-purpose caches. Basalt is laser-focused on one workload: **storing and retrieving memories for AI agents**.
+AI agent platforms need memory that general-purpose caches don't provide. Redis and Memcached are key-value stores. Pinecone and Weaviate are vector DBs. Basalt is the **memory layer** - purpose-built for how AI agents actually use memory, in a single binary with no external services.
 
-That workload has specific properties we exploit:
-
-| Property | Implication |
+| What AI platforms need | What Basalt provides |
 |---|---|
-| Read-heavy (50-100:1) | Lock-free reads via papaya concurrent HashMap |
-| Namespace-partitioned | First-class `/store/{namespace}` paths, prefix scan (O(N) full scan - see [performance docs](docs/performance.md)) |
-| TTL-aware by type | Episodic memories auto-expire, semantic/procedural don't |
-| Small-to-medium values | No blob overhead, optimized for 16B-8KB values |
-| Bulk retrieval | One call to fetch all memories for an agent |
+| Fast key-value storage for observations, facts, and skills | Sharded papaya HashMap with 323ns GET latency |
+| Memory that expires when it should | Three memory types: episodic (auto-TTL), semantic (permanent), procedural (permanent) |
+| Semantic similarity search | Per-namespace HNSW indexes with lazy rebuild |
+| Multi-agent isolation | Namespace scoping with bearer token auth per namespace |
+| Memory consolidation (episodic -> semantic) | Built-in promote and compress with LLM-powered summarization |
+| Relevance decay (stale memories fade) | Exponential decay with read/write boosts, pinned entries, automatic GC |
+| Bulk operations (400+ agents hitting shared memory) | Batch store/get endpoints, pipelined RESP commands |
+| Persistence without a separate DB | Binary snapshots with LZ4 compression, auto-rotate |
+| High availability | Primary-replica replication with automatic failover |
+| Single deployment, no ops overhead | One binary, one config file, no Redis, no vector DB, no external services |
 
 ## Quick Start
 
 ```bash
-# Build and run
+# Build and run - that's it
 cargo run --release
 
 # HTTP API (port 7380)
@@ -45,6 +50,11 @@ curl http://localhost:7380/store/agent-42/obs:1
 curl -X POST http://localhost:7380/store/agent-42 \
   -H 'Content-Type: application/json' \
   -d '{"key":"fact:earth","value":"earth is round","type":"semantic"}'
+
+# Search by embedding similarity
+curl -X POST http://localhost:7380/store/agent-42/search \
+  -H 'Content-Type: application/json' \
+  -d '{"embedding":[0.1,0.2,0.3,0.4,0.5],"top_k":10}'
 
 # RESP (Redis-compatible) on port 6380
 redis-cli -p 6380 PING
@@ -91,19 +101,23 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 
 ## Features
 
+- **Single binary** - No Redis, no vector DB, no external services. Just `basalt` and a config file.
 - **Dual protocol** - HTTP REST API + RESP2 (Redis-compatible)
 - **Namespace scoping** - Each agent gets isolated key space at `/store/{namespace}/`
 - **Bearer token auth** - Tokens scoped to specific namespaces or wildcard (`*`)
 - **Memory types** - Episodic (auto-expiring), semantic (permanent), procedural (permanent)
 - **Vector search** - HNSW semantic similarity search on embeddings
-- **Persistence** - Binary snapshots with LZ4 compression, auto-rotate last 3
-- **Replication** - Asynchronous primary-replica with WAL streaming
+- **Persistence** - Binary snapshots with LZ4 compression, CRC32 checksums, auto-rotate last 3
+- **Replication** - Asynchronous primary-replica with WAL streaming, automatic failover
 - **Compression** - Runtime LZ4 compression for large values (configurable threshold)
 - **io_uring** - Linux-only io_uring backend for the RESP server (feature flag)
 - **Relevance decay** - Exponential relevance scoring that decays over time; read/write boosts keep hot memories alive, pinned entries stay at 1.0, low-relevance entries GC'd automatically
 - **Summarization triggers** - Automatic memory compression when conditions are met (entry count, age, pattern match), with webhook and callback actions
 - **Memory consolidation** - Promote episodic memories to semantic, compress related episodes, configurable rules with conflict policies and summary strategies
 - **LLM integration** - Optional background LLM inference for summarization, consolidation, and relevance scoring (OpenAI, Anthropic, or custom endpoints)
+- **Cross-agent sharing** - Grant one namespace access to another namespace's keys with permission scoping
+- **TLS** - Feature-gated TLS for RESP protocol (rustls or native-tls)
+- **Prometheus metrics** - Optional `/metrics` endpoint (feature flag)
 
 ## Memory Consolidation
 
@@ -247,12 +261,23 @@ When `consolidation_interval_ms > 0`, a background task wakes on the configured 
     RESP ---------->|  Dispatch   |       (64 papaya HashMaps)
   (port 6380)      |             |
                     +-------------+
+                            |
+                    +-------+-------+
+                    v       v       v
+                 Snapshot  WAL   Expired
+                 Loop     Writer  Entry
+                            |
+                    +-------+-------+
+                    v               v
+               LlmClient      Consolidation
+               (background)   (background)
 ```
 
 - **Sharding**: Keys hashed to shards via ahash with per-instance random seed
 - **papaya**: Lock-free concurrent SwissTable - reads scale linearly with cores
 - **TTL**: Per-entry expiry with lazy eviction (checked on read) + background sweep
 - **Dual protocol**: Same engine, two frontends - no data duplication
+- **Single binary**: Everything compiles into one executable - HTTP, RESP, persistence, replication, vector search, consolidation
 
 ## Configuration
 

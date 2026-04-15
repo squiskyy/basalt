@@ -1,6 +1,6 @@
 # Persistence
 
-Basalt supports optional disk persistence via binary snapshots. When `db_path` is configured, the engine writes snapshots to disk and restores them on startup.
+Basalt supports optional disk persistence via binary snapshots - no external database required. When `db_path` is configured, the engine writes snapshots to disk and restores them on startup.
 
 ## Overview
 

@@ -1,6 +1,6 @@
 # Memory Types
 
-Basalt's memory type system maps directly to how AI agents organize information. Three types - episodic, semantic, and procedural - each with different TTL behavior.
+Basalt's memory type system maps directly to how AI agents organize information. Unlike a generic KV store where everything is a string with optional TTL, Basalt understands that observations expire, facts persist, and skills endure. Three types - episodic, semantic, and procedural - each with different TTL behavior.
 
 ## The Three Types
 
