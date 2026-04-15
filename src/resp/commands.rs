@@ -546,7 +546,7 @@ impl CommandHandler {
         };
 
         let info = format!(
-            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{shard_count}\r\ncompression_threshold:{}\r\neviction_policy:{eviction_str}\r\nmax_entries_per_shard:{}{lru_info}\r\n{shard_entries_str}\r\n",
+            "# Basalt\r\nbasalt_version:0.2.0\r\nshard_count:{shard_count}\r\ncompression_threshold:{}\r\neviction_policy:{eviction_str}\r\nmax_entries_per_shard:{}{lru_info}\r\n{shard_entries_str}\r\n",
             self.engine.compression_threshold(),
             self.engine.max_entries(),
         );

@@ -32,7 +32,7 @@ Returns server metadata. No authentication required.
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "shard_count": 64,
   "role": "primary",
   "connected_replicas": 0,
