@@ -581,6 +581,16 @@ impl KvEngine {
     /// Scan all entries whose keys start with `prefix` across all shards.
     /// Returns (key, value, EntryMeta) tuples.
     /// Values are transparently decompressed if they were compressed at rest.
+    ///
+    /// # Cost
+    ///
+    /// This is O(N) in total entries across all shards. Each shard is fully scanned
+    /// because the HashMap has no ordering - prefix matching requires checking every
+    /// key. For the target workload (per-namespace scans where entries per namespace
+    /// are relatively few), the constant factor is small and the cost is acceptable.
+    /// For large namespaces or empty-prefix scans, consider the linear cost. A sorted
+    /// secondary index (e.g. B-tree) would reduce this to O(K log N) where K is the
+    /// result count, at the cost of write-path overhead.
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, Vec<u8>, EntryMeta)> {
         let now = now_ms();
         let mut results = Vec::new();
@@ -611,6 +621,10 @@ impl KvEngine {
     /// including their embedding vectors.
     /// Returns (key, value, EntryMetaWithEmbedding) tuples.
     /// Values are transparently decompressed if they were compressed at rest.
+    ///
+    /// # Cost
+    ///
+    /// Same O(N) cost as [`scan_prefix`](Self::scan_prefix) - full scan of all shards.
     pub fn scan_prefix_with_embeddings(
         &self,
         prefix: &str,
@@ -643,6 +657,10 @@ impl KvEngine {
 
     /// Scan all entries whose keys start with `prefix` across all shards,
     /// returning the raw Entry objects (for internal use like snapshots).
+    ///
+    /// # Cost
+    ///
+    /// Same O(N) cost as [`scan_prefix`](Self::scan_prefix) - full scan of all shards.
     pub fn scan_prefix_entries(&self, prefix: &str) -> Vec<(String, Entry)> {
         let mut results = Vec::new();
         for shard in &self.shards {

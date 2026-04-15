@@ -239,9 +239,26 @@ If many agents write to the same key prefix, entries concentrate in fewer shards
 
 Values > 8KB have higher SET latency (4.11us vs 1.26us for 16B). If you're storing large documents, consider enabling compression.
 
-### Frequent Full Namespace Scans
+### Prefix Scans Are O(N)
 
-`DELETE /store/{namespace}` and `GET /store/{namespace}` without prefix filtering scan all entries in the namespace. For large namespaces, this can be expensive.
+`scan_prefix` is a linear scan over all entries across all shards. The HashMap has no ordering, so there is no secondary index or sorted structure to accelerate prefix lookups - every key must be checked against the prefix.
+
+**Per-shard cost**: O(S) where S is entries in that shard.
+**Full `scan_prefix`**: O(N) where N is total entries across all shards (every shard is scanned).
+
+For the target workload (per-namespace scans like `scan_prefix("agent-42:")` where entries per namespace are relatively few compared to total data), the constant factor is small and this is acceptable in practice. The shard distribution means work is parallelized across cores.
+
+This becomes painful when:
+- Namespaces grow very large (millions of entries in one namespace)
+- Empty-prefix scans (`scan_prefix("")`) iterate the entire dataset
+- Scan-heavy workloads with many concurrent prefix lookups
+
+A sorted secondary index (B-tree or LSM-tail index) would improve prefix scans to O(K log N) where K is the result count, but at the cost of write-path overhead and additional memory. This is a conscious tradeoff: Basalt optimizes for the read-heavy, write-simple case where per-namespace scans touch a small fraction of total entries.
+
+If you need faster prefix scans at scale, consider:
+- Keeping namespaces small (the natural AI agent pattern)
+- Using `count_prefix` instead of `scan_prefix` when you only need the count (avoids decompression and allocation)
+- Avoiding empty-prefix scans in hot paths
 
 ### Vector Search on Stale Indexes
 

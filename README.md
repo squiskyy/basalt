@@ -17,7 +17,7 @@ That workload has specific properties we exploit:
 | Property | Implication |
 |---|---|
 | Read-heavy (50-100:1) | Lock-free reads via papaya concurrent HashMap |
-| Namespace-partitioned | First-class `/store/{namespace}` paths, native prefix scan |
+| Namespace-partitioned | First-class `/store/{namespace}` paths, prefix scan (O(N) full scan - see [performance docs](docs/performance.md)) |
 | TTL-aware by type | Episodic memories auto-expire, semantic/procedural don't |
 | Small-to-medium values | No blob overhead, optimized for 16B-8KB values |
 | Bulk retrieval | One call to fetch all memories for an agent |

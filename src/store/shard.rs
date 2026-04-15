@@ -522,6 +522,17 @@ impl Shard {
     /// Scan all entries whose keys start with `prefix`, returning (key, entry) pairs.
     /// Skips expired entries (lazily removing them).
     /// Returned entries have their values decompressed.
+    ///
+    /// # Cost
+    ///
+    /// This is an O(S) full-shard scan where S is the number of entries in this shard.
+    /// The HashMap has no ordering, so prefix matching requires iterating every entry.
+    /// At the engine level, `scan_prefix` scans ALL shards, making it O(N) where N is
+    /// total entries across the cluster. For per-namespace lookups (e.g.
+    /// `scan_prefix("agent-42:")`) where the namespace is small relative to total data,
+    /// this is acceptable in practice. For large namespaces or empty-prefix scans, the
+    /// cost is linear in total entry count. A sorted secondary index would improve this
+    /// to O(K log N) where K is the result count, but adds write-path overhead.
     pub fn scan_prefix(&self, prefix: &str) -> Vec<(String, Entry)> {
         let now = now_ms();
         let mut results = Vec::new();
