@@ -345,7 +345,9 @@ impl KvEngine {
     /// Returns 0 if the namespace has never been modified.
     fn namespace_version(&self, namespace: &str) -> u64 {
         let pin = self.namespace_versions.pin();
-        pin.get(namespace).map(|v| v.load(Ordering::Relaxed)).unwrap_or(0)
+        pin.get(namespace)
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     /// Set a key with explicit TTL (in ms from now) and memory type.
