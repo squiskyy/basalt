@@ -53,11 +53,37 @@ pub struct KvEngine {
     lru_sample_size: usize,
     /// Per-namespace HNSW vector indices, protected by a Mutex.
     /// Key: namespace (prefix before the first `:` in a key, or the full key).
+    ///
+    /// # Bottleneck
+    ///
+    /// The Mutex is held during index rebuilds, which blocks all search queries
+    /// across ALL namespaces while a single namespace is being rebuilt. For large
+    /// namespaces with many embeddings, rebuild can take significant time.
+    ///
+    /// A better approach would be to use an RwLock so concurrent reads don't block
+    /// each other, or to rebuild the index outside the lock and swap it in atomically.
+    /// However, `instant_distance::HnswIndex` doesn't support incremental updates,
+    /// so full rebuilds are unavoidable. The swap-in approach would look like:
+    ///
+    /// ```ignore
+    /// // Rebuild outside the lock, then swap in
+    /// let new_index = HnswIndex::new();
+    /// new_index.rebuild(&entries, version);
+    /// let mut indexes = self.vector_indexes.write().unwrap();
+    /// indexes.insert(namespace.to_string(), new_index);
+    /// ```
+    ///
+    /// This reduces lock hold time from O(N*logN) rebuild to O(1) HashMap insert.
     vector_indexes: Mutex<HashMap<String, HnswIndex>>,
     /// Per-namespace version counters for tracking changes to entries with embeddings.
     /// Only the namespace that was modified has its version incremented,
     /// avoiding unnecessary rebuilds of unrelated namespace indexes.
-    namespace_versions: Mutex<HashMap<String, AtomicU64>>,
+    ///
+    /// Uses papaya's lock-free HashMap instead of Mutex<HashMap> to avoid
+    /// contention on the write path. Every set/delete call increments a namespace
+    /// version, so a Mutex would serialize writes across all namespaces. With papaya,
+    /// reads are lock-free and writes only contend within the same hash bucket.
+    namespace_versions: papaya::HashMap<String, AtomicU64>,
     /// Randomized hash builder for shard routing. Each KvEngine instance
     /// gets a unique random seed so that hash collisions cannot be
     /// predicted by an attacker.
@@ -172,7 +198,7 @@ impl KvEngine {
             eviction_policy: EvictionPolicy::Reject,
             lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
-            namespace_versions: Mutex::new(HashMap::new()),
+            namespace_versions: papaya::HashMap::new(),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
@@ -202,7 +228,7 @@ impl KvEngine {
             eviction_policy: EvictionPolicy::Reject,
             lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
-            namespace_versions: Mutex::new(HashMap::new()),
+            namespace_versions: papaya::HashMap::new(),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
@@ -260,7 +286,7 @@ impl KvEngine {
             eviction_policy,
             lru_sample_size: lru_sample_size.max(1),
             vector_indexes: Mutex::new(HashMap::new()),
-            namespace_versions: Mutex::new(HashMap::new()),
+            namespace_versions: papaya::HashMap::new(),
             hash_state: RandomState::new(),
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
@@ -291,7 +317,7 @@ impl KvEngine {
             eviction_policy,
             lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
-            namespace_versions: Mutex::new(HashMap::new()),
+            namespace_versions: papaya::HashMap::new(),
             hash_state: RandomState::new(),
             decay_config,
             trigger_manager: Arc::new(TriggerManager::new()),
@@ -307,24 +333,19 @@ impl KvEngine {
 
     /// Increment the version counter for a specific namespace.
     /// This is called when data in that namespace is modified (set/delete).
-    #[allow(clippy::or_fun_call)]
+    /// Uses papaya's lock-free HashMap so concurrent writes to different
+    /// namespaces don't contend.
     fn increment_namespace_version(&self, namespace: &str) -> u64 {
-        let mut versions = self.namespace_versions.lock().unwrap();
-        versions
-            .entry(namespace.to_string())
-            .or_insert_with(|| AtomicU64::new(1))
-            .fetch_add(1, Ordering::Relaxed)
-            + 1
+        let pin = self.namespace_versions.pin();
+        let version = pin.get_or_insert_with(namespace.to_string(), || AtomicU64::new(0));
+        version.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Get the current version for a specific namespace.
     /// Returns 0 if the namespace has never been modified.
     fn namespace_version(&self, namespace: &str) -> u64 {
-        let versions = self.namespace_versions.lock().unwrap();
-        versions
-            .get(namespace)
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        let pin = self.namespace_versions.pin();
+        pin.get(namespace).map(|v| v.load(Ordering::Relaxed)).unwrap_or(0)
     }
 
     /// Set a key with explicit TTL (in ms from now) and memory type.
@@ -928,8 +949,7 @@ impl KvEngine {
         }
         let mut indexes = self.vector_indexes.lock().unwrap();
         indexes.clear();
-        let mut versions = self.namespace_versions.lock().unwrap();
-        versions.clear();
+        self.namespace_versions.pin().clear();
     }
 
     /// Search for entries with embeddings similar to the query embedding within a namespace.
@@ -945,17 +965,20 @@ impl KvEngine {
     ) -> Vec<VectorSearchResult> {
         let prefix = format!("{}:", namespace);
 
-        // Read the per-namespace version and check/build index inside the lock
-        let mut indexes = self.vector_indexes.lock().unwrap();
-        let version = self.namespace_version(namespace);
-
-        let needs_rebuild = match indexes.get(namespace) {
-            Some(idx) => idx.is_stale(version),
-            None => true,
+        // Check if a rebuild is needed (quick read under lock)
+        let needs_rebuild = {
+            let indexes = self.vector_indexes.lock().unwrap();
+            let version = self.namespace_version(namespace);
+            match indexes.get(namespace) {
+                Some(idx) => idx.is_stale(version),
+                None => true,
+            }
         };
 
         if needs_rebuild {
-            // Collect entries with embeddings for this namespace
+            // Collect entries and rebuild the index OUTSIDE the lock.
+            // This avoids blocking all other search queries while rebuilding,
+            // which can be slow for large namespaces with many embeddings.
             let entries: Vec<(String, Vec<f32>, Vec<u8>)> = {
                 let all = self.scan_prefix_with_embeddings(&prefix);
                 all.into_iter()
@@ -969,20 +992,37 @@ impl KvEngine {
 
             if entries.is_empty() {
                 // No embeddings in this namespace - clear the index
+                let mut indexes = self.vector_indexes.lock().unwrap();
                 indexes.remove(namespace);
                 return Vec::new();
             }
 
-            // Rebuild the index (still holding the lock)
-            let index = indexes.entry(namespace.to_string()).or_default();
-            index.rebuild(&entries, version);
+            // Build a new index outside the lock
+            let version = self.namespace_version(namespace);
+            let mut new_index = HnswIndex::new();
+            new_index.rebuild(&entries, version);
 
-            // Search using the rebuilt index (values are cached inside the index)
-            return index.search(embedding, top_k);
+            // Swap in the rebuilt index (brief lock hold - just a HashMap insert)
+            let mut indexes = self.vector_indexes.lock().unwrap();
+            // Re-check version: another thread may have rebuilt while we were working.
+            // If so, their rebuild is at least as recent as ours, so we can skip.
+            let current_version = self.namespace_version(namespace);
+            if current_version > version {
+                // A newer write happened during our rebuild. Our index is stale.
+                // The next search will trigger another rebuild. This is rare.
+                // We still insert our index as a best-effort cache.
+            }
+            indexes.insert(namespace.to_string(), new_index);
+
+            // Search using the rebuilt index (still holding the brief lock)
+            return indexes
+                .get(namespace)
+                .map(|idx| idx.search(embedding, top_k))
+                .unwrap_or_default();
         }
 
-        // Index is up-to-date, just search (still holding the lock)
-        // Values are cached in the index, no need to rebuild the values map
+        // Index is up-to-date, just search
+        let indexes = self.vector_indexes.lock().unwrap();
         if let Some(index) = indexes.get(namespace) {
             index.search(embedding, top_k)
         } else {

@@ -117,6 +117,16 @@ pub struct ShardFullError {
     pub shard_index: usize,
 }
 
+impl std::fmt::Display for ShardFullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shard {} full: {}/{} entries",
+            self.shard_index, self.current, self.max_entries
+        )
+    }
+}
+
 /// Default maximum entries per shard.
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 
@@ -444,17 +454,30 @@ impl Shard {
             // Touch LRU access time if it's been more than 1 second
             // (avoids excessive writes on hot keys)
             let needs_touch = now.saturating_sub(entry.last_accessed_ms) > 1000;
-            let cloned = entry.clone();
-            drop(pin);
             if needs_touch {
-                let mut updated = cloned.clone();
-                updated.last_accessed_ms = now;
-                updated.access_count = updated.access_count.saturating_add(1);
-                // Use set-force semantics: just insert, count already correct
+                // Touch path: update the entry's access time and count.
+                // This requires cloning the entry for the in-place update (papaya's
+                // update takes Fn(&V) -> V) and cloning again for the return value.
+                // Two full Entry clones is costly for entries with large embeddings,
+                // but the 1-second debounce ensures this only fires once per second
+                // per key, making it rare for hot keys. The no-touch path below
+                // (single clone) handles the common case.
+                let key_owned = key.to_string();
+                drop(pin);
                 let pin2 = self.map.pin();
-                pin2.insert(key.to_string(), updated);
+                pin2.update(key_owned, |e| {
+                    let mut touched = e.clone();
+                    touched.last_accessed_ms = now;
+                    touched.access_count = touched.access_count.saturating_add(1);
+                    touched
+                });
+                Some(pin2.get(key)?.clone())
+            } else {
+                // No touch needed - single clone for the return value.
+                let cloned = entry.clone();
+                drop(pin);
+                Some(cloned)
             }
-            Some(cloned)
         }
     }
 

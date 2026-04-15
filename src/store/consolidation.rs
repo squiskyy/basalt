@@ -104,6 +104,10 @@ pub struct ConsolidationResult {
     pub promoted: usize,
     pub compressed: usize,
     pub skipped: usize,
+    /// Number of groups that failed to write (e.g., shard full).
+    /// Source entries are NOT deleted when the target write fails,
+    /// preventing data loss.
+    pub failed: usize,
     pub details: Vec<ConsolidationDetail>,
 }
 
@@ -114,6 +118,7 @@ impl ConsolidationResult {
             promoted: 0,
             compressed: 0,
             skipped: 0,
+            failed: 0,
             details: Vec::new(),
         }
     }
@@ -371,12 +376,20 @@ fn run_promote_rule(
                         let versioned_internal = format!("{}:{}", namespace, versioned_suffix);
                         if engine.get(&versioned_internal).is_none() {
                             // Use this versioned key instead
-                            let _ = engine.set(
+                            if let Err(e) = engine.set(
                                 &versioned_internal,
                                 entries.last().unwrap().1.clone(),
                                 None,
                                 target_type,
-                            );
+                            ) {
+                                tracing::warn!(
+                                    "consolidation promote failed to write '{}': {}",
+                                    versioned_internal,
+                                    e
+                                );
+                                result.failed += 1;
+                                break;
+                            }
                             // Delete all source episodic entries
                             for (src_key, _) in &entries {
                                 engine.delete(src_key);
@@ -399,7 +412,15 @@ fn run_promote_rule(
 
         // Write the latest value from the group as the target type (no TTL)
         let latest_value = entries.last().unwrap().1.clone();
-        let _ = engine.set(&target_internal, latest_value, None, target_type);
+        if let Err(e) = engine.set(&target_internal, latest_value, None, target_type) {
+            tracing::warn!(
+                "consolidation promote failed to write '{}': {}",
+                target_internal,
+                e
+            );
+            result.failed += 1;
+            continue;
+        }
 
         // Delete all source episodic entries
         for (src_key, _) in &entries {
@@ -457,7 +478,15 @@ fn run_compress_rule(
         let final_key = target_key.replace("{prefix}", &group_key);
         let target_internal = format!("{}:{}", namespace, final_key);
 
-        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
+        if let Err(e) = engine.set(&target_internal, summary.into_bytes(), None, target_type) {
+            tracing::warn!(
+                "consolidation compress failed to write '{}': {}",
+                target_internal,
+                e
+            );
+            result.failed += 1;
+            continue;
+        }
 
         if delete_source {
             for (src_key, _) in &entries {
@@ -540,7 +569,15 @@ async fn run_compress_rule_with_llm(
         let final_key = target_key.replace("{prefix}", &group_key);
         let target_internal = format!("{}:{}", namespace, final_key);
 
-        let _ = engine.set(&target_internal, summary.into_bytes(), None, target_type);
+        if let Err(e) = engine.set(&target_internal, summary.into_bytes(), None, target_type) {
+            tracing::warn!(
+                "consolidation compress (llm) failed to write '{}': {}",
+                target_internal,
+                e
+            );
+            result.failed += 1;
+            continue;
+        }
 
         if delete_source {
             for (src_key, _) in &entries {

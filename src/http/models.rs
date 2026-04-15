@@ -222,6 +222,7 @@ pub struct ConsolidateResponse {
     pub promoted: usize,
     pub compressed: usize,
     pub skipped: usize,
+    pub failed: usize,
     pub details: Vec<ConsolidateDetailResponse>,
 }
 
@@ -240,6 +241,7 @@ impl From<crate::store::consolidation::ConsolidationResult> for ConsolidateRespo
             promoted: r.promoted,
             compressed: r.compressed,
             skipped: r.skipped,
+            failed: r.failed,
             details: r
                 .details
                 .into_iter()
