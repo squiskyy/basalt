@@ -118,6 +118,7 @@ Episodic memories auto-expire because old observations become stale. Semantic an
 - **Cross-agent sharing** - Grant one namespace access to another namespace's keys with permission scoping
 - **TLS** - Feature-gated TLS for RESP protocol (rustls or native-tls)
 - **Prometheus metrics** - Optional `/metrics` endpoint (feature flag)
+- **Rate limiting** - Per-IP (HTTP) and per-connection (RESP) token bucket rate limiting, configurable via `--rate-limit-requests`
 
 ## Memory Consolidation
 

@@ -519,3 +519,76 @@ fn test_wildcard_token_bypasses_namespace_check() {
         RespValue::SimpleString("OK".to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// 17. Rate limiting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rate_limit_allows_within_limit() {
+    let auth = Arc::new(AuthStore::new());
+    let mut session = ClientSession::with_rate_limit(auth, make_share(), false, 3, 1000);
+    let handler = make_handler();
+    let share_handler = make_share_handler();
+
+    // 3 PINGs should all succeed
+    for _ in 0..3 {
+        let cmd = make_command("PING", &[]);
+        let result = session.process_command_batch(&[cmd], &handler, &share_handler);
+        assert_eq!(result.responses.len(), 1);
+        assert_eq!(
+            result.responses[0],
+            RespValue::SimpleString("PONG".to_string())
+        );
+    }
+
+    // 4th PING should be rate limited
+    let cmd = make_command("PING", &[]);
+    let result = session.process_command_batch(&[cmd], &handler, &share_handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::Error("ERR rate limit exceeded".to_string())
+    );
+}
+
+#[test]
+fn test_rate_limit_auth_bypasses_rate_limit() {
+    let auth = Arc::new(AuthStore::from_list(vec![(
+        "admin".to_string(),
+        vec!["*".to_string()],
+    )]));
+    // 1 request per window
+    let mut session = ClientSession::with_rate_limit(auth.clone(), make_share(), true, 1, 1000);
+    let handler = make_handler();
+    let share_handler = make_share_handler();
+
+    // AUTH should succeed even when rate limited (AUTH bypasses rate limiting)
+    let auth_cmd = make_command("AUTH", &["admin"]);
+    let result = session.process_command_batch(&[auth_cmd], &handler, &share_handler);
+    assert_eq!(result.responses.len(), 1);
+    assert_eq!(
+        result.responses[0],
+        RespValue::SimpleString("OK".to_string())
+    );
+}
+
+#[test]
+fn test_rate_limit_disabled_when_zero() {
+    let auth = Arc::new(AuthStore::new());
+    // 0 = disabled
+    let mut session = ClientSession::with_rate_limit(auth, make_share(), false, 0, 1000);
+    let handler = make_handler();
+    let share_handler = make_share_handler();
+
+    // Should allow unlimited requests
+    for _ in 0..100 {
+        let cmd = make_command("PING", &[]);
+        let result = session.process_command_batch(&[cmd], &handler, &share_handler);
+        assert_eq!(result.responses.len(), 1);
+        assert_eq!(
+            result.responses[0],
+            RespValue::SimpleString("PONG".to_string())
+        );
+    }
+}

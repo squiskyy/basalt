@@ -227,6 +227,7 @@ volumes:
 - [ ] Set `LimitNOFILE=65536` or higher for many concurrent connections
 - [ ] Run as a non-root user (`User=basalt` in systemd)
 - [ ] Use `ProtectSystem=strict` and `ReadWritePaths` in systemd
+- [ ] Consider enabling rate limiting (`--rate-limit-requests 100 --rate-limit-window 1000`) for public-facing deployments
 
 ### Persistence
 

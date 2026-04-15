@@ -15,7 +15,7 @@ use basalt::store::share::ShareStore;
 #[command(
     name = "basalt",
     version,
-    about = "Ultra-high performance KV store for AI memory"
+    about = "Single-binary memory stack for AI platforms"
 )]
 struct Args {
     /// Path to TOML config file
@@ -135,6 +135,14 @@ struct Args {
     /// LLM base URL override for OpenAI-compatible endpoints (overrides config file)
     #[arg(long, value_name = "URL")]
     llm_base_url: Option<String>,
+
+    /// Max requests per rate limit window (0 = disabled, overrides config file)
+    #[arg(long, value_name = "N")]
+    rate_limit_requests: Option<u64>,
+
+    /// Rate limit window duration in milliseconds (overrides config file, default: 1000)
+    #[arg(long, value_name = "MS")]
+    rate_limit_window: Option<u64>,
 }
 
 #[tokio::main]
@@ -197,6 +205,8 @@ async fn main() {
         args.llm_api_key,
         args.llm_model,
         args.llm_base_url,
+        args.rate_limit_requests,
+        args.rate_limit_window,
     );
 
     // Resolve auth tokens from file + CLI
@@ -360,6 +370,14 @@ async fn main() {
     }
     info!("HTTP:  {}:{}", cfg.server.http_host, cfg.server.http_port);
     info!("RESP:  {}:{}", cfg.server.resp_host, cfg.server.resp_port);
+    if cfg.server.rate_limit_requests > 0 {
+        info!(
+            "rate limit: {} requests per {}ms (per-IP for HTTP, per-connection for RESP)",
+            cfg.server.rate_limit_requests, cfg.server.rate_limit_window_ms
+        );
+    } else {
+        info!("rate limit: disabled");
+    }
 
     // Build TLS acceptor if cert/key are configured
     #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
@@ -636,6 +654,19 @@ async fn main() {
     let http_repl_state = repl_state.clone();
     let http_shutdown_rx = shutdown_rx.clone();
     let http_server = tokio::spawn(async move {
+        let rate_limiter = http::rate_limit::RateLimiter::new(
+            http_config.rate_limit_requests,
+            http_config.rate_limit_window_ms,
+        );
+
+        // Start rate limit cleanup task if rate limiting is enabled
+        if http_config.rate_limit_requests > 0 {
+            http::rate_limit::start_cleanup_task(
+                rate_limiter.clone(),
+                http_config.rate_limit_window_ms,
+            );
+        }
+
         let app = http::server::app(
             http_engine,
             http_auth,
@@ -646,6 +677,7 @@ async fn main() {
             http_ready_state,
             metrics,
             http_config.consolidation_interval_ms,
+            rate_limiter,
         );
         let addr = format!("{}:{}", http_config.http_host, http_config.http_port);
         let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
@@ -662,8 +694,16 @@ async fn main() {
     #[allow(unused_mut)] // mut needed on older tokio where changed() takes &mut self
     let mut resp_shutdown_rx = shutdown_rx.clone();
     let resp_server = tokio::spawn(async move {
+        // Determine whether to use io_uring or tokio for the RESP server.
+        // io_uring only available when the feature is compiled in AND the config flag is set.
         #[cfg(feature = "io-uring")]
-        if resp_config.io_uring {
+        let use_uring = resp_config.io_uring;
+        #[cfg(not(feature = "io-uring"))]
+        let use_uring = false;
+
+        if use_uring {
+            // io_uring runs in its own thread (blocking), separate from tokio.
+            // TLS is not supported with io_uring - exit early if configured.
             if cfg!(any(feature = "tls-rustls", feature = "tls-native-tls"))
                 && (resp_config.tls_cert.is_some() || resp_config.tls_key.is_some())
             {
@@ -676,7 +716,7 @@ async fn main() {
             let port = resp_config.resp_port;
             let db_path = resp_config.db_path.clone();
             let uring_repl_state = repl_state.clone();
-            // io_uring runs in its own thread (blocking), separate from tokio
+            #[cfg(feature = "io-uring")]
             std::thread::spawn(move || {
                 if let Err(e) = resp::uring_server::run(
                     &host,
@@ -690,9 +730,16 @@ async fn main() {
                     eprintln!("io_uring RESP server error: {e}");
                 }
             });
+            #[cfg(not(feature = "io-uring"))]
+            {
+                let _ = (host, port, db_path, uring_repl_state);
+                // use_uring is only true when io-uring feature is enabled,
+                // so this branch is dead code when the feature is off.
+            }
             // Keep the tokio task alive until shutdown signal
             resp_shutdown_rx.changed().await.ok();
         } else {
+            // Tokio RESP server (single codepath, no duplication)
             #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
             let tls_acc = tls_acceptor.clone();
             #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
@@ -707,30 +754,8 @@ async fn main() {
                 repl_state.clone(),
                 resp_shutdown_rx,
                 tls_acc,
-            )
-            .await
-            {
-                eprintln!("RESP server error: {e}");
-            }
-        }
-
-        #[cfg(not(feature = "io-uring"))]
-        {
-            let rx = resp_shutdown_rx;
-            #[cfg(any(feature = "tls-rustls", feature = "tls-native-tls"))]
-            let tls_acc = tls_acceptor.clone();
-            #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
-            let tls_acc = None;
-            if let Err(e) = resp::server::run_with_replication_and_tls(
-                &resp_config.resp_host,
-                resp_config.resp_port,
-                resp_engine,
-                resp_auth,
-                resp_share,
-                resp_config.db_path.clone(),
-                repl_state.clone(),
-                rx,
-                tls_acc,
+                resp_config.rate_limit_requests,
+                resp_config.rate_limit_window_ms,
             )
             .await
             {

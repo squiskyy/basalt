@@ -60,6 +60,13 @@ shard_count = 64
 # Use io_uring for the RESP server (Linux only, requires --features io-uring)
 # io_uring = false
 
+# Rate limiting: max requests per window per client (0 = disabled, default).
+# HTTP: per-IP. RESP: per-connection.
+# rate_limit_requests = 0
+
+# Rate limiting: window duration in milliseconds (default: 1000 = 1 second).
+# rate_limit_window_ms = 1000
+
 [auth]
 # Path to a tokens file (one token per line)
 # Format: <token> <namespace1> [namespace2 ...]

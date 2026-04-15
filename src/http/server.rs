@@ -24,6 +24,7 @@ use super::models::{
     SearchResult, ShareListResponse, SimpleResponse, StoreRequest, StoreResponse,
     TriggerFireResponse, TriggerInfoResponse, TriggerListResponse,
 };
+use super::rate_limit::{RateLimiter, rate_limit_middleware};
 use super::ready::{ReadyResponse, ReadyState};
 
 /// Shared application state wrapping the KV engine, auth store, share store, and optional db_path.
@@ -38,9 +39,10 @@ pub struct AppState {
     pub ready_state: Arc<ReadyState>,
     pub metrics: Arc<dyn Metrics>,
     pub consolidation_interval_ms: u64,
+    pub rate_limiter: RateLimiter,
 }
 
-/// Build the axum Router with all routes, auth middleware, and shared state.
+/// Build the axum Router with all routes, auth middleware, rate limiting, and shared state.
 #[allow(clippy::too_many_arguments)]
 pub fn app(
     engine: Arc<KvEngine>,
@@ -52,6 +54,7 @@ pub fn app(
     ready_state: Arc<ReadyState>,
     metrics: Arc<dyn Metrics>,
     consolidation_interval_ms: u64,
+    rate_limiter: RateLimiter,
 ) -> Router {
     let state = AppState {
         engine,
@@ -63,6 +66,7 @@ pub fn app(
         ready_state,
         metrics,
         consolidation_interval_ms,
+        rate_limiter,
     };
 
     // Public routes (no auth)
@@ -103,6 +107,10 @@ pub fn app(
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .with_state(state)
 }

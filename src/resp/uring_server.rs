@@ -198,7 +198,13 @@ pub fn run(
 
                     let conn_id = connections.insert(Connection {
                         read_buf: Vec::with_capacity(READ_BUF_SIZE),
-                        session: ClientSession::new(auth.clone(), share.clone(), auth_enabled),
+                        session: ClientSession::with_rate_limit(
+                            auth.clone(),
+                            share.clone(),
+                            auth_enabled,
+                            0,
+                            1000,
+                        ),
                     });
 
                     // Allocate a stable read buffer (Box ensures stable address)

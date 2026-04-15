@@ -41,6 +41,7 @@ async fn start_server(
         Arc::new(ReadyState::new_ready()),
         basalt::metrics::create_metrics(),
         300_000,
+        basalt::http::rate_limit::RateLimiter::new(0, 1000),
     );
 
     let handle = tokio::spawn(async move {

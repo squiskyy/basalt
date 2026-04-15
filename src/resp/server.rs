@@ -61,6 +61,8 @@ pub async fn run_with_replication(
         repl_state,
         shutdown_rx,
         None,
+        0,
+        1000,
     )
     .await
 }
@@ -80,6 +82,8 @@ pub async fn run_with_replication_and_tls(
         TlsAcceptor,
     >,
     #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))] tls_acceptor: Option<()>,
+    rate_limit_requests: u64,
+    rate_limit_window_ms: u64,
 ) -> Result<(), RespError> {
     let listener = TcpListener::bind((host, port))
         .await
@@ -121,6 +125,7 @@ pub async fn run_with_replication_and_tls(
                             Ok(tls_stream) => {
                                 if let Err(e) = handle_connection_tls(
                                     tls_stream, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                                    rate_limit_requests, rate_limit_window_ms,
                                 ).await {
                                     tracing::debug!("TLS connection {addr} error: {e}");
                                 }
@@ -132,6 +137,7 @@ pub async fn run_with_replication_and_tls(
                     } else {
                         if let Err(e) = handle_connection(
                             socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                            rate_limit_requests, rate_limit_window_ms,
                         ).await {
                             tracing::debug!("connection {addr} error: {e}");
                         }
@@ -140,6 +146,7 @@ pub async fn run_with_replication_and_tls(
                     #[cfg(not(any(feature = "tls-rustls", feature = "tls-native-tls")))]
                     if let Err(e) = handle_connection(
                         socket, handler, share_handler, auth, auth_enabled, share, repl_state, engine,
+                        rate_limit_requests, rate_limit_window_ms,
                     ).await {
                         tracing::debug!("connection {addr} error: {e}");
                     }
@@ -163,6 +170,8 @@ async fn handle_connection(
     share: Arc<ShareStore>,
     repl_state: Arc<ReplicationState>,
     engine: Arc<KvEngine>,
+    rate_limit_requests: u64,
+    rate_limit_window_ms: u64,
 ) -> Result<(), RespError> {
     let (mut reader, mut writer) = stream.into_split();
 
@@ -172,7 +181,13 @@ async fn handle_connection(
     let mut tmp = [0u8; 8192];
 
     // Per-connection session managing auth state and command dispatch
-    let mut session = ClientSession::new(auth.clone(), share.clone(), auth_enabled);
+    let mut session = ClientSession::with_rate_limit(
+        auth.clone(),
+        share.clone(),
+        auth_enabled,
+        rate_limit_requests,
+        rate_limit_window_ms,
+    );
 
     loop {
         let n = reader.read(&mut tmp).await.map_err(RespError::Read)?;
@@ -277,6 +292,8 @@ async fn handle_connection_tls(
     share: Arc<ShareStore>,
     repl_state: Arc<ReplicationState>,
     engine: Arc<KvEngine>,
+    rate_limit_requests: u64,
+    rate_limit_window_ms: u64,
 ) -> Result<(), RespError> {
     // TlsStream implements AsyncRead + AsyncWrite, but we can't split it
     // like TcpStream. Instead, we use a single-stream approach with
@@ -288,7 +305,13 @@ async fn handle_connection_tls(
     let mut read_buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
 
-    let mut session = ClientSession::new(auth.clone(), share.clone(), auth_enabled);
+    let mut session = ClientSession::with_rate_limit(
+        auth.clone(),
+        share.clone(),
+        auth_enabled,
+        rate_limit_requests,
+        rate_limit_window_ms,
+    );
 
     loop {
         let n = reader.read(&mut tmp).await.map_err(RespError::Read)?;

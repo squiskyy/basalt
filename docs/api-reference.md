@@ -85,6 +85,7 @@ Store a single memory in the given namespace. Requires auth if enabled.
 |--------|-----------|
 | `401` | Missing or invalid auth token |
 | `403` | Token does not have access to this namespace |
+| `429` | Rate limit exceeded (when rate limiting is enabled) |
 | `507` | Shard is at capacity (`max_entries` exceeded) |
 
 ### Batch Store
@@ -439,3 +440,14 @@ Common errors:
 | `-ERR max entries exceeded` | Shard at capacity |
 | `-ERR no db_path configured` | SNAP without persistence |
 | `-ERR unknown command` | Unrecognized command |
+| `-ERR rate limit exceeded` | Per-connection rate limit exceeded |
+
+### Rate Limiting
+
+When rate limiting is enabled (via `--rate-limit-requests` or `rate_limit_requests` in config), the RESP server applies per-connection rate limiting. Each TCP connection is tracked independently. When a connection exceeds the configured request limit within the window, subsequent commands receive:
+
+```
+-ERR rate limit exceeded
+```
+
+AUTH and REPLICAOF commands are exempt from rate limiting.

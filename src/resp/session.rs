@@ -6,6 +6,14 @@ use crate::store::share::ShareStore;
 use super::commands::{CommandHandler, ReplicaofResult, ShareHandler, check_command_namespace};
 use super::parser::{Command, RespValue};
 
+/// Per-connection token bucket for RESP rate limiting.
+struct ConnectionBucket {
+    /// Number of requests made in the current window.
+    count: u64,
+    /// Start time of the current window (millisecond timestamp).
+    window_start_ms: u64,
+}
+
 /// Per-connection session state shared between both server implementations.
 pub struct ClientSession {
     pub authenticated: bool,
@@ -14,6 +22,12 @@ pub struct ClientSession {
     pub auth: Arc<AuthStore>,
     pub share: Arc<ShareStore>,
     pub is_replica: bool,
+    /// Per-connection rate limiter state. None if rate limiting is disabled.
+    rate_bucket: Option<ConnectionBucket>,
+    /// Max requests per rate limit window (0 = disabled).
+    rate_limit_requests: u64,
+    /// Rate limit window duration in milliseconds.
+    rate_limit_window_ms: u64,
 }
 
 /// Special action returned by `process_command_batch` that the caller
@@ -35,8 +49,27 @@ pub struct BatchResult {
 
 impl ClientSession {
     /// Create a new session. If auth is not required, the session starts
-    /// pre-authenticated.
+    /// pre-authenticated. If rate_limit_requests is 0, rate limiting is disabled.
     pub fn new(auth: Arc<AuthStore>, share: Arc<ShareStore>, auth_enabled: bool) -> Self {
+        Self::with_rate_limit(auth, share, auth_enabled, 0, 1000)
+    }
+
+    /// Create a new session with rate limiting configuration.
+    pub fn with_rate_limit(
+        auth: Arc<AuthStore>,
+        share: Arc<ShareStore>,
+        auth_enabled: bool,
+        rate_limit_requests: u64,
+        rate_limit_window_ms: u64,
+    ) -> Self {
+        let rate_bucket = if rate_limit_requests > 0 {
+            Some(ConnectionBucket {
+                count: 0,
+                window_start_ms: crate::time::now_ms(),
+            })
+        } else {
+            None
+        };
         Self {
             authenticated: !auth_enabled,
             auth_token: None,
@@ -44,6 +77,13 @@ impl ClientSession {
             auth,
             share,
             is_replica: false,
+            rate_bucket,
+            rate_limit_requests,
+            rate_limit_window_ms: if rate_limit_window_ms == 0 {
+                1000
+            } else {
+                rate_limit_window_ms
+            },
         }
     }
 
@@ -61,6 +101,24 @@ impl ClientSession {
 
     pub fn set_replica(&mut self, value: bool) {
         self.is_replica = value;
+    }
+
+    /// Check if this connection is rate limited. Returns true if the request
+    /// is allowed, false if rate limited.
+    fn check_rate_limit(&mut self) -> bool {
+        if let Some(ref mut bucket) = self.rate_bucket {
+            let now_ms = crate::time::now_ms();
+            // Reset window if expired
+            if now_ms - bucket.window_start_ms >= self.rate_limit_window_ms {
+                bucket.count = 0;
+                bucket.window_start_ms = now_ms;
+            }
+            if bucket.count >= self.rate_limit_requests {
+                return false;
+            }
+            bucket.count += 1;
+        }
+        true
     }
 
     /// Process a batch of parsed RESP values and return responses plus
@@ -115,6 +173,12 @@ impl ClientSession {
                 responses.push(RespValue::Error(
                     "NOAUTH Authentication required".to_string(),
                 ));
+                continue;
+            }
+
+            // Per-connection rate limiting check
+            if !self.check_rate_limit() {
+                responses.push(RespValue::Error("ERR rate limit exceeded".to_string()));
                 continue;
             }
 

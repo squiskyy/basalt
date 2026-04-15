@@ -68,6 +68,10 @@ pub struct ServerConfig {
     pub trigger_sweep_interval_ms: u64,
     /// How often (ms) to run consolidation sweep. 0 = disabled.
     pub consolidation_interval_ms: u64,
+    /// Max requests per rate limit window. 0 = disabled (default).
+    pub rate_limit_requests: u64,
+    /// Rate limit window duration in milliseconds. Default: 1000 (1 second).
+    pub rate_limit_window_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -98,6 +102,8 @@ impl Default for ServerConfig {
             decay_default_lambda: std::f64::consts::LN_2 / 24.0,
             trigger_sweep_interval_ms: 30_000,
             consolidation_interval_ms: 300_000, // 5 minutes
+            rate_limit_requests: 0,
+            rate_limit_window_ms: 1000,
         }
     }
 }
@@ -217,6 +223,10 @@ struct ServerFile {
     trigger_sweep_interval_ms: Option<u64>,
     #[serde(default)]
     consolidation_interval_ms: Option<u64>,
+    #[serde(default)]
+    rate_limit_requests: Option<u64>,
+    #[serde(default)]
+    rate_limit_window_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -320,6 +330,14 @@ impl Config {
                 .server
                 .consolidation_interval_ms
                 .unwrap_or(server_defaults.consolidation_interval_ms),
+            rate_limit_requests: file
+                .server
+                .rate_limit_requests
+                .unwrap_or(server_defaults.rate_limit_requests),
+            rate_limit_window_ms: file
+                .server
+                .rate_limit_window_ms
+                .unwrap_or(server_defaults.rate_limit_window_ms),
         };
 
         let auth = AuthConfig {
@@ -379,6 +397,8 @@ impl Config {
         llm_api_key: Option<String>,
         llm_model: Option<String>,
         llm_base_url: Option<String>,
+        rate_limit_requests: Option<u64>,
+        rate_limit_window: Option<u64>,
     ) {
         if let Some(v) = http_host {
             self.server.http_host = v;
@@ -456,6 +476,12 @@ impl Config {
         }
         if let Some(v) = llm_base_url {
             self.llm.base_url = v;
+        }
+        if let Some(v) = rate_limit_requests {
+            self.server.rate_limit_requests = v;
+        }
+        if let Some(v) = rate_limit_window {
+            self.server.rate_limit_window_ms = v;
         }
     }
 
@@ -674,6 +700,8 @@ http_port = 9999
             None,          // llm_api_key
             None,          // llm_model
             None,          // llm_base_url
+            None,          // rate_limit_requests
+            None,          // rate_limit_window
         );
         assert_eq!(config.server.http_host, "0.0.0.0");
         assert_eq!(config.server.http_port, 9000);

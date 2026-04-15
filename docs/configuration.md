@@ -130,6 +130,28 @@ All server settings are available as CLI flags. These override config file value
 
 Only available when compiled with `--features io-uring`.
 
+### Rate Limiting
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--rate-limit-requests` | u64 | `0` | Max requests per rate limit window per client (0 = disabled) |
+| `--rate-limit-window` | u64 | `1000` | Rate limit window duration in milliseconds |
+
+When `--rate-limit-requests` is set to a non-zero value, rate limiting is enabled:
+- HTTP API: per-IP rate limiting using a token bucket. Requests from the same IP are tracked. When the limit is exceeded, the server returns `429 Too Many Requests` with a JSON body: `{"ok": false, "error": "rate limit exceeded"}`.
+- RESP API: per-connection rate limiting. Each TCP connection is tracked independently. When the limit is exceeded, the server returns `-ERR rate limit exceeded`.
+
+The `X-Forwarded-For` and `X-Real-IP` headers are respected for reverse proxy setups (the first IP in `X-Forwarded-For` is used).
+
+TOML configuration under `[server]`:
+```toml
+[server]
+rate_limit_requests = 100   # 100 requests per window
+rate_limit_window_ms = 1000 # 1-second window
+```
+
+Default is `0` (disabled) for backward compatibility.
+
 ### LLM Inference
 
 || Flag | Type | Default | Description ||
