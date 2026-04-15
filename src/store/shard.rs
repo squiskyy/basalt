@@ -456,22 +456,21 @@ impl Shard {
             let needs_touch = now.saturating_sub(entry.last_accessed_ms) > 1000;
             if needs_touch {
                 // Touch path: update the entry's access time and count.
-                // This requires cloning the entry for the in-place update (papaya's
-                // update takes Fn(&V) -> V) and cloning again for the return value.
-                // Two full Entry clones is costly for entries with large embeddings,
-                // but the 1-second debounce ensures this only fires once per second
-                // per key, making it rare for hot keys. The no-touch path below
-                // (single clone) handles the common case.
+                // We capture the updated entry from the update closure's return value
+                // to avoid a third map lookup. The update closure clones once (for
+                // in-place mutation via papaya's Fn(&V) -> V), and we clone that
+                // result once more for the caller - two clones total, same as before,
+                // but no extra get() on the map.
                 let key_owned = key.to_string();
                 drop(pin);
                 let pin2 = self.map.pin();
-                pin2.update(key_owned, |e| {
+                let updated = pin2.update(key_owned, |e| {
                     let mut touched = e.clone();
                     touched.last_accessed_ms = now;
                     touched.access_count = touched.access_count.saturating_add(1);
                     touched
                 });
-                Some(pin2.get(key)?.clone())
+                Some(updated?.clone())
             } else {
                 // No touch needed - single clone for the return value.
                 let cloned = entry.clone();
