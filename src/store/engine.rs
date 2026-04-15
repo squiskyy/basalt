@@ -48,6 +48,9 @@ pub struct KvEngine {
     max_entries: usize,
     compression_threshold: usize,
     eviction_policy: EvictionPolicy,
+    /// Number of random entries to sample for approximate LRU eviction.
+    /// Only relevant when eviction_policy is Lru. Default: 20.
+    lru_sample_size: usize,
     /// Per-namespace HNSW vector indices, protected by a Mutex.
     /// Key: namespace (prefix before the first `:` in a key, or the full key).
     vector_indexes: Mutex<HashMap<String, HnswIndex>>,
@@ -167,6 +170,7 @@ impl KvEngine {
             max_entries,
             compression_threshold: 1024,
             eviction_policy: EvictionPolicy::Reject,
+            lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -196,6 +200,7 @@ impl KvEngine {
             max_entries,
             compression_threshold,
             eviction_policy: EvictionPolicy::Reject,
+            lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -214,10 +219,37 @@ impl KvEngine {
         eviction_policy: EvictionPolicy,
         consolidation_manager: Arc<ConsolidationManager>,
     ) -> Self {
+        Self::with_eviction_policy_and_sample_size(
+            shard_count,
+            max_entries,
+            compression_threshold,
+            eviction_policy,
+            20,
+            consolidation_manager,
+        )
+    }
+
+    /// Create a new KvEngine with the given target shard count,
+    /// max entries per shard, compression threshold, eviction policy,
+    /// and LRU sample size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_eviction_policy_and_sample_size(
+        shard_count: usize,
+        max_entries: usize,
+        compression_threshold: usize,
+        eviction_policy: EvictionPolicy,
+        lru_sample_size: usize,
+        consolidation_manager: Arc<ConsolidationManager>,
+    ) -> Self {
         let count = next_power_of_2(shard_count.max(1));
         let shards = (0..count)
             .map(|_| {
-                Shard::with_eviction_policy(max_entries, compression_threshold, eviction_policy)
+                Shard::with_eviction_policy_and_sample_size(
+                    max_entries,
+                    compression_threshold,
+                    eviction_policy,
+                    lru_sample_size,
+                )
             })
             .collect();
         KvEngine {
@@ -226,6 +258,7 @@ impl KvEngine {
             max_entries,
             compression_threshold,
             eviction_policy,
+            lru_sample_size: lru_sample_size.max(1),
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -256,6 +289,7 @@ impl KvEngine {
             max_entries,
             compression_threshold,
             eviction_policy,
+            lru_sample_size: 20,
             vector_indexes: Mutex::new(HashMap::new()),
             namespace_versions: Mutex::new(HashMap::new()),
             hash_state: RandomState::new(),
@@ -860,6 +894,11 @@ impl KvEngine {
     /// Return the eviction policy.
     pub fn eviction_policy(&self) -> EvictionPolicy {
         self.eviction_policy
+    }
+
+    /// Return the LRU sample size (number of entries sampled per eviction).
+    pub fn lru_sample_size(&self) -> usize {
+        self.lru_sample_size
     }
 
     /// Clear all data from the engine, removing every entry from every shard

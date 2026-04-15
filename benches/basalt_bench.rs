@@ -190,6 +190,51 @@ fn bench_delete_prefix(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lru_eviction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lru_eviction");
+
+    // Benchmark write performance against a full shard with LRU eviction.
+    // This is the critical scenario: with O(n) eviction, writes degrade linearly
+    // as shard size grows. With O(k) sampled eviction, writes stay constant.
+    for shard_size in [1_000, 10_000, 100_000].iter() {
+        group.bench_with_input(
+            BenchmarkId::new("write_full_shard", shard_size),
+            shard_size,
+            |b, &max_entries| {
+                // Pre-fill the shard to capacity, then measure write throughput
+                // (each write triggers an eviction)
+                let engine = KvEngine::with_eviction_policy_and_sample_size(
+                    1, // 1 shard for deterministic behavior
+                    max_entries,
+                    0, // no compression
+                    basalt::store::EvictionPolicy::Lru,
+                    20, // default sample size
+                    Arc::new(basalt::store::ConsolidationManager::disabled()),
+                );
+                for i in 0..max_entries {
+                    let key = format!("bench:lru:{}", i);
+                    engine.set(&key, b"x".to_vec(), None, MemoryType::Semantic);
+                }
+
+                let mut i = 0u64;
+                b.iter(|| {
+                    // Each set triggers an eviction since shard is at capacity
+                    let key = format!("bench:lru:new:{}", i);
+                    engine.set(
+                        black_box(&key),
+                        black_box(b"v".to_vec()),
+                        None,
+                        MemoryType::Semantic,
+                    );
+                    i += 1;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_set,
@@ -198,5 +243,6 @@ criterion_group!(
     bench_namespace_scan,
     bench_set_with_memory_type,
     bench_delete_prefix,
+    bench_lru_eviction,
 );
 criterion_main!(benches);

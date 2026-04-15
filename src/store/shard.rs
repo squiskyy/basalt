@@ -3,6 +3,11 @@ use crate::time::now_ms;
 use papaya::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Default number of random entries to sample for approximate LRU eviction.
+/// Redis uses 5 by default (maxmemory-samples), but 20 gives better eviction
+/// accuracy with minimal overhead since we only compare timestamps.
+const DEFAULT_LRU_SAMPLE_SIZE: usize = 20;
+
 /// Eviction policy when a shard hits its entry capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EvictionPolicy {
@@ -132,6 +137,10 @@ pub struct Shard {
     compression_threshold: usize,
     /// Eviction policy when the shard is at capacity.
     eviction_policy: EvictionPolicy,
+    /// Number of random entries to sample for approximate LRU eviction.
+    /// Only used when eviction_policy is Lru. Higher values give better
+    /// eviction accuracy at O(k) cost per eviction. Default: 20.
+    lru_sample_size: usize,
 }
 
 impl Shard {
@@ -149,13 +158,12 @@ impl Shard {
         max_entries: usize,
         compression_threshold: usize,
     ) -> Self {
-        Shard {
-            map: HashMap::new(),
-            count: AtomicUsize::new(0),
+        Shard::with_eviction_policy_and_sample_size(
             max_entries,
             compression_threshold,
-            eviction_policy: EvictionPolicy::Reject,
-        }
+            EvictionPolicy::Reject,
+            DEFAULT_LRU_SAMPLE_SIZE,
+        )
     }
 
     /// Create a shard with a specific entry limit, compression threshold, and eviction policy.
@@ -164,18 +172,40 @@ impl Shard {
         compression_threshold: usize,
         eviction_policy: EvictionPolicy,
     ) -> Self {
+        Shard::with_eviction_policy_and_sample_size(
+            max_entries,
+            compression_threshold,
+            eviction_policy,
+            DEFAULT_LRU_SAMPLE_SIZE,
+        )
+    }
+
+    /// Create a shard with a specific entry limit, compression threshold, eviction policy,
+    /// and LRU sample size.
+    pub fn with_eviction_policy_and_sample_size(
+        max_entries: usize,
+        compression_threshold: usize,
+        eviction_policy: EvictionPolicy,
+        lru_sample_size: usize,
+    ) -> Self {
         Shard {
             map: HashMap::new(),
             count: AtomicUsize::new(0),
             max_entries,
             compression_threshold,
             eviction_policy,
+            lru_sample_size: lru_sample_size.max(1), // at least 1 sample
         }
     }
 
     /// Return this shard's eviction policy.
     pub fn eviction_policy(&self) -> EvictionPolicy {
         self.eviction_policy
+    }
+
+    /// Return this shard's LRU sample size.
+    pub fn lru_sample_size(&self) -> usize {
+        self.lru_sample_size
     }
 
     /// Compress a value if it exceeds the compression threshold.
@@ -326,20 +356,45 @@ impl Shard {
         // else: update of existing key, count unchanged
     }
 
-    /// Evict the least-recently-used entry from this shard.
+    /// Evict the least-recently-used entry from this shard using random sampling.
+    ///
+    /// Instead of scanning all N entries (O(N)), we sample `lru_sample_size` random
+    /// entries from the hash map and evict the one with the lowest `last_accessed_ms`.
+    /// This is the same approach Redis uses (maxmemory-samples), providing O(k)
+    /// eviction where k is the sample size (default: 20).
+    ///
+    /// HashMap iteration order is effectively random due to hash distribution,
+    /// so taking the first k entries from iteration gives a good random sample.
+    /// This avoids the catastrophic O(N) cost of a full scan on shards with
+    /// millions of entries.
+    ///
     /// Returns true if an entry was evicted, false if the shard is empty.
-    /// Used by the LRU eviction policy when the shard is at capacity.
     fn evict_lru(&self) -> bool {
         let pin = self.map.pin();
-        // Find the entry with the oldest last_accessed_ms
-        let lru_key = pin
-            .iter()
-            .min_by_key(|(_, v)| v.last_accessed_ms)
-            .map(|(k, _)| k.clone());
+        let sample_size = self.lru_sample_size;
+
+        // Sample up to `sample_size` entries from iteration.
+        // HashMap iteration order is determined by slot layout, which is
+        // effectively random across different hash seeds. With ahash's
+        // randomized seed per instance, this provides good distribution.
+        let mut best_key: Option<String> = None;
+        let mut best_time: u64 = u64::MAX;
+        let mut sampled = 0;
+
+        for (k, v) in pin.iter() {
+            if sampled >= sample_size {
+                break;
+            }
+            if v.last_accessed_ms < best_time {
+                best_time = v.last_accessed_ms;
+                best_key = Some(k.clone());
+            }
+            sampled += 1;
+        }
         drop(pin);
 
-        if let Some(key) = lru_key {
-            tracing::debug!("lru eviction: removing key {:?}", key);
+        if let Some(key) = best_key {
+            tracing::debug!("lru eviction: removing key {:?} (sampled {sampled})", key);
             self.delete(&key)
         } else {
             false
@@ -1129,6 +1184,54 @@ mod tests {
             Some(EvictionPolicy::Lru)
         );
         assert_eq!(EvictionPolicy::from_str_loose("invalid"), None);
+    }
+
+    #[test]
+    fn test_lru_sample_size_default() {
+        let shard = Shard::with_eviction_policy(100, 0, EvictionPolicy::Lru);
+        assert_eq!(shard.lru_sample_size(), 20);
+    }
+
+    #[test]
+    fn test_lru_sample_size_custom() {
+        let shard = Shard::with_eviction_policy_and_sample_size(100, 0, EvictionPolicy::Lru, 50);
+        assert_eq!(shard.lru_sample_size(), 50);
+    }
+
+    #[test]
+    fn test_lru_sample_size_minimum_one() {
+        // Sample size of 0 should be clamped to 1
+        let shard = Shard::with_eviction_policy_and_sample_size(100, 0, EvictionPolicy::Lru, 0);
+        assert_eq!(shard.lru_sample_size(), 1);
+    }
+
+    #[test]
+    fn test_lru_eviction_with_small_sample_size() {
+        // With sample_size=1, eviction still works (picks 1 random entry)
+        let shard = Shard::with_eviction_policy_and_sample_size(3, 0, EvictionPolicy::Lru, 1);
+        for i in 0..3 {
+            let entry = make_entry(format!("val{i}").into_bytes(), None, MemoryType::Semantic);
+            assert!(shard.set(format!("key{i}"), entry).is_ok());
+        }
+        // Shard is at capacity; inserting a 4th should evict one
+        let entry = make_entry(b"new".to_vec(), None, MemoryType::Semantic);
+        assert!(shard.set("key3_extra".into(), entry).is_ok());
+        assert_eq!(shard.len(), 3);
+        assert!(shard.get("key3_extra").is_some());
+    }
+
+    #[test]
+    fn test_lru_eviction_bulk_stays_at_capacity() {
+        // Insert many more keys than max_entries to verify eviction keeps
+        // the shard at capacity even with many evictions
+        let shard = Shard::with_eviction_policy_and_sample_size(10, 0, EvictionPolicy::Lru, 5);
+        // Insert 100 entries into a shard with max 10
+        for i in 0..100 {
+            let entry = make_entry(format!("val{i}").into_bytes(), None, MemoryType::Semantic);
+            assert!(shard.set(format!("key{i}"), entry).is_ok());
+        }
+        // Shard should still have exactly 10 entries
+        assert_eq!(shard.len(), 10);
     }
 
     #[test]

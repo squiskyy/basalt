@@ -79,6 +79,10 @@ struct Args {
     #[arg(long, value_name = "POLICY")]
     eviction: Option<String>,
 
+    /// Number of entries to sample for approximate LRU eviction (overrides config file, default: 20)
+    #[arg(long, value_name = "N")]
+    lru_sample_size: Option<usize>,
+
     /// Enable automatic failover when primary lease expires.
     /// Replicas will self-promote to primary if the primary becomes unreachable.
     #[arg(long)]
@@ -178,6 +182,7 @@ async fn main() {
         args.compression_threshold,
         args.wal_size,
         args.eviction,
+        args.lru_sample_size,
         args.failover,
         args.failover_timeout,
         args.replica_peers.map(|s| {
@@ -204,11 +209,12 @@ async fn main() {
 
     let engine = Arc::new(
         match store::shard::EvictionPolicy::from_str_loose(&cfg.server.eviction) {
-            Some(policy) => store::engine::KvEngine::with_eviction_policy(
+            Some(policy) => store::engine::KvEngine::with_eviction_policy_and_sample_size(
                 cfg.server.shard_count,
                 cfg.server.max_entries,
                 cfg.server.compression_threshold,
                 policy,
+                cfg.server.lru_sample_size,
                 Arc::new(store::ConsolidationManager::disabled()),
             ),
             None => {
@@ -334,6 +340,9 @@ async fn main() {
         cfg.server.compression_threshold
     );
     info!("eviction policy: {}", cfg.server.eviction);
+    if cfg.server.eviction == "lru" {
+        info!("lru sample size: {}", cfg.server.lru_sample_size);
+    }
     info!("max entries per shard: {}", cfg.server.max_entries);
     if auth.is_enabled() {
         info!("auth: enabled ({} tokens)", auth.list_tokens().len());

@@ -46,6 +46,10 @@ pub struct ServerConfig {
     /// Eviction policy when a shard hits max_entries capacity.
     /// "reject" = reject writes (default), "ttl-first" = sweep expired then reject, "lru" = evict least-recently-used
     pub eviction: String,
+    /// Number of random entries to sample for approximate LRU eviction.
+    /// Higher values improve eviction accuracy at O(k) cost per eviction.
+    /// Default: 20 (same concept as Redis maxmemory-samples).
+    pub lru_sample_size: usize,
     /// Enable automatic failover when primary lease expires.
     pub failover: bool,
     /// How long (ms) without a lease heartbeat before considering the primary dead.
@@ -84,6 +88,7 @@ impl Default for ServerConfig {
             compression_threshold: 1024,
             wal_size: 10_000,
             eviction: "reject".to_string(),
+            lru_sample_size: 20,
             failover: false,
             failover_timeout_ms: 15_000,
             replica_peers: Vec::new(),
@@ -193,6 +198,8 @@ struct ServerFile {
     #[serde(default)]
     eviction: Option<String>,
     #[serde(default)]
+    lru_sample_size: Option<usize>,
+    #[serde(default)]
     failover: Option<bool>,
     #[serde(default)]
     failover_timeout_ms: Option<u64>,
@@ -285,6 +292,10 @@ impl Config {
                 .server
                 .eviction
                 .unwrap_or_else(|| server_defaults.eviction.clone()),
+            lru_sample_size: file
+                .server
+                .lru_sample_size
+                .unwrap_or(server_defaults.lru_sample_size),
             failover: file.server.failover.unwrap_or(false),
             failover_timeout_ms: file
                 .server
@@ -358,6 +369,7 @@ impl Config {
         compression_threshold: Option<usize>,
         wal_size: Option<usize>,
         eviction: Option<String>,
+        lru_sample_size: Option<usize>,
         failover: bool,
         failover_timeout: Option<u64>,
         replica_peers: Option<Vec<String>>,
@@ -416,6 +428,9 @@ impl Config {
         }
         if let Some(v) = eviction {
             self.server.eviction = v;
+        }
+        if let Some(v) = lru_sample_size {
+            self.server.lru_sample_size = v;
         }
         self.server.failover = failover;
         if let Some(v) = failover_timeout {
@@ -649,6 +664,7 @@ http_port = 9999
             None,          // compression_threshold
             None,          // wal_size
             None,          // eviction
+            None,          // lru_sample_size
             false,         // failover
             None,          // failover_timeout
             None,          // replica_peers

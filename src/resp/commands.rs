@@ -4,6 +4,7 @@ use crate::replication::ReplicationState;
 use crate::store::consolidation::ConsolidationRule;
 use crate::store::engine::KvEngine;
 use crate::store::memory_type::MemoryType;
+use crate::store::shard::EvictionPolicy;
 use crate::store::share::{SharePermission, SharePolicy, ShareStore};
 use crate::time::now_ms;
 
@@ -537,10 +538,16 @@ impl CommandHandler {
             .collect::<Vec<_>>()
             .join("\r\n");
 
+        let eviction_str = format!("{}", self.engine.eviction_policy());
+        let lru_info = if self.engine.eviction_policy() == EvictionPolicy::Lru {
+            format!("\r\nlru_sample_size:{}", self.engine.lru_sample_size())
+        } else {
+            String::new()
+        };
+
         let info = format!(
-            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{shard_count}\r\ncompression_threshold:{}\r\neviction_policy:{}\r\nmax_entries_per_shard:{}\r\n{shard_entries_str}\r\n",
+            "# Basalt\r\nbasalt_version:0.1.0\r\nshard_count:{shard_count}\r\ncompression_threshold:{}\r\neviction_policy:{eviction_str}\r\nmax_entries_per_shard:{}{lru_info}\r\n{shard_entries_str}\r\n",
             self.engine.compression_threshold(),
-            self.engine.eviction_policy(),
             self.engine.max_entries(),
         );
         RespValue::BulkString(Some(info.into_bytes()))
