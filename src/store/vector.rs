@@ -77,6 +77,10 @@ pub struct HnswIndex {
     index_version: u64,
     /// Cached values map for returning search results. Rebuilt alongside the index.
     cached_values: HashMap<String, Vec<u8>>,
+    /// Expected embedding dimension. All entries in the index must have
+    /// vectors of this length. Prevents silent corruption from mismatched
+    /// model-version embeddings (issue from code review).
+    dimension: Option<usize>,
 }
 
 impl HnswIndex {
@@ -86,6 +90,7 @@ impl HnswIndex {
             index: None,
             index_version: 0,
             cached_values: HashMap::new(),
+            dimension: None,
         }
     }
 
@@ -93,7 +98,45 @@ impl HnswIndex {
     ///
     /// Entries without embeddings are skipped. Also caches the values map
     /// for fast search result lookups without re-scanning the namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if entries have inconsistent embedding dimensions.
     pub fn rebuild(&mut self, entries: &[(String, Vec<f32>, Vec<u8>)], namespace_version: u64) {
+        if entries.is_empty() {
+            self.index = None;
+            self.index_version = namespace_version;
+            self.dimension = None;
+            self.cached_values.clear();
+            return;
+        }
+
+        // Validate embedding dimension consistency
+        let dim = entries[0].1.len();
+        if dim == 0 {
+            self.index = None;
+            self.index_version = namespace_version;
+            self.dimension = None;
+            self.cached_values.clear();
+            return;
+        }
+
+        for (key, emb, _) in entries.iter() {
+            if emb.len() != dim {
+                tracing::warn!(
+                    "HNSW rebuild: embedding dimension mismatch for key '{}': expected {}, got {}. Skipping build.",
+                    key,
+                    dim,
+                    emb.len()
+                );
+                self.index = None;
+                self.index_version = namespace_version;
+                return;
+            }
+        }
+
+        self.dimension = Some(dim);
+
         let points: Vec<EmbeddingPoint> = entries
             .iter()
             .map(|(_, emb, _)| EmbeddingPoint::new(emb.clone()))
@@ -105,12 +148,6 @@ impl HnswIndex {
             .iter()
             .map(|(k, _, v)| (k.clone(), v.clone()))
             .collect();
-
-        if points.is_empty() {
-            self.index = None;
-            self.index_version = namespace_version;
-            return;
-        }
 
         let map: HnswMap<EmbeddingPoint, String> =
             instant_distance::Hnsw::<EmbeddingPoint>::builder()
@@ -131,11 +168,24 @@ impl HnswIndex {
     ///
     /// Returns results sorted by distance (closest first).
     /// Uses the cached values map from the last rebuild.
+    /// Returns empty results if the embedding dimension doesn't match the index.
     pub fn search(&self, embedding: &[f32], top_k: usize) -> Vec<VectorSearchResult> {
         let index = match &self.index {
             Some(idx) => idx,
             None => return Vec::new(),
         };
+
+        // Validate query embedding dimension matches index dimension
+        if let Some(expected_dim) = self.dimension
+            && embedding.len() != expected_dim
+        {
+            tracing::warn!(
+                "HNSW search: dimension mismatch - query has {} dims, index has {}. Returning empty results.",
+                embedding.len(),
+                expected_dim
+            );
+            return Vec::new();
+        }
 
         let query = EmbeddingPoint::new(embedding.to_vec());
         let mut search = Search::default();

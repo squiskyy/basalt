@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use basalt::config;
 use basalt::http;
@@ -350,6 +350,12 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     );
     info!("shards: {}", cfg.server.shard_count);
+    if cfg.server.shard_count > 4096 {
+        warn!(
+            "shard_count {} exceeds recommended max of 4096; each shard carries memory overhead and the count is rounded to the next power of two",
+            cfg.server.shard_count
+        );
+    }
     info!(
         "compression threshold: {} bytes",
         cfg.server.compression_threshold

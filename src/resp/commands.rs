@@ -1123,8 +1123,10 @@ impl CommandHandler {
         // Update meta
         let mut meta = mgr.get_meta(&namespace).unwrap_or_default();
         meta.last_run_ms = now_ms();
-        meta.total_promoted += result.promoted as u64;
-        meta.total_compressed += result.compressed as u64;
+        meta.total_promoted = meta.total_promoted.saturating_add(result.promoted as u64);
+        meta.total_compressed = meta
+            .total_compressed
+            .saturating_add(result.compressed as u64);
         mgr.update_meta(&namespace, meta);
 
         RespValue::Array(Some(vec![
