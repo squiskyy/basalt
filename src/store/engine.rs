@@ -1,3 +1,4 @@
+use crate::llm::client::LlmClient;
 use crate::store::consolidation::ConsolidationManager;
 use crate::store::decay::DecayConfigStore;
 use crate::store::memory_type::MemoryType;
@@ -94,6 +95,8 @@ pub struct KvEngine {
     trigger_manager: Arc<TriggerManager>,
     /// Memory consolidation rule manager.
     consolidation_manager: Arc<ConsolidationManager>,
+    /// Optional LLM client for AI-powered consolidation.
+    llm_client: std::sync::Mutex<Option<Arc<LlmClient>>>,
 }
 
 /// A key structured as `namespace:key`, enforcing the convention at the type level.
@@ -203,10 +206,22 @@ impl KvEngine {
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
             consolidation_manager,
+            llm_client: std::sync::Mutex::new(None),
         }
     }
 
-    /// Create a new KvEngine with the given target shard count,
+    /// Set the LLM client for AI-powered consolidation.
+    pub fn set_llm_client(&self, client: Arc<LlmClient>) {
+        let mut guard = self.llm_client.lock().unwrap();
+        *guard = Some(client);
+    }
+
+    /// Get a reference to the LLM client if configured.
+    pub fn llm_client(&self) -> Option<Arc<LlmClient>> {
+        self.llm_client.lock().unwrap().clone()
+    }
+
+    /// Create a new KvEngine with the given target shard count, shard_count: usize,
     /// max entries per shard, and compression threshold.
     /// compression_threshold: minimum value size (bytes) to LZ4-compress in memory.
     /// 0 = disable compression.
@@ -233,6 +248,7 @@ impl KvEngine {
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
             consolidation_manager,
+            llm_client: std::sync::Mutex::new(None),
         }
     }
 
@@ -291,6 +307,7 @@ impl KvEngine {
             decay_config: DecayConfigStore::default(),
             trigger_manager: Arc::new(TriggerManager::new()),
             consolidation_manager,
+            llm_client: std::sync::Mutex::new(None),
         }
     }
 
@@ -322,6 +339,7 @@ impl KvEngine {
             decay_config,
             trigger_manager: Arc::new(TriggerManager::new()),
             consolidation_manager,
+            llm_client: std::sync::Mutex::new(None),
         }
     }
 

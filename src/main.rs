@@ -321,8 +321,13 @@ async fn main() {
         info!("LLM: disabled (no provider configured)");
         basalt::llm::LlmClient::disabled()
     };
-    let _llm_client = Arc::new(llm_client);
-
+    let llm_client = Arc::new(llm_client);
+    // If LLM is enabled, wire it into the engine so consolidation can use it
+    if llm_client.provider_name() != "disabled" {
+        engine.set_llm_client(llm_client.clone());
+        info!("LLM: wired into engine for consolidation");
+    }
+    // Load snapshot if db_path is configured
     // Load snapshot if db_path is configured
     if let Some(ref db_path) = cfg.server.db_path {
         let db_path = std::path::Path::new(db_path);
@@ -558,11 +563,12 @@ async fn main() {
                         let namespaces = con_engine.active_namespaces();
                         let rules = con_engine.consolidation_manager().rules();
                         for namespace in &namespaces {
+                            let llm = con_engine.llm_client();
                             let result = store::consolidation::run_consolidation_with_llm(
                                 &con_engine,
                                 namespace,
                                 &rules,
-                                None,
+                                llm.clone(),
                             ).await;
                             if result.promoted > 0 || result.compressed > 0 {
                                 info!(

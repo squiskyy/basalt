@@ -914,8 +914,17 @@ async fn consolidate(
         _ => rules,
     };
 
-    let result =
-        crate::store::consolidation::run_consolidation(&state.engine, &namespace, &filtered);
+    let result = if let Some(ref llm) = state.engine.llm_client() {
+        crate::store::consolidation::run_consolidation_with_llm(
+            &state.engine,
+            &namespace,
+            &filtered,
+            Some(llm.clone()),
+        )
+        .await
+    } else {
+        crate::store::consolidation::run_consolidation(&state.engine, &namespace, &filtered)
+    };
 
     // Update metadata
     let mut meta = mgr.get_meta(&namespace).unwrap_or_default();
